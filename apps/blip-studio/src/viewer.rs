@@ -95,12 +95,7 @@ impl CaptureTarget {
 
     fn label(&self) -> String {
         match self {
-            Self::Display(display) => format!(
-                "Display {}  {}x{}",
-                display.id(),
-                display.physical_width(),
-                display.physical_height()
-            ),
+            Self::Display(display) => format!("Display {}", display.id()),
             Self::Window(window) => {
                 let application = window
                     .application()
@@ -160,6 +155,13 @@ const fn inset_layout() -> ItemLayout {
 struct CaptureResource {
     capturer: CaptureBackend,
     generation: u64,
+    configuration: Option<VideoSourceConfiguration>,
+}
+
+#[derive(Clone, Copy)]
+struct VideoSourceConfiguration {
+    dimensions: (usize, usize),
+    fps: f64,
 }
 
 enum CaptureBackend {
@@ -977,15 +979,15 @@ impl FrameViewer {
         let source = target.id();
         if !self.captures.borrow().contains_key(&source) {
             let generation = 1;
-            let capturer = match build_capturer(&target, self.options, generation, &self.frame_hub)
-            {
-                Ok(capturer) => capturer,
-                Err(error) => {
-                    self.control_error = Some(error.to_string());
-                    cx.notify();
-                    return;
-                }
-            };
+            let (capturer, configuration) =
+                match build_capturer(&target, self.options, generation, &self.frame_hub) {
+                    Ok(capturer) => capturer,
+                    Err(error) => {
+                        self.control_error = Some(error.to_string());
+                        cx.notify();
+                        return;
+                    }
+                };
             if let Err(error) = capturer.start() {
                 self.control_error = Some(error.to_string());
                 cx.notify();
@@ -996,6 +998,7 @@ impl FrameViewer {
                 CaptureResource {
                     capturer,
                     generation,
+                    configuration,
                 },
             );
         }
@@ -1039,7 +1042,8 @@ impl FrameViewer {
                 move || drop_hub.report_camera_drop(source),
             )?;
             capturer.start()?;
-            Ok::<_, blip_avfoundation::CameraError>(capturer)
+            let configuration = camera_configuration(&capturer);
+            Ok::<_, blip_avfoundation::CameraError>((capturer, configuration))
         });
         cx.spawn(async move |_, cx| {
             let result = background.await;
@@ -1055,7 +1059,10 @@ impl FrameViewer {
         &mut self,
         source: SourceId,
         generation: u64,
-        result: Result<CameraCapturer, blip_avfoundation::CameraError>,
+        result: Result<
+            (CameraCapturer, Option<VideoSourceConfiguration>),
+            blip_avfoundation::CameraError,
+        >,
         cx: &mut Context<Self>,
     ) {
         if !should_finish_pending_capture(
@@ -1063,19 +1070,20 @@ impl FrameViewer {
             generation,
             self.scene.borrow().uses_source(source),
         ) {
-            if let Ok(capturer) = result {
+            if let Ok((capturer, _)) = result {
                 capturer.stop();
             }
             return;
         }
         self.pending_captures.remove(&source);
         match result {
-            Ok(capturer) => {
+            Ok((capturer, configuration)) => {
                 self.captures.borrow_mut().insert(
                     source,
                     CaptureResource {
                         capturer: CaptureBackend::Camera(capturer),
                         generation,
+                        configuration,
                     },
                 );
                 self.failed_captures.remove(&source);
@@ -1124,11 +1132,6 @@ impl FrameViewer {
                 self.frame_hub
                     .camera_status(source)
                     .map_or(label.clone(), |status| {
-                        let (width, height) = status.dimensions;
-                        let label = status.measured_fps.map_or_else(
-                            || format!("{label} - {width}x{height}"),
-                            |fps| format!("{label} - {width}x{height} - {fps:.1} FPS"),
-                        );
                         if status.dropped_frames == 0 {
                             label
                         } else {
@@ -1200,19 +1203,20 @@ impl FrameViewer {
         };
         let next_generation = generation.saturating_add(1);
         let restarted = build_capturer(&target, self.options, next_generation, &self.frame_hub)
-            .and_then(|capturer| {
+            .and_then(|(capturer, configuration)| {
                 capturer
                     .start()
                     .map_err(|error| CaptureError::Framework(error.to_string()))?;
-                Ok(capturer)
+                Ok((capturer, configuration))
             });
         match restarted {
-            Ok(capturer) => {
+            Ok((capturer, configuration)) => {
                 self.captures.borrow_mut().insert(
                     source,
                     CaptureResource {
                         capturer,
                         generation: next_generation,
+                        configuration,
                     },
                 );
                 self.control_error = None;
@@ -1577,6 +1581,30 @@ impl FrameViewer {
                         .child("Select an item to edit"),
                 );
         };
+        let Some(source) = self
+            .scene
+            .borrow()
+            .element(item)
+            .map(|element| element.source)
+        else {
+            return panel.child("Selected element is unavailable");
+        };
+        let configuration = self
+            .captures
+            .borrow()
+            .get(&source)
+            .and_then(|resource| resource.configuration);
+        let panel = panel.child(
+            div()
+                .text_sm()
+                .font_weight(FontWeight::SEMIBOLD)
+                .child(format!("Element {item}")),
+        );
+        let panel = if let Some(configuration) = configuration {
+            panel.child(Self::source_configuration(configuration))
+        } else {
+            panel
+        };
         let (canvas_width, canvas_height) =
             self.content_dimensions.unwrap_or(DEFAULT_CANVAS_DIMENSIONS);
         let canvas_size = [canvas_width as f32, canvas_height as f32];
@@ -1615,20 +1643,22 @@ impl FrameViewer {
                 cx,
             );
         }
+        let position_heading = div()
+            .text_xs()
+            .font_weight(FontWeight::MEDIUM)
+            .text_color(rgb(theme::TEXT_MUTED))
+            .child("Position");
+        let position_heading = if configuration.is_some() {
+            position_heading
+                .mt_1()
+                .pt_3()
+                .border_t_1()
+                .border_color(rgb(theme::BORDER_SUBTLE))
+        } else {
+            position_heading
+        };
         let panel = panel
-            .child(
-                div()
-                    .text_sm()
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .child(format!("Element {item}")),
-            )
-            .child(
-                div()
-                    .text_xs()
-                    .font_weight(FontWeight::MEDIUM)
-                    .text_color(rgb(theme::TEXT_MUTED))
-                    .child("Position"),
-            )
+            .child(position_heading)
             .child(
                 div()
                     .flex()
@@ -1676,6 +1706,40 @@ impl FrameViewer {
         } else {
             panel
         }
+    }
+
+    fn source_configuration(configuration: VideoSourceConfiguration) -> Div {
+        let (width, height) = configuration.dimensions;
+        div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .child(
+                div()
+                    .text_xs()
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(rgb(theme::TEXT_MUTED))
+                    .child("Source"),
+            )
+            .child(Self::source_property(
+                "Resolution",
+                format!("{width} x {height}"),
+            ))
+            .child(Self::source_property(
+                "Frame rate",
+                frame_rate_label(configuration.fps),
+            ))
+    }
+
+    fn source_property(label: &'static str, value: String) -> Div {
+        div()
+            .flex()
+            .items_center()
+            .justify_between()
+            .gap_2()
+            .text_xs()
+            .child(div().text_color(rgb(theme::TEXT_DIM)).child(label))
+            .child(div().text_color(rgb(theme::TEXT)).child(value))
     }
 
     fn sync_transform_input(
@@ -2318,13 +2382,15 @@ pub(crate) fn view(args: &StreamArgs) -> Result<(), Box<dyn Error>> {
         .ok_or(CaptureError::NoDisplay)?;
     let initial_source = target.id();
     let initial_generation = 1;
-    let initial_capturer = build_capturer(&target, options, initial_generation, &frame_hub)?;
+    let (initial_capturer, initial_configuration) =
+        build_capturer(&target, options, initial_generation, &frame_hub)?;
     initial_capturer.start()?;
     let captures = Rc::new(RefCell::new(HashMap::from([(
         initial_source,
         CaptureResource {
             capturer: initial_capturer,
             generation: initial_generation,
+            configuration: initial_configuration,
         },
     )])));
     let mut initial_scene = Scene::new();
@@ -2867,7 +2933,7 @@ fn build_capturer(
     options: CaptureOptions,
     generation: u64,
     frame_hub: &Arc<FrameHub>,
-) -> Result<CaptureBackend, CaptureError> {
+) -> Result<(CaptureBackend, Option<VideoSourceConfiguration>), CaptureError> {
     let source = target.id();
     let frame_hub = Arc::clone(frame_hub);
     let stop_hub = Arc::clone(&frame_hub);
@@ -2876,7 +2942,10 @@ fn build_capturer(
             let filter = target.filter().ok_or_else(|| {
                 CaptureError::InvalidConfiguration("missing capture filter".into())
             })?;
-            Capturer::builder(filter, stream_config(options))?
+            let dimensions = filter.capture_size().ok_or_else(|| {
+                CaptureError::InvalidConfiguration("failed to determine capture resolution".into())
+            })?;
+            let capturer = Capturer::builder(filter, stream_config(options))?
                 .with_timeout(CAPTURE_TIMEOUT)
                 .with_video_frame_callback(move |frame| {
                     frame_hub.submit(source, CapturedFrame::Screen(frame));
@@ -2888,20 +2957,46 @@ fn build_capturer(
                         error.localizedDescription().to_string(),
                     );
                 })
-                .build()
-                .map(CaptureBackend::Screen)
+                .build()?;
+            Ok((
+                CaptureBackend::Screen(capturer),
+                Some(VideoSourceConfiguration {
+                    dimensions,
+                    fps: f64::from(options.fps),
+                }),
+            ))
         }
         CaptureTarget::Camera(camera) => {
             let drop_hub = Arc::clone(&frame_hub);
-            CameraCapturer::new_with_drop_callback(
+            let capturer = CameraCapturer::new_with_drop_callback(
                 camera,
                 PREFERRED_CAMERA_FPS,
                 move |frame| frame_hub.submit(source, CapturedFrame::Camera(frame)),
                 move || drop_hub.report_camera_drop(source),
             )
-            .map(CaptureBackend::Camera)
-            .map_err(|error| CaptureError::Framework(error.to_string()))
+            .map_err(|error| CaptureError::Framework(error.to_string()))?;
+            let configuration = camera_configuration(&capturer);
+            Ok((CaptureBackend::Camera(capturer), configuration))
         }
+    }
+}
+
+fn camera_configuration(capturer: &CameraCapturer) -> Option<VideoSourceConfiguration> {
+    let format = capturer.capture_format()?;
+    Some(VideoSourceConfiguration {
+        dimensions: (
+            usize::try_from(format.dimensions.0).ok()?,
+            usize::try_from(format.dimensions.1).ok()?,
+        ),
+        fps: format.frame_rate,
+    })
+}
+
+fn frame_rate_label(fps: f64) -> String {
+    if (fps - fps.round()).abs() < 0.01 {
+        format!("{fps:.0} FPS")
+    } else {
+        format!("{fps:.2} FPS")
     }
 }
 
