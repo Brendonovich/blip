@@ -15,7 +15,7 @@ jobs:
 
     steps:
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Install Rust toolchain
         run: rustup show active-toolchain
@@ -33,7 +33,7 @@ jobs:
           tar -czf target/artifacts/blip-studio.tar.gz -C target/debug blip-studio
 
       - name: Upload Blip Capture
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: blip-capture-macos-${{ runner.arch }}-debug
           path: target/artifacts/blip-capture.tar.gz
@@ -41,7 +41,7 @@ jobs:
           retention-days: 14
 
       - name: Upload Blip Studio
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: blip-studio-macos-${{ runner.arch }}-debug
           path: target/artifacts/blip-studio.tar.gz
