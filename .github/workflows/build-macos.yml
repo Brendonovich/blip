@@ -8,10 +8,10 @@ permissions:
   contents: read
 
 jobs:
-  debug:
-    name: Debug binaries
+  build:
+    name: macOS DMGs
     runs-on: macos-14
-    timeout-minutes: 60
+    timeout-minutes: 90
 
     steps:
       - name: Check out repository
@@ -23,27 +23,28 @@ jobs:
       - name: Cache Rust build
         uses: Swatinem/rust-cache@v2
 
-      - name: Build debug binaries
-        run: cargo build --locked --package blip-capture --package blip-studio
+      - name: Build Blip Capture DMG
+        env:
+          BLIP_BUILD_NUMBER: ${{ github.run_number }}
+        run: apps/blip-capture/build-app.sh --dmg
 
-      - name: Package debug binaries
-        run: |
-          mkdir -p target/artifacts
-          tar -czf target/artifacts/blip-capture.tar.gz -C target/debug blip-capture
-          tar -czf target/artifacts/blip-studio.tar.gz -C target/debug blip-studio
+      - name: Build Blip Studio DMG
+        env:
+          BLIP_BUILD_NUMBER: ${{ github.run_number }}
+        run: apps/blip-studio/build-app.sh --dmg
 
       - name: Upload Blip Capture
         uses: actions/upload-artifact@v7
         with:
-          name: blip-capture-macos-${{ runner.arch }}-debug
-          path: target/artifacts/blip-capture.tar.gz
+          name: blip-capture-macos-${{ runner.arch }}
+          path: target/release/bundle/dmg/Blip-Capture.dmg
           if-no-files-found: error
           retention-days: 14
 
       - name: Upload Blip Studio
         uses: actions/upload-artifact@v7
         with:
-          name: blip-studio-macos-${{ runner.arch }}-debug
-          path: target/artifacts/blip-studio.tar.gz
+          name: blip-studio-macos-${{ runner.arch }}
+          path: target/release/bundle/dmg/Blip-Studio.dmg
           if-no-files-found: error
           retention-days: 14
