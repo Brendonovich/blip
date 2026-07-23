@@ -1,0 +1,2 @@
+[alias]
+lint = "clippy --workspace --all-targets --no-deps --exclude gpui --exclude gpui_linux --exclude gpui_macos --exclude gpui_macros --exclude gpui_platform --exclude gpui_shared_string --exclude gpui_tokio --exclude gpui_util --exclude gpui_web --exclude gpui_wgpu --exclude gpui_windows"

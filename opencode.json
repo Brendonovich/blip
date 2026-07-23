@@ -1,0 +1,17 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "references": {
+    "cap": {
+      "repository": "capsoftware/cap",
+      "description": "Use for Cap implementation details and conventions"
+    },
+    "scap": {
+      "repository": "capsoftware/scap",
+      "description": "Use for scap implementation details and conventions"
+    },
+    "obs-studio": {
+      "repository": "obsproject/obs-studio",
+      "description": "Use for OBS Studio rendering, preview UI, and streaming implementation details"
+    }
+  }
+}

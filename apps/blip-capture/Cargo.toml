@@ -1,0 +1,21 @@
+[package]
+name = "blip-capture"
+version = "0.1.0"
+edition.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+async-channel.workspace = true
+blip-avfoundation.workspace = true
+blip-sck.workspace = true
+chrono.workspace = true
+core-graphics.workspace = true
+dispatch2.workspace = true
+gpui.workspace = true
+gpui_platform.workspace = true
+objc2.workspace = true
+objc2-app-kit = { workspace = true, features = ["NSCell", "NSMenu", "NSMenuItem", "NSResponder", "NSRunningApplication", "NSScreen", "libc"] }
+objc2-foundation.workspace = true
+raw-window-handle.workspace = true

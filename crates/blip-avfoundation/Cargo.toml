@@ -1,0 +1,19 @@
+[package]
+name = "blip-avfoundation"
+version = "0.1.0"
+edition.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+block2.workspace = true
+dispatch2 = "0.3.0"
+objc2.workspace = true
+objc2-av-foundation.workspace = true
+objc2-core-foundation = "0.3.2"
+objc2-core-media.workspace = true
+objc2-core-video.workspace = true
+objc2-foundation.workspace = true
+objc2-io-surface.workspace = true
+thiserror.workspace = true

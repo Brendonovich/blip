@@ -1,0 +1,15 @@
+{
+  "canvas": [1920, 1080],
+  "sources": {
+    "camera": {
+      "type": "camera"
+    }
+  },
+  "elements": [
+    {
+      "source": "camera",
+      "center": [0.5, 0.5],
+      "size": [1.0, 1.0]
+    }
+  ]
+}

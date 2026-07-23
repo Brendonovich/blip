@@ -1,0 +1,166 @@
+[workspace]
+members = [
+    "apps/*",
+    "crates/*",
+    "gpui/gpui",
+    "gpui/gpui_linux",
+    "gpui/gpui_macos",
+    "gpui/gpui_macros",
+    "gpui/gpui_platform",
+    "gpui/gpui_shared_string",
+    "gpui/gpui_tokio",
+    "gpui/gpui_util",
+    "gpui/gpui_web",
+    "gpui/gpui_wgpu",
+    "gpui/gpui_windows",
+]
+resolver = "3"
+
+[workspace.package]
+edition = "2024"
+publish = false
+
+[workspace.dependencies]
+accesskit = { version = "0.24.0", features = ["enumn"] }
+accesskit_macos = "0.26.0"
+accesskit_unix = "0.21.0"
+accesskit_windows = "0.33.1"
+anyhow = "1.0.86"
+async-channel = "2.5.0"
+async-task = "4.7"
+ashpd = { version = "0.13", default-features = false, features = ["async-io", "notification", "open_uri", "file_chooser", "settings", "trash"] }
+backtrace = "0.3"
+bitflags = "2.6.0"
+blip-sck = { path = "crates/blip-sck" }
+blip-avfoundation = { path = "crates/blip-avfoundation" }
+bytemuck = { version = "1", features = ["derive"] }
+block = "0.1"
+block2 = "0.6"
+cbindgen = { version = "0.28.0", default-features = false }
+clap = { version = "4.5.50", features = ["derive"] }
+ctrlc = "3.5.0"
+crossterm = "0.29.0"
+chrono = { version = "0.4", features = ["serde"] }
+cocoa = "=0.26.0"
+cocoa-foundation = "=0.2.0"
+collections = { git = "https://github.com/zed-industries/zed", rev = "aba12fc8a0fe44a0742acc0d096e843d07385962", version = "0.1.0" }
+core-foundation = "0.10"
+core-foundation-sys = "0.8.6"
+core-graphics = "0.24"
+core-text = "21"
+core-video = { version = "0.5.2", features = ["metal"] }
+criterion = { version = "0.5", features = ["html_reports"] }
+ctor = "1.0.6"
+derive_more = { version = "2.1.1", features = ["add", "add_assign", "deref", "deref_mut", "display", "from_str", "mul", "mul_assign", "not"] }
+dispatch2 = "0.3.1"
+dunce = "1.0"
+env_logger = "0.11"
+etagere = "0.2"
+foreign-types = "0.5"
+ffmpeg = { package = "ffmpeg-next", version = "8.1.0", default-features = false, features = ["build", "codec", "format", "software-scaling"] }
+ffmpeg-sys-next = { version = "8.1.0", features = ["build-videotoolbox"] }
+futures = "0.3.32"
+futures-concurrency = "7.7.1"
+gpui = { path = "gpui/gpui", default-features = false }
+gpui_linux = { path = "gpui/gpui_linux", default-features = false }
+gpui_macos = { path = "gpui/gpui_macos", default-features = false }
+gpui_macros = { path = "gpui/gpui_macros" }
+gpui_platform = { path = "gpui/gpui_platform", default-features = false, features = ["font-kit", "runtime_shaders"] }
+gpui_shared_string = { path = "gpui/gpui_shared_string" }
+gpui_tokio = { path = "gpui/gpui_tokio" }
+gpui_util = { path = "gpui/gpui_util" }
+gpui_web = { path = "gpui/gpui_web" }
+gpui_wgpu = { path = "gpui/gpui_wgpu" }
+gpui_windows = { path = "gpui/gpui_windows", default-features = false }
+hdrhistogram = "7"
+heapless = "0.9.2"
+heck = "0.5"
+http_client = { git = "https://github.com/zed-industries/zed", rev = "aba12fc8a0fe44a0742acc0d096e843d07385962" }
+image = { version = "0.25.1", default-features = false, features = ["bmp", "dds", "exr", "ff", "gif", "hdr", "ico", "jpeg", "png", "pnm", "qoi", "rayon", "tga", "tiff", "webp"] }
+inventory = "0.3.19"
+itertools = "0.14.0"
+libc = "0.2"
+log = { version = "0.4.16", features = ["kv_unstable_serde", "serde"] }
+mach2 = "0.5"
+media = { git = "https://github.com/zed-industries/zed", rev = "aba12fc8a0fe44a0742acc0d096e843d07385962" }
+metal = "0.33"
+notify-rust = "4"
+objc2-core-video = { version = "0.3.2", features = ["CVPixelBuffer", "objc2-io-surface"] }
+objc2-io-surface = { version = "0.3.2", features = ["IOSurfaceRef", "objc2-core-foundation"] }
+objc2-metal = "0.3.2"
+objc = "0.2"
+objc2 = "0.6"
+objc2-app-kit = { version = "0.3.2", default-features = false, features = ["NSButton", "NSControl", "NSGraphics", "NSResponder", "NSView", "NSWindow", "objc2-core-foundation"] }
+objc2-av-foundation = { version = "0.3.2", default-features = false, features = ["std", "AVAssetWriter", "AVAssetWriterInput", "AVCaptureDevice", "AVCaptureInput", "AVCaptureOutputBase", "AVCaptureSession", "AVCaptureVideoDataOutput", "AVMediaFormat", "AVVideoSettings", "block2", "dispatch2", "objc2-core-media", "objc2-core-video"] }
+objc2-core-media = { version = "0.3.2", features = ["CMFormatDescription", "CMSampleBuffer", "CMTime"] }
+objc2-foundation = { version = "=0.3.2", default-features = false, features = ["NSArray", "NSAttributedString", "NSBundle", "NSCoder", "NSData", "NSDate", "NSDictionary", "NSEnumerator", "NSError", "NSGeometry", "NSNotification", "NSNull", "NSObjCRuntime", "NSObject", "NSProcessInfo", "NSRange", "NSRunLoop", "NSSet", "NSString", "NSURL", "NSUndoManager", "NSValue", "objc2-core-foundation", "std"] }
+objc2-user-notifications = "0.3"
+parking_lot = "0.12.1"
+pathfinder_geometry = "0.5"
+pollster = "0.4.0"
+postage = { version = "0.5", features = ["futures-traits"] }
+proc-macro2 = "1.0.93"
+profiling = "1"
+proptest = { git = "https://github.com/proptest-rs/proptest", rev = "3dca198a8fef1b32e3a66f1e1897c955b4dc5b5b", features = ["attr-macro"] }
+quote = "1.0.9"
+rand = "0.9"
+raw-window-handle = "0.6"
+refineable = { git = "https://github.com/zed-industries/zed", rev = "aba12fc8a0fe44a0742acc0d096e843d07385962" }
+regex = "1.5"
+reqwest_client = { git = "https://github.com/zed-industries/zed", rev = "aba12fc8a0fe44a0742acc0d096e843d07385962" }
+resvg = { version = "0.46.0", default-features = false, features = ["text", "system-fonts", "memmap-fonts", "raster-images"] }
+scap = { git = "https://github.com/zed-industries/scap", rev = "4afea48c3b002197176fb19cd0f9b180dd36eaac", default-features = false, package = "zed-scap", version = "0.0.8-zed" }
+scheduler = { git = "https://github.com/zed-industries/zed", rev = "aba12fc8a0fe44a0742acc0d096e843d07385962" }
+schemars = { version = "1.0", features = ["indexmap2"] }
+semver = { version = "1.0", features = ["serde"] }
+serde = { version = "1.0.221", features = ["derive", "rc"] }
+serde_json = { version = "1.0.144", features = ["preserve_order", "raw_value"] }
+slotmap = "1.0.6"
+smallvec = { version = "1.6", features = ["union", "const_new"] }
+smol = "2.0"
+stacksafe = "0.1"
+strum = { version = "0.27.2", features = ["derive"] }
+sum_tree = { git = "https://github.com/zed-industries/zed", rev = "aba12fc8a0fe44a0742acc0d096e843d07385962" }
+swash = "0.2.6"
+syn = { version = "2.0.101", features = ["full", "extra-traits", "visit-mut"] }
+thiserror = "2.0.12"
+tokio = "1"
+unicode-segmentation = "1.10"
+url = "2.2"
+usvg = { version = "0.46.0", default-features = false }
+util_macros = { git = "https://github.com/zed-industries/zed", rev = "aba12fc8a0fe44a0742acc0d096e843d07385962" }
+uuid = { version = "1.1.2", features = ["v4", "v5", "v7", "serde"] }
+wasm-bindgen = "0.2.120"
+web-time = "1.1.0"
+wgpu = "29.0.4"
+wgsl_bindgen = "0.22.2"
+which = "6.0.0"
+windows = "0.61"
+windows-core = "0.61"
+
+[patch.crates-io]
+async-task = { git = "https://github.com/smol-rs/async-task.git", rev = "b4486cd71e4e94fbda54ce6302444de14f4d190e" }
+
+[profile.release]
+codegen-units = 1
+lto = "thin"
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+unused_must_use = "deny"
+
+[workspace.lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "deny", priority = -1 }
+arithmetic_side_effects = "deny"
+as_conversions = "deny"
+dbg_macro = "deny"
+expect_used = "deny"
+indexing_slicing = "deny"
+integer_division = "deny"
+panic = "deny"
+todo = "deny"
+unchecked_time_subtraction = "deny"
+undocumented_unsafe_blocks = "deny"
+unimplemented = "deny"
+unwrap_used = "deny"
