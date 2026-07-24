@@ -23,7 +23,9 @@ pub(crate) enum NumericInputEvent {
 }
 
 pub(crate) struct NumericInput {
-    label: &'static str,
+    label: Option<&'static str>,
+    placeholder: SharedString,
+    numeric: bool,
     focus_handle: FocusHandle,
     content: SharedString,
     selected_range: Range<usize>,
@@ -35,7 +37,9 @@ pub(crate) struct NumericInput {
 impl NumericInput {
     pub(crate) fn new(label: &'static str, cx: &mut Context<Self>) -> Self {
         Self {
-            label,
+            label: Some(label),
+            placeholder: "".into(),
+            numeric: true,
             focus_handle: cx.focus_handle(),
             content: "0".into(),
             selected_range: 0..1,
@@ -43,6 +47,24 @@ impl NumericInput {
             last_bounds: None,
             focus_subscriptions: Vec::new(),
         }
+    }
+
+    pub(crate) fn new_text(placeholder: impl Into<SharedString>, cx: &mut Context<Self>) -> Self {
+        Self {
+            label: None,
+            placeholder: placeholder.into(),
+            numeric: false,
+            focus_handle: cx.focus_handle(),
+            content: "".into(),
+            selected_range: 0..0,
+            last_layout: None,
+            last_bounds: None,
+            focus_subscriptions: Vec::new(),
+        }
+    }
+
+    pub(crate) fn value(&self) -> &str {
+        &self.content
     }
 
     pub(crate) fn bind_keys(cx: &mut App) {
@@ -146,14 +168,16 @@ impl NumericInput {
         let candidate = self.content[..self.selected_range.start].to_owned()
             + text
             + &self.content[self.selected_range.end..];
-        if !is_numeric_candidate(&candidate) {
+        if self.numeric && !is_numeric_candidate(&candidate) {
             window.play_system_bell();
             return;
         }
         let cursor = self.selected_range.start.saturating_add(text.len());
         self.content = candidate.into();
         self.selected_range = cursor..cursor;
-        if let Ok(value) = self.content.parse() {
+        if self.numeric
+            && let Ok(value) = self.content.parse()
+        {
             cx.emit(NumericInputEvent::Changed(value));
         }
         cx.notify();
@@ -299,12 +323,21 @@ impl Element for NumericTextElement {
     ) -> Self::PrepaintState {
         let input = self.input.read(cx);
         let content = input.content.clone();
+        let display_text = if content.is_empty() {
+            input.placeholder.clone()
+        } else {
+            content.clone()
+        };
         let selection = input.selected_range.clone();
         let focused = input.focus_handle.is_focused(window);
         let run = TextRun {
-            len: content.len(),
+            len: display_text.len(),
             font: window.text_style().font(),
-            color: window.text_style().color,
+            color: if content.is_empty() {
+                rgb(theme::TEXT_DIM).into()
+            } else {
+                window.text_style().color
+            },
             background_color: None,
             underline: None,
             strikethrough: None,
@@ -312,7 +345,7 @@ impl Element for NumericTextElement {
         let font_size = window.text_style().font_size.to_pixels(window.rem_size());
         let line = window
             .text_system()
-            .shape_line(content, font_size, &[run], None);
+            .shape_line(display_text, font_size, &[run], None);
         let cursor_x = line.x_for_index(selection.end);
         let (selection_quad, cursor) = if !focused {
             (None, None)
@@ -411,7 +444,7 @@ impl Render for NumericInput {
                     cx.emit(NumericInputEvent::FocusChanged(false));
                 }));
         }
-        div()
+        let input = div()
             .key_context("NumericInput")
             .track_focus(&self.focus_handle)
             .cursor(CursorStyle::IBeam)
@@ -438,21 +471,25 @@ impl Render for NumericInput {
                 rgb(theme::BORDER_SUBTLE)
             })
             .text_color(rgb(theme::TEXT))
-            .text_sm()
-            .child(
+            .text_sm();
+        let input = if let Some(label) = self.label {
+            input.child(
                 div()
                     .w(px(18.0))
                     .flex_none()
                     .text_xs()
                     .text_color(rgb(theme::TEXT_MUTED))
-                    .child(self.label),
+                    .child(label),
             )
-            .child(
-                div()
-                    .flex_1()
-                    .overflow_hidden()
-                    .child(NumericTextElement { input: cx.entity() }),
-            )
+        } else {
+            input
+        };
+        input.child(
+            div()
+                .flex_1()
+                .overflow_hidden()
+                .child(NumericTextElement { input: cx.entity() }),
+        )
     }
 }
 

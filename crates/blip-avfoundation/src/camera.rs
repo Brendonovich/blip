@@ -285,7 +285,7 @@ impl CameraCapturer {
             frame: callback,
             dropped: drop_callback,
         });
-        let queue = DispatchQueue::new("com.brendonovich.blip.camera", None);
+        let queue = DispatchQueue::new("dev.brendonovich.blip.camera", None);
         let selected_format = select_format(&raw_device, fps);
 
         // SAFETY: Configuration is completed before the session starts and both objects are retained.

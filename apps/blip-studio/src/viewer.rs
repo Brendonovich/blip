@@ -632,7 +632,10 @@ struct FrameViewer {
     next_color_source_id: u64,
     frame_hub: Arc<FrameHub>,
     stream: Option<RtmpStream>,
-    stream_config: Option<RtmpConfig>,
+    stream_url: Entity<NumericInput>,
+    stream_url_focused: bool,
+    stream_fps: u32,
+    stream_bitrate: usize,
     stream_canvas: Rc<Cell<Option<(usize, usize)>>>,
     stream_generation: u64,
     stream_error_sender: Sender<(u64, String)>,
@@ -831,7 +834,7 @@ impl FrameViewer {
     }
 
     fn delete_selected(&mut self, cx: &mut Context<Self>) {
-        if !self.focused_transform_inputs.is_empty() {
+        if self.stream_url_focused || !self.focused_transform_inputs.is_empty() {
             return;
         }
         let Some(selected) = self.selected_item.take() else {
@@ -876,7 +879,7 @@ impl FrameViewer {
         clippy::cast_precision_loss
     )]
     fn move_selected(&mut self, delta: [f32; 2], cx: &mut Context<Self>) {
-        if !self.focused_transform_inputs.is_empty() {
+        if self.stream_url_focused || !self.focused_transform_inputs.is_empty() {
             return;
         }
         let Some(selected) = self.selected_item else {
@@ -910,11 +913,12 @@ impl FrameViewer {
             return;
         }
 
-        let Some(config) = self.stream_config.clone() else {
-            self.control_error = Some("start with --rtmp-url to configure a destination".into());
+        let url = self.stream_url.read(cx).value().trim().to_owned();
+        if url.is_empty() {
+            self.control_error = Some("enter an RTMP URL before starting the stream".into());
             cx.notify();
             return;
-        };
+        }
         let Some(dimensions) = self.content_dimensions else {
             self.control_error = Some("waiting for the first captured frame".into());
             cx.notify();
@@ -922,7 +926,11 @@ impl FrameViewer {
         };
         let dimensions = even_dimensions(dimensions);
         match RtmpStream::start(
-            config,
+            RtmpConfig {
+                url,
+                fps: self.stream_fps,
+                bitrate: self.stream_bitrate,
+            },
             dimensions,
             self.stream_generation,
             self.stream_error_sender.clone(),
@@ -2186,6 +2194,7 @@ impl FrameViewer {
                     )
                     .on_click(cx.listener(|viewer, _, _, cx| viewer.toggle_stream(cx))),
             )
+            .child(self.stream_url.clone())
             .child(
                 div()
                     .text_sm()
@@ -2402,11 +2411,8 @@ pub(crate) fn view(args: &StreamArgs) -> Result<(), Box<dyn Error>> {
     let compositor_colors = Rc::clone(&colors);
     let stream_canvas = Rc::new(Cell::new(None));
     let compositor_canvas = Rc::clone(&stream_canvas);
-    let stream_config = args.rtmp_url.clone().map(|url| RtmpConfig {
-        url,
-        fps: args.fps,
-        bitrate: args.bitrate,
-    });
+    let stream_fps = args.fps;
+    let stream_bitrate = args.bitrate;
     let (stream_error_sender, stream_error_receiver) = async_channel::unbounded();
 
     let viewer_captures = Rc::clone(&captures);
@@ -2455,6 +2461,14 @@ pub(crate) fn view(args: &StreamArgs) -> Result<(), Box<dyn Error>> {
 
             let viewer = cx.new(|cx| {
                 let transform_inputs = TransformInputs::new(cx);
+                let stream_url = cx.new(|cx| NumericInput::new_text("Stream key (RTMP URL)", cx));
+                cx.subscribe(&stream_url, |viewer, _, event: &NumericInputEvent, cx| {
+                    if let NumericInputEvent::FocusChanged(focused) = event {
+                        viewer.stream_url_focused = *focused;
+                        cx.notify();
+                    }
+                })
+                .detach();
                 FrameViewer {
                     image: None,
                     content_dimensions: None,
@@ -2487,7 +2501,10 @@ pub(crate) fn view(args: &StreamArgs) -> Result<(), Box<dyn Error>> {
                     next_color_source_id: 1,
                     frame_hub: viewer_frame_hub,
                     stream: None,
-                    stream_config,
+                    stream_url,
+                    stream_url_focused: false,
+                    stream_fps,
+                    stream_bitrate,
                     stream_canvas,
                     stream_generation: 0,
                     stream_error_sender,

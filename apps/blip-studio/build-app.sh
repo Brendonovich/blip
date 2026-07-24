@@ -108,7 +108,7 @@ codesign "${sign_args[@]}" "$app"
 plutil -lint "$app/Contents/Info.plist"
 codesign --verify --deep --strict --verbose=2 "$app"
 test "$(plutil -extract CFBundleIdentifier raw "$app/Contents/Info.plist")" = \
-    "com.brendonovich.blip.studio"
+    "dev.brendonovich.blip.studio"
 test "$(plutil -extract CFBundleShortVersionString raw "$app/Contents/Info.plist")" = "$version"
 
 if [[ "$make_dmg" == true ]]; then

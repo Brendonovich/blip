@@ -33,10 +33,6 @@ struct StreamArgs {
     #[arg(long)]
     cursor: bool,
 
-    /// RTMP destination, including the stream key.
-    #[arg(long, value_name = "URL")]
-    rtmp_url: Option<String>,
-
     /// Target H.264 video bitrate in kilobits per second.
     #[arg(long, default_value_t = 6_000, value_name = "KBPS")]
     bitrate: usize,
@@ -86,15 +82,19 @@ mod tests {
     }
 
     #[test]
-    fn accepts_rtmp_options() {
-        let result = StreamArgs::try_parse_from([
-            "blip-studio",
-            "--rtmp-url",
-            "rtmp://localhost/live/test",
-            "--bitrate",
-            "4500",
-        ]);
-        assert!(result.is_ok(), "stream app should accept RTMP options");
+    fn accepts_stream_bitrate() {
+        let result = StreamArgs::try_parse_from(["blip-studio", "--bitrate", "4500"]);
+        assert!(result.is_ok(), "stream app should accept a stream bitrate");
+    }
+
+    #[test]
+    fn rejects_removed_rtmp_url_option() {
+        let result =
+            StreamArgs::try_parse_from(["blip-studio", "--rtmp-url", "rtmp://localhost/live/test"]);
+        assert!(
+            result.is_err(),
+            "RTMP destinations should be entered in the UI"
+        );
     }
 
     #[test]

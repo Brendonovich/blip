@@ -207,7 +207,7 @@ impl CapturerBuilder {
                 Some(delegate),
             )
         };
-        let queue = DispatchQueue::new("com.brendonovich.blip.capture", None);
+        let queue = DispatchQueue::new("dev.brendonovich.blip.capture", None);
         let stream_output = ProtocolObject::<dyn SCStreamOutput>::from_ref(&*output);
         // SAFETY: Capturer retains the serial queue and output for the stream lifetime.
         unsafe {

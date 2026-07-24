@@ -7,7 +7,7 @@
     <key>CFBundleExecutable</key>
     <string>blip-studio</string>
     <key>CFBundleIdentifier</key>
-    <string>com.brendonovich.blip.studio</string>
+    <string>dev.brendonovich.blip.studio</string>
     <key>CFBundleInfoDictionaryVersion</key>
     <string>6.0</string>
     <key>CFBundleName</key>
