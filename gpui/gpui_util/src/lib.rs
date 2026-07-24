@@ -295,28 +295,41 @@ where
     let file = caller.file();
     #[cfg(windows)]
     let file = caller.file().replace('\\', "/");
-    // In this codebase all crates reside in a `crates` directory,
-    // so discard the prefix up to that segment to find the crate name
-    let file = file.split_once("crates/");
-    let target = file.as_ref().and_then(|(_, s)| s.split_once("/src/"));
-
-    let module_path = target.map(|(krate, module)| {
-        if module.starts_with(krate) {
-            module.trim_end_matches(".rs").replace('/', "::")
-        } else {
-            krate.to_owned() + "::" + &module.trim_end_matches(".rs").replace('/', "::")
-        }
-    });
-    let file = file.map(|(_, file)| format!("crates/{file}"));
+    #[cfg(windows)]
+    let file = file.as_str();
+    let module_path = module_path_for_file(file);
     log::logger().log(
         &log::Record::builder()
             .target(module_path.as_deref().unwrap_or(""))
-            .module_path(file.as_deref())
+            .module_path(Some(file))
             .args(format_args!("{:#}", error))
             .file(Some(caller.file()))
             .line(Some(caller.line()))
             .level(level)
             .build(),
+    );
+}
+
+fn module_path_for_file(file: &str) -> Option<String> {
+    let (crate_path, module) = file.rsplit_once("/src/")?;
+    let krate = crate_path.rsplit('/').next()?.replace('-', "_");
+    let module = module.trim_end_matches(".rs").replace('/', "::");
+    Some(if matches!(module.as_str(), "lib" | "main") {
+        krate
+    } else {
+        format!("{krate}::{module}")
+    })
+}
+
+#[test]
+fn derives_log_target_from_workspace_path() {
+    assert_eq!(
+        module_path_for_file("/workspace/gpui/gpui/src/window.rs").as_deref(),
+        Some("gpui::window")
+    );
+    assert_eq!(
+        module_path_for_file("/workspace/apps/blip-capture/src/main.rs").as_deref(),
+        Some("blip_capture")
     );
 }
 

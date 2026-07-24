@@ -1556,11 +1556,9 @@ impl Window {
             let input_rate_tracker = input_rate_tracker.clone();
             let mut deferred_force_render = false;
             move |request_frame_options| {
-                // This must be checked before anything else: if this request
-                // arrived re-entrantly while a draw is on this thread's stack
-                // (e.g. via a nested message pump in the Windows window
-                // procedure), drawing would nest draws, and even touching the
-                // App would panic on its already-mutable borrow. Skip instead;
+                // This must be checked before anything else: platform callbacks can arrive
+                // re-entrantly while the App is borrowed, including from a nested message pump
+                // during a draw or synchronously while configuring a native window. Skip instead;
                 // the platform leaves the window invalidated (or re-invalidates
                 // it), so a fresh request arrives once the in-progress draw
                 // unwinds. Remember force_render so the deferred frame still
@@ -1571,7 +1569,7 @@ impl Window {
                 // but calling it would hit the App borrow panic above, and this
                 // branch is unreachable there in practice: only Windows pumps
                 // platform events (and thus requests frames) mid-draw.
-                if draw_in_progress() {
+                if draw_in_progress() || !cx.can_update() {
                     log::debug!("deferring re-entrant window draw request");
                     deferred_force_render |= request_frame_options.force_render;
                     return;

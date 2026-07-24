@@ -1,11 +1,15 @@
 #![cfg(target_os = "macos")]
 
 mod camera;
+mod decoder;
+mod hls;
 
 pub use camera::{
     CameraAuthorizationStatus, CameraCaptureFormat, CameraCapturer, CameraDevice, CameraError,
     CameraFrame, camera_authorization_status, list_video_devices, request_camera_access,
 };
+pub use decoder::*;
+pub use hls::HlsWriter;
 
 use std::fs;
 use std::path::Path;
@@ -33,6 +37,8 @@ pub enum WriterError {
     InvalidDimensions,
     #[error("frame rate must be greater than zero")]
     InvalidFrameRate,
+    #[error("HLS segment duration must be greater than zero")]
+    InvalidSegmentDuration,
     #[error("output path is not valid UTF-8")]
     InvalidOutputPath,
     #[error("failed to prepare output: {0}")]
@@ -47,6 +53,8 @@ pub enum WriterError {
     Start(String),
     #[error("failed to append video frame: {0}")]
     Append(String),
+    #[error("failed to write HLS output: {0}")]
+    HlsOutput(String),
     #[error("recording contains no video frames")]
     NoFrames,
     #[error("video timestamp exceeds AVFoundation's range")]

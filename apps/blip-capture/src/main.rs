@@ -1,6 +1,7 @@
 use std::cell::{Cell, RefCell};
 use std::ffi::c_void;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::process::ExitCode;
 use std::ptr;
 use std::ptr::NonNull;
 use std::rc::Rc;
@@ -9,6 +10,7 @@ use std::time::{Duration, Instant};
 
 use blip_sck::{CaptureError, Display, ShareableContent, Window as CaptureWindow};
 use chrono::Local;
+use clap::Parser;
 use core_graphics::window::{
     create_window_list, kCGNullWindowID, kCGWindowListExcludeDesktopElements,
     kCGWindowListOptionOnScreenOnly,
@@ -17,8 +19,8 @@ use dispatch2::DispatchQueue;
 use gpui::{
     AnyWindowHandle, App, Bounds, ClipboardEntry, ClipboardItem, Context, CursorStyle, Div, Entity,
     ExternalPaths, FontWeight, IntoElement, MouseButton, MouseDownEvent, MouseMoveEvent,
-    MouseUpEvent, Pixels, Point, Render, Window, WindowBackgroundAppearance, WindowBounds,
-    WindowKind, WindowOptions, div, point, prelude::*, px, rgb, rgba, size,
+    MouseUpEvent, Pixels, Point, Render, SharedString, Window, WindowBackgroundAppearance,
+    WindowBounds, WindowKind, WindowOptions, div, point, prelude::*, px, rgb, rgba, size,
 };
 use gpui_platform::application;
 use objc2::rc::Retained;
@@ -33,13 +35,24 @@ use objc2_app_kit::{
 use objc2_foundation::{NSObject, NSObjectProtocol, NSPoint, NSString};
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 
+mod bundle;
+mod editor;
+mod headless;
 #[path = "../../blip-studio/src/numeric_input.rs"]
 #[allow(dead_code)]
 mod numeric_input;
+mod profiles;
 mod recording;
 mod theme;
+mod upload;
 
+use bundle::BlipBundle;
+use editor::BundleEditor;
 use numeric_input::{NumericInput, NumericInputEvent};
+use profiles::{
+    CompletionAction, RecordingFormat, RecordingProfile, RecordingProfiles, RecordingTarget,
+    join_server_url, split_server_url,
+};
 use recording::{CaptureSpec, RecordingEvent};
 
 #[link(name = "CoreGraphics", kind = "framework")]
@@ -57,8 +70,47 @@ const OVERLAY_BLACK: u32 = 0x0000_0060;
 const OVERLAY_BLUE_TINT: u32 = 0x184d_8280;
 const CAPTURE_TIMEOUT: Duration = Duration::from_secs(5);
 const WINDOW_POLL_INTERVAL: Duration = Duration::from_millis(250);
-const TOOLBAR_SIZE: (f32, f32) = (556.0, 58.0);
+#[allow(clippy::arithmetic_side_effects)]
+fn toolbar_dimensions_for_label(label: &str) -> (f32, f32) {
+    let char_count = label.chars().count().clamp(3, 30);
+    let width = 344.0 + (char_count as f32 * 8.0);
+    (width, 56.0)
+}
 type RegionSelection = (u32, f64, f64, f64, f64);
+
+#[derive(Debug, Parser)]
+#[command(name = "blip-capture", about = "Record and share your Mac screen")]
+struct CaptureArgs {
+    /// Path to a Blip bundle or file to open.
+    #[arg(value_name = "PATH", conflicts_with = "headless")]
+    path: Option<PathBuf>,
+
+    /// Record and upload without opening the capture interface.
+    #[arg(long)]
+    headless: bool,
+
+    /// Blip server URL, including the capture key after `#`.
+    #[arg(long, value_name = "URL", requires = "headless")]
+    server_url: Option<String>,
+
+    /// Display ID reported by `blip-cli displays list`. Defaults to the main display.
+    #[arg(long, value_name = "ID", requires = "headless")]
+    display: Option<u32>,
+
+    /// Number of seconds to record.
+    #[arg(
+        long,
+        default_value_t = 5,
+        value_name = "SECONDS",
+        value_parser = clap::value_parser!(u64).range(1..),
+        requires = "headless"
+    )]
+    duration: u64,
+
+    /// Recording format to exercise during the upload.
+    #[arg(long, value_enum, default_value_t, requires = "headless")]
+    format: headless::HeadlessFormat,
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Mode {
@@ -74,35 +126,10 @@ enum Status {
     Finalizing,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum SaveDestination {
-    Desktop,
-    Documents,
-    Downloads,
-    Clipboard,
-}
-
-impl SaveDestination {
-    const ALL: [Self; 4] = [
-        Self::Desktop,
-        Self::Documents,
-        Self::Downloads,
-        Self::Clipboard,
-    ];
-
-    const fn label(self) -> &'static str {
-        match self {
-            Self::Desktop => "Desktop",
-            Self::Documents => "Documents",
-            Self::Downloads => "Downloads",
-            Self::Clipboard => "Clipboard",
-        }
-    }
-}
-
 enum DestinationMenuAction {
-    SelectDestination(SaveDestination),
-    ToggleOpenFinder,
+    SelectProfile(usize),
+    ToggleOpenRecording,
+    OpenSettings,
 }
 
 struct DestinationMenuHandlerIvars {
@@ -122,19 +149,25 @@ define_class!(
             let Ok(index) = usize::try_from(item.tag()) else {
                 return;
             };
-            if let Some(destination) = SaveDestination::ALL.get(index).copied() {
-                self.ivars()
-                    .sender
-                    .try_send(DestinationMenuAction::SelectDestination(destination))
-                    .ok();
-            }
-        }
-
-        #[unsafe(method(toggleOpenFinder:))]
-        fn toggle_open_finder(&self, _: &NSMenuItem) {
             self.ivars()
                 .sender
-                .try_send(DestinationMenuAction::ToggleOpenFinder)
+                .try_send(DestinationMenuAction::SelectProfile(index))
+                .ok();
+        }
+
+        #[unsafe(method(toggleOpenRecording:))]
+        fn toggle_open_recording(&self, _: &NSMenuItem) {
+            self.ivars()
+                .sender
+                .try_send(DestinationMenuAction::ToggleOpenRecording)
+                .ok();
+        }
+
+        #[unsafe(method(openProfileSettings:))]
+        fn open_profile_settings(&self, _: &NSMenuItem) {
+            self.ivars()
+                .sender
+                .try_send(DestinationMenuAction::OpenSettings)
                 .ok();
         }
     }
@@ -189,13 +222,16 @@ struct CaptureApp {
     event_sender: async_channel::Sender<RecordingEvent>,
     visible: Rc<Cell<bool>>,
     escape_hotkey: Rc<Cell<*mut c_void>>,
-    destination: SaveDestination,
+    profiles: RecordingProfiles,
     destination_sender: async_channel::Sender<DestinationMenuAction>,
-    open_finder_after_recording: bool,
+    recording_completion_action: CompletionAction,
+    open_recording_when_finished: bool,
+    drag_start_window_position: Option<Point<Pixels>>,
     error: Option<String>,
 }
 
 impl CaptureApp {
+    #[allow(clippy::too_many_lines)]
     fn new(
         targets: &CaptureTargets,
         controller_window: AnyWindowHandle,
@@ -208,7 +244,7 @@ impl CaptureApp {
         let windows = targets.windows.clone();
         let selected_window = None;
         let selection = Rc::new(SelectionState {
-            mode: Cell::new(Some(Mode::Display)),
+            mode: Cell::new(None),
             display: Cell::new(selected_display),
             window: Cell::new(selected_window),
             hovered_window: Cell::new(None),
@@ -233,12 +269,21 @@ impl CaptureApp {
                 if app
                     .update(cx, |app, cx| {
                         match action {
-                            DestinationMenuAction::SelectDestination(destination) => {
-                                app.destination = destination;
+                            DestinationMenuAction::SelectProfile(index) => {
+                                if let Some(profile) = app.profiles.profiles.get(index) {
+                                    app.profiles.selected_profile_id = profile.id.clone();
+                                    if let Err(error) = app.profiles.save() {
+                                        app.error = Some(error);
+                                    }
+                                    let dimensions = app.idle_toolbar_dimensions();
+                                    app.resize_toolbar(dimensions, cx);
+                                }
                             }
-                            DestinationMenuAction::ToggleOpenFinder => {
-                                app.open_finder_after_recording = !app.open_finder_after_recording;
+                            DestinationMenuAction::ToggleOpenRecording => {
+                                app.open_recording_when_finished =
+                                    !app.open_recording_when_finished;
                             }
+                            DestinationMenuAction::OpenSettings => app.open_profile_settings(cx),
                         }
                         cx.notify();
                     })
@@ -285,7 +330,7 @@ impl CaptureApp {
             controller_window,
             displays,
             windows,
-            mode: Some(Mode::Display),
+            mode: None,
             selected_display,
             selected_window,
             region: None,
@@ -298,9 +343,11 @@ impl CaptureApp {
             event_sender,
             visible,
             escape_hotkey,
-            destination: SaveDestination::Desktop,
+            profiles: RecordingProfiles::load(),
             destination_sender,
-            open_finder_after_recording: true,
+            recording_completion_action: CompletionAction::None,
+            open_recording_when_finished: true,
+            drag_start_window_position: None,
             error: None,
         }
     }
@@ -414,14 +461,83 @@ impl CaptureApp {
     fn show_destination_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if schedule_destination_menu(
             window,
-            self.destination,
-            self.open_finder_after_recording,
+            self.profiles
+                .profiles
+                .iter()
+                .map(|profile| profile.name.clone())
+                .collect(),
+            self.profiles.selected_index(),
+            self.open_recording_when_finished,
             self.destination_sender.clone(),
         )
         .is_err()
         {
             self.error = Some("Failed to open the destination menu".into());
             cx.notify();
+        }
+    }
+
+    fn open_profile_settings(&mut self, cx: &mut Context<Self>) {
+        let controller = cx.entity();
+        let profiles = self.profiles.clone();
+        let options = profile_settings_options(cx);
+        let settings_window = match cx.open_window(options, move |_, cx| {
+            cx.new(|cx| ProfileSettings::new(controller, profiles, cx))
+        }) {
+            Ok(window) => window,
+            Err(error) => {
+                self.error = Some(format!(
+                    "Failed to open recording profile settings: {error}"
+                ));
+                cx.notify();
+                return;
+            }
+        };
+
+        self.close_selection_windows(cx);
+        unregister_escape_hotkey(&self.escape_hotkey);
+        self.controller_window
+            .update(cx, |_, window, _| {
+                set_toolbar_window_visible(window, false);
+            })
+            .ok();
+
+        let settings_window_id = AnyWindowHandle::from(settings_window).window_id();
+        cx.defer(move |cx| {
+            cx.activate(true);
+            settings_window
+                .update(cx, |_, window, _| window.activate_window())
+                .ok();
+        });
+        let controller_window = self.controller_window;
+        let restored = Rc::new(Cell::new(false));
+        cx.on_window_closed(move |cx, window_id| {
+            if window_id != settings_window_id || restored.replace(true) {
+                return;
+            }
+            let Some(controller) = controller_window.downcast::<CaptureApp>() else {
+                return;
+            };
+            controller
+                .update(cx, |app, window, cx| {
+                    app.restore_after_profile_settings(window, cx);
+                })
+                .ok();
+        })
+        .detach();
+    }
+
+    fn restore_after_profile_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        set_toolbar_window_visible(window, true);
+        if self.mode.is_some() {
+            self.open_selection_windows(window, cx);
+        }
+        match register_escape_hotkey() {
+            Ok(hotkey) => self.escape_hotkey.set(hotkey),
+            Err(status) => {
+                self.error = Some(format!("Failed to register Escape ({status})"));
+                cx.notify();
+            }
         }
     }
 
@@ -551,9 +667,35 @@ impl CaptureApp {
                 return;
             }
         };
+        let Some(profile) = self.profiles.selected().cloned() else {
+            self.error = Some("Create a recording profile first".into());
+            cx.notify();
+            return;
+        };
+        if let Err(error) = profile.validate() {
+            self.error = Some(error);
+            cx.notify();
+            return;
+        }
+        let output = match output_destination(&profile) {
+            Ok(output) => output,
+            Err(error) => {
+                self.error = Some(error);
+                cx.notify();
+                return;
+            }
+        };
+        let server_url = match &profile.target {
+            RecordingTarget::Remote { server_url } => Some(server_url.clone()),
+            RecordingTarget::Local { .. } => None,
+        };
         let sender = match recording::spawn(
             spec,
-            output_path(self.destination),
+            output.media_path,
+            output.completed_path,
+            output.cleanup_on_failure,
+            server_url,
+            profile.format,
             self.event_sender.clone(),
         ) {
             Ok(sender) => sender,
@@ -563,6 +705,7 @@ impl CaptureApp {
                 return;
             }
         };
+        self.recording_completion_action = profile.completion_action;
         self.selection.recording.set(true);
         self.refresh_selection_windows(cx);
         self.close_interaction_windows(cx);
@@ -641,15 +784,33 @@ impl CaptureApp {
                 })
                 .detach();
             }
-            RecordingEvent::Finished(path) => {
-                if self.destination == SaveDestination::Clipboard {
-                    cx.write_to_clipboard(ClipboardItem {
-                        entries: vec![ClipboardEntry::ExternalPaths(ExternalPaths(
-                            std::iter::once(path.clone()).collect(),
-                        ))],
-                    });
-                } else if self.open_finder_after_recording {
-                    cx.reveal_path(&path);
+            RecordingEvent::Finished { path, viewer_url } => {
+                if let Some(viewer_url) = viewer_url {
+                    cx.write_to_clipboard(ClipboardItem::new_string(viewer_url.clone()));
+                    if self.open_recording_when_finished {
+                        cx.open_url(&viewer_url);
+                    }
+                } else if path
+                    .extension()
+                    .is_some_and(|extension| extension == "blip")
+                {
+                    if let Err(error) = BundleEditor::open(path.clone(), cx) {
+                        eprintln!("blip-capture: {error}");
+                    }
+                } else {
+                    match self.recording_completion_action {
+                        CompletionAction::CopyToClipboard => {
+                            cx.write_to_clipboard(ClipboardItem {
+                                entries: vec![ClipboardEntry::ExternalPaths(ExternalPaths(
+                                    std::iter::once(path.clone()).collect(),
+                                ))],
+                            });
+                        }
+                        CompletionAction::Reveal if self.open_recording_when_finished => {
+                            cx.reveal_path(&path);
+                        }
+                        CompletionAction::Reveal | CompletionAction::None => {}
+                    }
                 }
                 self.selection.recording.set(false);
                 self.close_selection_windows(cx);
@@ -669,7 +830,8 @@ impl CaptureApp {
                 self.stop_sender = None;
                 self.selection.recording.set(false);
                 self.error = Some(message);
-                self.resize_toolbar(TOOLBAR_SIZE, cx);
+                let dimensions = self.idle_toolbar_dimensions();
+                self.resize_toolbar(dimensions, cx);
                 let controller = self.controller_window;
                 cx.defer(move |cx| {
                     let Some(controller) = controller.downcast::<CaptureApp>() else {
@@ -694,6 +856,23 @@ impl CaptureApp {
                 window.resize(size(px(dimensions.0), px(dimensions.1)));
             })
             .ok();
+    }
+
+    fn idle_toolbar_dimensions(&self) -> (f32, f32) {
+        let label = self
+            .profiles
+            .selected()
+            .map_or("Profile", |profile| profile.name.as_str());
+        toolbar_dimensions_for_label(label)
+    }
+
+    #[allow(clippy::arithmetic_side_effects)]
+    fn was_dragged(&mut self, window: &Window) -> bool {
+        let Some(start) = self.drag_start_window_position.take() else {
+            return false;
+        };
+        let current = window.bounds().origin;
+        (current.x - start.x).abs() > px(3.0) || (current.y - start.y).abs() > px(3.0)
     }
 
     fn mode_button(
@@ -724,7 +903,11 @@ impl CaptureApp {
             })
             .hover(|button| button.bg(rgba(0xffff_ff14)).text_color(rgb(TEXT)))
             .cursor_pointer()
-            .on_click(cx.listener(move |app, _, window, cx| app.set_mode(mode, window, cx)))
+            .on_click(cx.listener(move |app, _, window, cx| {
+                if !app.was_dragged(window) {
+                    app.set_mode(mode, window, cx);
+                }
+            }))
             .child(label)
     }
 }
@@ -745,9 +928,13 @@ impl Render for CaptureApp {
             .bg(rgba(0x1819_1ca0))
             .text_color(rgb(TEXT))
             .shadow_lg()
-            .on_mouse_down(MouseButton::Left, |_, window, _| {
-                window.start_window_move();
-            });
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|app, _, window, _| {
+                    app.drag_start_window_position = Some(window.bounds().origin);
+                    window.start_window_move();
+                }),
+            );
         if matches!(self.status, Status::Idle) {
             return shell
                 .child(
@@ -765,7 +952,9 @@ impl Render for CaptureApp {
                         .hover(|button| button.bg(rgba(0xffff_ff12)).text_color(rgb(TEXT)))
                         .cursor_pointer()
                         .on_click(cx.listener(|app, _, window, cx| {
-                            app.close_windows(window, cx);
+                            if !app.was_dragged(window) {
+                                app.close_windows(window, cx);
+                            }
                         }))
                         .child(div().relative().top(px(-1.0)).child("×")),
                 )
@@ -776,20 +965,22 @@ impl Render for CaptureApp {
                     div()
                         .mx_1()
                         .w(px(1.0))
-                        .h(px(28.0))
+                        .h(px(20.0))
                         .flex_none()
-                        .bg(rgba(0xffff_ff30)),
+                        .bg(rgba(0xffff_ff18)),
                 )
                 .child(
-                    overlay_secondary_button("destination", "Options").on_click(cx.listener(
-                        |app, _, window, cx| {
+                    overlay_secondary_button(
+                        "destination",
+                        self.profiles
+                            .selected()
+                            .map_or("Profile", |profile| profile.name.as_str()),
+                    )
+                    .on_click(cx.listener(|app, _, window, cx| {
+                        if !app.was_dragged(window) {
                             app.show_destination_menu(window, cx);
-                        },
-                    )),
-                )
-                .child(
-                    overlay_start_button("record")
-                        .on_click(cx.listener(|app, _, _, cx| app.record(cx))),
+                        }
+                    })),
                 );
         }
 
@@ -828,11 +1019,449 @@ impl Render for CaptureApp {
                     .when(!disabled, |button| {
                         button
                             .cursor_pointer()
-                            .on_click(cx.listener(|app, _, _, cx| app.stop(cx)))
+                            .on_click(cx.listener(|app, _, window, cx| {
+                                if !app.was_dragged(window) {
+                                    app.stop(cx);
+                                }
+                            }))
                     })
                     .child(label),
             )
     }
+}
+
+struct ProfileSettings {
+    controller: Entity<CaptureApp>,
+    profiles: RecordingProfiles,
+    selected: usize,
+    name_input: Entity<NumericInput>,
+    destination_input: Entity<NumericInput>,
+    token_input: Entity<NumericInput>,
+    error: Option<String>,
+}
+
+impl ProfileSettings {
+    fn new(
+        controller: Entity<CaptureApp>,
+        profiles: RecordingProfiles,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let selected = profiles.selected_index();
+        let name_input = cx.new(|cx| NumericInput::new_text("Profile name", cx));
+        let destination_input =
+            cx.new(|cx| NumericInput::new_text("Folder or Blip server URL", cx));
+        let token_input = cx.new(|cx| NumericInput::new_text("blip_...", cx));
+        let mut settings = Self {
+            controller,
+            profiles,
+            selected,
+            name_input,
+            destination_input,
+            token_input,
+            error: None,
+        };
+        settings.load_inputs(cx);
+        settings
+    }
+
+    fn commit_inputs(&mut self, cx: &mut Context<Self>) {
+        let name = self.name_input.read(cx).value().trim().to_owned();
+        let destination = self.destination_input.read(cx).value().trim().to_owned();
+        let token = self.token_input.read(cx).value().trim().to_owned();
+        let Some(profile) = self.profiles.profiles.get_mut(self.selected) else {
+            return;
+        };
+        profile.name = name;
+        match &mut profile.target {
+            RecordingTarget::Local { folder } => *folder = PathBuf::from(destination),
+            RecordingTarget::Remote { server_url } => {
+                *server_url = join_server_url(&destination, &token);
+            }
+        }
+    }
+
+    fn load_inputs(&mut self, cx: &mut Context<Self>) {
+        let Some(profile) = self.profiles.profiles.get(self.selected) else {
+            return;
+        };
+        let name = profile.name.clone();
+        let (destination, token) = match &profile.target {
+            RecordingTarget::Local { folder } => {
+                (folder.to_string_lossy().into_owned(), String::new())
+            }
+            RecordingTarget::Remote { server_url } => split_server_url(server_url),
+        };
+        self.name_input
+            .update(cx, |input, cx| input.set_text(name, cx));
+        self.destination_input
+            .update(cx, |input, cx| input.set_text(destination, cx));
+        self.token_input
+            .update(cx, |input, cx| input.set_text(token, cx));
+    }
+
+    fn select(&mut self, index: usize, cx: &mut Context<Self>) {
+        self.commit_inputs(cx);
+        if self.profiles.profiles.get(index).is_none() {
+            return;
+        }
+        self.selected = index;
+        self.error = None;
+        self.load_inputs(cx);
+        cx.notify();
+    }
+
+    fn add(&mut self, cx: &mut Context<Self>) {
+        self.commit_inputs(cx);
+        let folder = std::env::var_os("HOME")
+            .map_or_else(|| PathBuf::from("."), PathBuf::from)
+            .join("Desktop");
+        self.profiles
+            .profiles
+            .push(RecordingProfile::new_local(folder));
+        self.selected = self.profiles.profiles.len().saturating_sub(1);
+        self.error = None;
+        self.load_inputs(cx);
+        cx.notify();
+    }
+
+    fn delete(&mut self, cx: &mut Context<Self>) {
+        if self.profiles.profiles.len() == 1 {
+            self.error = Some("At least one recording profile is required".into());
+            cx.notify();
+            return;
+        }
+        let Some(removed) = self.profiles.profiles.get(self.selected) else {
+            return;
+        };
+        let removed_id = removed.id.clone();
+        self.profiles.profiles.remove(self.selected);
+        self.selected = self
+            .selected
+            .min(self.profiles.profiles.len().saturating_sub(1));
+        if self.profiles.selected_profile_id == removed_id
+            && let Some(profile) = self.profiles.profiles.first()
+        {
+            self.profiles.selected_profile_id = profile.id.clone();
+        }
+        self.error = None;
+        self.load_inputs(cx);
+        cx.notify();
+    }
+
+    fn set_remote(&mut self, remote: bool, cx: &mut Context<Self>) {
+        self.commit_inputs(cx);
+        let Some(profile) = self.profiles.profiles.get_mut(self.selected) else {
+            return;
+        };
+        if remote && matches!(profile.target, RecordingTarget::Local { .. }) {
+            profile.target = RecordingTarget::Remote {
+                server_url: "https://blip.brendonovich.dev/".into(),
+            };
+            profile.format = RecordingFormat::Mp4;
+            profile.completion_action = CompletionAction::None;
+        } else if !remote && matches!(profile.target, RecordingTarget::Remote { .. }) {
+            let folder = std::env::var_os("HOME")
+                .map_or_else(|| PathBuf::from("."), PathBuf::from)
+                .join("Desktop");
+            profile.target = RecordingTarget::Local { folder };
+            profile.format = RecordingFormat::Mp4;
+            profile.completion_action = CompletionAction::Reveal;
+        }
+        self.error = None;
+        self.load_inputs(cx);
+        cx.notify();
+    }
+
+    fn set_completion_action(&mut self, action: CompletionAction, cx: &mut Context<Self>) {
+        if let Some(profile) = self.profiles.profiles.get_mut(self.selected) {
+            profile.completion_action = action;
+            cx.notify();
+        }
+    }
+
+    fn set_format(&mut self, format: RecordingFormat, cx: &mut Context<Self>) {
+        if let Some(profile) = self.profiles.profiles.get_mut(self.selected) {
+            profile.format = format;
+            cx.notify();
+        }
+    }
+
+    fn save(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.commit_inputs(cx);
+        if let Some(error) = self.profiles.profiles.iter().find_map(|profile| {
+            profile
+                .validate()
+                .err()
+                .map(|error| format!("{}: {error}", profile.name))
+        }) {
+            self.error = Some(error);
+            cx.notify();
+            return;
+        }
+        if let Err(error) = self.profiles.save() {
+            self.error = Some(error);
+            cx.notify();
+            return;
+        }
+        let profiles = self.profiles.clone();
+        self.controller.update(cx, move |controller, cx| {
+            controller.profiles = profiles;
+            controller.error = None;
+            let dimensions = controller.idle_toolbar_dimensions();
+            controller.resize_toolbar(dimensions, cx);
+            cx.notify();
+        });
+        window.remove_window();
+    }
+}
+
+impl Render for ProfileSettings {
+    #[allow(clippy::too_many_lines)]
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let mut profile_list = div().flex().flex_col().gap_1();
+        for (index, profile) in self.profiles.profiles.iter().enumerate() {
+            let selected = index == self.selected;
+            profile_list = profile_list.child(
+                div()
+                    .id(("profile", index))
+                    .px_3()
+                    .py_2()
+                    .rounded_md()
+                    .bg(rgba(if selected { 0xffff_ff16 } else { 0x0000_0000 }))
+                    .text_color(rgb(if selected { TEXT } else { MUTED }))
+                    .hover(|row| row.bg(rgba(0xffff_ff10)))
+                    .cursor_pointer()
+                    .on_click(cx.listener(move |settings, _, _, cx| settings.select(index, cx)))
+                    .child(profile.name.clone()),
+            );
+        }
+        let profile = self.profiles.profiles.get(self.selected);
+        let remote =
+            profile.is_some_and(|profile| matches!(profile.target, RecordingTarget::Remote { .. }));
+        let format = profile.map_or("—", |profile| profile.format.label());
+        let bundle = profile.is_some_and(|profile| profile.format == RecordingFormat::BlipBundle);
+        let completion_action = profile.map(|profile| profile.completion_action);
+        let completion_controls = if remote {
+            div().child("The private viewer link is opened and copied after upload.")
+        } else if bundle {
+            div().child("The Blip Bundle Editor opens when recording finishes.")
+        } else {
+            div()
+                .flex()
+                .gap_2()
+                .child(
+                    settings_choice(
+                        "reveal",
+                        "Reveal in Finder",
+                        completion_action == Some(CompletionAction::Reveal),
+                    )
+                    .on_click(cx.listener(|settings, _, _, cx| {
+                        settings.set_completion_action(CompletionAction::Reveal, cx);
+                    })),
+                )
+                .child(
+                    settings_choice(
+                        "clipboard",
+                        "Copy to Clipboard",
+                        completion_action == Some(CompletionAction::CopyToClipboard),
+                    )
+                    .on_click(cx.listener(|settings, _, _, cx| {
+                        settings.set_completion_action(CompletionAction::CopyToClipboard, cx);
+                    })),
+                )
+                .child(
+                    settings_choice(
+                        "nothing",
+                        "Do Nothing",
+                        completion_action == Some(CompletionAction::None),
+                    )
+                    .on_click(cx.listener(|settings, _, _, cx| {
+                        settings.set_completion_action(CompletionAction::None, cx);
+                    })),
+                )
+        };
+        div()
+            .size_full()
+            .flex()
+            .bg(rgb(0x0014_1518))
+            .text_color(rgb(TEXT))
+            .child(
+                div()
+                    .w(px(210.0))
+                    .h_full()
+                    .p_4()
+                    .flex()
+                    .flex_col()
+                    .border_r_1()
+                    .border_color(rgba(0xffff_ff16))
+                    .child(
+                        div()
+                            .mb_3()
+                            .text_sm()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child("Recording Profiles"),
+                    )
+                    .child(
+                        div()
+                            .id("profile-list")
+                            .flex_1()
+                            .overflow_y_scroll()
+                            .child(profile_list),
+                    )
+                    .child(
+                        div()
+                            .mt_3()
+                            .flex()
+                            .gap_2()
+                            .child(
+                                settings_button("add-profile", "Add")
+                                    .on_click(cx.listener(|settings, _, _, cx| settings.add(cx))),
+                            )
+                            .child(
+                                settings_button("delete-profile", "Delete").on_click(
+                                    cx.listener(|settings, _, _, cx| settings.delete(cx)),
+                                ),
+                            ),
+                    ),
+            )
+            .child(
+                div()
+                    .id("profile-settings-pane")
+                    .flex_1()
+                    .h_full()
+                    .overflow_y_scroll()
+                    .p_6()
+                    .flex()
+                    .flex_col()
+                    .gap_5()
+                    .child(settings_field("Name", self.name_input.clone()))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_2()
+                            .child(settings_label("Destination"))
+                            .child(
+                                div()
+                                    .flex()
+                                    .gap_2()
+                                    .child(
+                                        settings_choice("local", "Local folder", !remote).on_click(
+                                            cx.listener(|settings, _, _, cx| {
+                                                settings.set_remote(false, cx);
+                                            }),
+                                        ),
+                                    )
+                                    .child(
+                                        settings_choice("remote", "Blip server", remote).on_click(
+                                            cx.listener(|settings, _, _, cx| {
+                                                settings.set_remote(true, cx);
+                                            }),
+                                        ),
+                                    ),
+                            )
+                            .child(self.destination_input.clone()),
+                    )
+                    .when(remote, |panel| {
+                        panel.child(settings_field("Access token", self.token_input.clone()))
+                    })
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_2()
+                            .child(settings_label("Format"))
+                            .child(if remote {
+                                div()
+                                    .flex()
+                                    .gap_2()
+                                    .child(
+                                        settings_choice("format-hls", "HLS", format == "HLS")
+                                            .on_click(cx.listener(|settings, _, _, cx| {
+                                                settings.set_format(RecordingFormat::Hls, cx);
+                                            })),
+                                    )
+                                    .child(
+                                        settings_choice("format-mp4", "MP4", format == "MP4")
+                                            .on_click(cx.listener(|settings, _, _, cx| {
+                                                settings.set_format(RecordingFormat::Mp4, cx);
+                                            })),
+                                    )
+                            } else {
+                                div()
+                                    .flex()
+                                    .gap_2()
+                                    .child(settings_choice("format-mp4", "MP4", !bundle).on_click(
+                                        cx.listener(|settings, _, _, cx| {
+                                            settings.set_format(RecordingFormat::Mp4, cx);
+                                        }),
+                                    ))
+                                    .child(
+                                        settings_choice("format-bundle", "Blip Bundle", bundle)
+                                            .on_click(cx.listener(|settings, _, _, cx| {
+                                                settings
+                                                    .set_format(RecordingFormat::BlipBundle, cx);
+                                            })),
+                                    )
+                            }),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_2()
+                            .child(settings_label("After recording"))
+                            .child(completion_controls),
+                    )
+                    .child(div().flex_1())
+                    .when_some(self.error.clone(), |panel, error| {
+                        panel.child(div().text_sm().text_color(rgb(ACCENT)).child(error))
+                    })
+                    .child(
+                        div().flex().justify_end().child(
+                            settings_button("save-profiles", "Save Profiles")
+                                .bg(rgb(0x00d2_d2d2))
+                                .text_color(rgb(0x0017_1717))
+                                .on_click(cx.listener(|settings, _, window, cx| {
+                                    settings.save(window, cx);
+                                })),
+                        ),
+                    ),
+            )
+    }
+}
+
+fn settings_label(label: &'static str) -> Div {
+    div().text_sm().text_color(rgb(MUTED)).child(label)
+}
+
+fn settings_field(label: &'static str, input: Entity<NumericInput>) -> Div {
+    div()
+        .flex()
+        .flex_col()
+        .gap_2()
+        .child(settings_label(label))
+        .child(input)
+}
+
+fn settings_button(id: &'static str, label: &'static str) -> gpui::Stateful<Div> {
+    div()
+        .id(id)
+        .px_3()
+        .py_2()
+        .rounded_md()
+        .border_1()
+        .border_color(rgba(0xffff_ff20))
+        .text_sm()
+        .hover(|button| button.bg(rgba(0xffff_ff12)))
+        .cursor_pointer()
+        .child(label)
+}
+
+fn settings_choice(id: &'static str, label: &'static str, selected: bool) -> gpui::Stateful<Div> {
+    settings_button(id, label)
+        .bg(rgba(if selected { 0xffff_ff20 } else { 0x0000_0000 }))
+        .border_color(rgba(if selected { 0xffff_ff42 } else { 0xffff_ff20 }))
 }
 
 struct SelectionOverlay {
@@ -1505,26 +2134,37 @@ fn overlay_start_button(id: &'static str) -> gpui::Stateful<Div> {
         .child("Start Recording")
 }
 
-fn overlay_secondary_button(id: &'static str, label: &'static str) -> gpui::Stateful<Div> {
+fn overlay_secondary_button(
+    id: &'static str,
+    label: impl Into<SharedString>,
+) -> gpui::Stateful<Div> {
+    let label = label.into();
     div()
         .id(id)
-        .h(px(30.0))
+        .h(px(36.0))
+        .max_w(px(300.0))
         .flex_none()
         .flex()
         .items_center()
         .justify_center()
         .px_3()
-        .rounded_sm()
+        .rounded_md()
         .border_1()
-        .border_color(rgb(0x0024_2424))
-        .bg(rgb(0x0009_0909))
+        .border_color(rgba(0xffff_ff18))
+        .bg(rgba(0xffff_ff12))
         .text_sm()
         .font_weight(FontWeight::MEDIUM)
         .text_color(rgb(TEXT))
-        .hover(|button| button.bg(rgb(0x0015_1515)))
+        .hover(|button| button.bg(rgba(0xffff_ff1c)))
         .active(|button| button.opacity(0.72))
         .cursor_pointer()
-        .child(label)
+        .child(
+            div()
+                .overflow_hidden()
+                .whitespace_nowrap()
+                .text_ellipsis()
+                .child(label),
+        )
 }
 
 #[allow(clippy::arithmetic_side_effects)]
@@ -1787,12 +2427,32 @@ fn configure_toolbar_window(window: &Window) {
     window.orderFrontRegardless();
 }
 
+fn set_toolbar_window_visible(window: &Window, visible: bool) {
+    let Ok(handle) = HasWindowHandle::window_handle(window) else {
+        return;
+    };
+    let RawWindowHandle::AppKit(handle) = handle.as_raw() else {
+        return;
+    };
+    // SAFETY: GPUI's AppKit handle points to the live NSView owned by this main-thread window.
+    let view = unsafe { handle.ns_view.cast::<NSView>().as_ref() };
+    let Some(window) = view.window() else {
+        return;
+    };
+    if visible {
+        window.orderFrontRegardless();
+    } else {
+        window.orderOut(None);
+    }
+}
+
 #[allow(clippy::arithmetic_side_effects)]
 #[allow(clippy::as_conversions)]
 fn schedule_destination_menu(
     window: &Window,
-    selected: SaveDestination,
-    open_finder_after_recording: bool,
+    profile_names: Vec<String>,
+    selected: usize,
+    open_recording_when_finished: bool,
     sender: async_channel::Sender<DestinationMenuAction>,
 ) -> Result<(), ()> {
     let handle = HasWindowHandle::window_handle(window).map_err(|_| ())?;
@@ -1804,7 +2464,13 @@ fn schedule_destination_menu(
         let Some(view) = NonNull::new(view_address as *mut c_void) else {
             return;
         };
-        native_destination_menu(view, selected, open_finder_after_recording, sender);
+        native_destination_menu(
+            view,
+            &profile_names,
+            selected,
+            open_recording_when_finished,
+            sender,
+        );
     });
     Ok(())
 }
@@ -1812,8 +2478,9 @@ fn schedule_destination_menu(
 #[allow(clippy::arithmetic_side_effects)]
 fn native_destination_menu(
     view: NonNull<c_void>,
-    selected: SaveDestination,
-    open_finder_after_recording: bool,
+    profile_names: &[String],
+    selected: usize,
+    open_recording_when_finished: bool,
     sender: async_channel::Sender<DestinationMenuAction>,
 ) -> Option<()> {
     // SAFETY: GPUI's AppKit handle points to the live NSView owned by this main-thread window.
@@ -1825,12 +2492,12 @@ fn native_destination_menu(
     menu.setMinimumWidth(112.0);
     let handler = DestinationMenuHandler::new(sender);
     let empty = NSString::from_str("");
-    for (index, destination) in SaveDestination::ALL.into_iter().enumerate() {
+    for (index, profile_name) in profile_names.iter().enumerate() {
         // SAFETY: The handler implements `selectDestination:` with the NSMenuItem signature.
         let item = unsafe {
             NSMenuItem::initWithTitle_action_keyEquivalent(
                 NSMenuItem::alloc(main_thread),
-                &NSString::from_str(destination.label()),
+                &NSString::from_str(profile_name),
                 Some(sel!(selectDestination:)),
                 &empty,
             )
@@ -1838,27 +2505,40 @@ fn native_destination_menu(
         item.setTag(isize::try_from(index).ok()?);
         // SAFETY: `handler` implements the selector configured above and outlives menu tracking.
         unsafe { item.setTarget(Some(&handler)) };
-        if destination == selected {
+        if index == selected {
             item.setState(NSControlStateValueOn);
         }
         menu.addItem(&item);
     }
     menu.addItem(&NSMenuItem::separatorItem(main_thread));
-    // SAFETY: The handler implements `toggleOpenFinder:` with the NSMenuItem signature.
-    let open_finder_item = unsafe {
+    // SAFETY: The handler implements `toggleOpenRecording:` with the NSMenuItem signature.
+    let open_recording_item = unsafe {
         NSMenuItem::initWithTitle_action_keyEquivalent(
             NSMenuItem::alloc(main_thread),
-            &NSString::from_str("Open Finder After Recording"),
-            Some(sel!(toggleOpenFinder:)),
+            &NSString::from_str("Open Recording When Finished"),
+            Some(sel!(toggleOpenRecording:)),
             &empty,
         )
     };
     // SAFETY: `handler` implements the selector configured above and outlives menu tracking.
-    unsafe { open_finder_item.setTarget(Some(&handler)) };
-    if open_finder_after_recording {
-        open_finder_item.setState(NSControlStateValueOn);
+    unsafe { open_recording_item.setTarget(Some(&handler)) };
+    if open_recording_when_finished {
+        open_recording_item.setState(NSControlStateValueOn);
     }
-    menu.addItem(&open_finder_item);
+    menu.addItem(&open_recording_item);
+    menu.addItem(&NSMenuItem::separatorItem(main_thread));
+    // SAFETY: The handler implements `openProfileSettings:` with the NSMenuItem signature.
+    let settings_item = unsafe {
+        NSMenuItem::initWithTitle_action_keyEquivalent(
+            NSMenuItem::alloc(main_thread),
+            &NSString::from_str("Edit Recording Profiles…"),
+            Some(sel!(openProfileSettings:)),
+            &empty,
+        )
+    };
+    // SAFETY: `handler` implements the selector configured above and outlives menu tracking.
+    unsafe { settings_item.setTarget(Some(&handler)) };
+    menu.addItem(&settings_item);
     menu.update();
     let menu_size = menu.size();
     let location = NSPoint::new(
@@ -1871,7 +2551,12 @@ fn native_destination_menu(
 
 #[allow(clippy::arithmetic_side_effects)]
 fn toolbar_options(cx: &App) -> WindowOptions {
-    let toolbar_size = size(px(TOOLBAR_SIZE.0), px(TOOLBAR_SIZE.1));
+    let profiles = RecordingProfiles::load();
+    let label = profiles
+        .selected()
+        .map_or("Profile", |profile| profile.name.as_str());
+    let (width, height) = toolbar_dimensions_for_label(label);
+    let toolbar_size = size(px(width), px(height));
     let bounds = cx.primary_display().map_or_else(
         || Bounds::centered(None, toolbar_size, cx),
         |display| {
@@ -1898,19 +2583,58 @@ fn toolbar_options(cx: &App) -> WindowOptions {
     }
 }
 
-fn output_path(destination: SaveDestination) -> PathBuf {
-    let name = format!(
-        "Blip Capture {}.mp4",
-        Local::now().format("%Y-%m-%d at %H.%M.%S")
-    );
-    let home = std::env::var_os("HOME").map_or_else(|| PathBuf::from("."), PathBuf::from);
-    match destination {
-        SaveDestination::Desktop => home.join("Desktop"),
-        SaveDestination::Documents => home.join("Documents"),
-        SaveDestination::Downloads => home.join("Downloads"),
-        SaveDestination::Clipboard => std::env::temp_dir().join("blip-capture"),
+fn profile_settings_options(cx: &App) -> WindowOptions {
+    let window_size = size(px(720.0), px(480.0));
+    WindowOptions {
+        window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
+            None,
+            window_size,
+            cx,
+        ))),
+        is_resizable: false,
+        is_minimizable: false,
+        ..Default::default()
     }
-    .join(name)
+}
+
+struct OutputDestination {
+    media_path: PathBuf,
+    completed_path: PathBuf,
+    cleanup_on_failure: Option<PathBuf>,
+}
+
+fn output_destination(profile: &RecordingProfile) -> Result<OutputDestination, String> {
+    let folder = match &profile.target {
+        RecordingTarget::Local { folder } => folder.clone(),
+        RecordingTarget::Remote { .. } => std::env::temp_dir().join("blip-capture"),
+    };
+    std::fs::create_dir_all(&folder)
+        .map_err(|error| format!("failed to create recording folder: {error}"))?;
+    let timestamp = Local::now().format("%Y-%m-%d at %H.%M.%S");
+    if profile.format == RecordingFormat::Hls {
+        let output = folder.join(format!("Blip Capture {timestamp}.hls"));
+        return Ok(OutputDestination {
+            media_path: output.clone(),
+            completed_path: output.clone(),
+            cleanup_on_failure: Some(output),
+        });
+    }
+    if profile.format == RecordingFormat::BlipBundle {
+        let completed_path = folder.join(format!("Blip Capture {timestamp}.blip"));
+        let bundle = BlipBundle::create(&completed_path)?;
+        let media_path = bundle.media_path(&completed_path)?;
+        return Ok(OutputDestination {
+            media_path,
+            completed_path: completed_path.clone(),
+            cleanup_on_failure: Some(completed_path),
+        });
+    }
+    let completed_path = folder.join(format!("Blip Capture {timestamp}.mp4"));
+    Ok(OutputDestination {
+        media_path: completed_path.clone(),
+        completed_path,
+        cleanup_on_failure: None,
+    })
 }
 
 #[repr(C)]
@@ -2097,7 +2821,8 @@ fn open_capture(
         eprintln!("blip-capture: {}", CaptureError::PermissionDenied);
         return;
     }
-    let targets = if let Some(targets) = target_cache.borrow().clone() {
+    let cached_targets = target_cache.borrow().clone();
+    let targets = if let Some(targets) = cached_targets {
         targets
     } else {
         let content = match ShareableContent::current(CAPTURE_TIMEOUT) {
@@ -2135,12 +2860,10 @@ fn open_capture(
         Err(status) => eprintln!("blip-capture: failed to register Escape ({status})"),
     }
     visible.set(true);
-    app.update(cx, |app, window, cx| {
+    app.update(cx, |_, window, _| {
         configure_toolbar_window(window);
-        app.open_selection_windows(window, cx);
     })
     .ok();
-    cx.activate(true);
 }
 
 fn handle_escape(cx: &mut App) {
@@ -2153,8 +2876,77 @@ fn handle_escape(cx: &mut App) {
     }
 }
 
-fn main() {
-    application().run(|cx| {
+fn import_profile_urls(cx: &mut App, urls: Vec<String>) {
+    let mut profile_urls = Vec::new();
+    for url_str in urls {
+        if let Ok(url) = url::Url::parse(&url_str)
+            && url.scheme() == "file"
+            && let Ok(path) = url.to_file_path()
+            && path.extension().is_some_and(|ext| ext == "blip")
+        {
+            if let Err(error) = BundleEditor::open(path, cx) {
+                eprintln!("blip-capture: {error}");
+            }
+            continue;
+        }
+        if Path::new(&url_str)
+            .extension()
+            .is_some_and(|ext| ext == "blip")
+        {
+            if let Err(error) = BundleEditor::open(PathBuf::from(url_str), cx) {
+                eprintln!("blip-capture: {error}");
+            }
+            continue;
+        }
+        profile_urls.push(url_str);
+    }
+    if profile_urls.is_empty() {
+        return;
+    }
+    let mut profiles = RecordingProfiles::load();
+    let result = profile_urls
+        .iter()
+        .try_for_each(|url| profiles.import_url(url))
+        .and_then(|()| profiles.save());
+
+    for window in cx.windows() {
+        let Some(controller) = window.downcast::<CaptureApp>() else {
+            continue;
+        };
+        controller
+            .update(cx, |controller, _, cx| {
+                match &result {
+                    Ok(()) => {
+                        controller.profiles = profiles.clone();
+                        controller.error = None;
+                        let dimensions = controller.idle_toolbar_dimensions();
+                        controller.resize_toolbar(dimensions, cx);
+                    }
+                    Err(error) => controller.error = Some(error.clone()),
+                }
+                cx.notify();
+            })
+            .ok();
+        break;
+    }
+    if let Err(error) = result {
+        eprintln!("blip-capture: failed to import recording profile: {error}");
+    }
+}
+
+fn run_app(open_path: Option<PathBuf>) {
+    let (profile_sender, profile_receiver) = async_channel::unbounded();
+    let app = application();
+    app.on_open_urls(move |urls| {
+        profile_sender.try_send(urls).ok();
+    });
+    app.run(move |cx| {
+        if let Some(path) = open_path {
+            if let Err(error) = BundleEditor::open(path, cx) {
+                eprintln!("blip-capture: {error}");
+            }
+            return;
+        }
         NumericInput::bind_keys(cx);
         let visible = Rc::new(Cell::new(false));
         let escape_hotkey = Rc::new(Cell::new(ptr::null_mut()));
@@ -2182,6 +2974,115 @@ fn main() {
             }
         })
         .detach();
+        cx.spawn(async move |cx| {
+            while let Ok(urls) = profile_receiver.recv().await {
+                cx.update(|cx| import_profile_urls(cx, urls));
+            }
+        })
+        .detach();
         open_capture(cx, &visible, &escape_hotkey, &target_cache);
     });
+}
+
+fn init_tracing() {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+                tracing_subscriber::EnvFilter::new("info,blip_capture=debug,blip_avfoundation=debug")
+            }),
+        )
+        .with_target(true)
+        .with_writer(std::io::stderr)
+        .init();
+}
+
+fn main() -> ExitCode {
+    init_tracing();
+    let args = CaptureArgs::parse();
+    if !args.headless {
+        run_app(args.path);
+        return ExitCode::SUCCESS;
+    }
+
+    match headless::run(&args) {
+        Ok(viewer_url) => {
+            println!("{viewer_url}");
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("blip-capture: {error}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::CaptureArgs;
+    use clap::Parser as _;
+
+    #[test]
+    fn accepts_gui_mode_without_options() {
+        let result = CaptureArgs::try_parse_from(["blip-capture"]);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn accepts_headless_upload_options() {
+        let result = CaptureArgs::try_parse_from([
+            "blip-capture",
+            "--headless",
+            "--server-url",
+            "https://blip.example#secret",
+            "--display",
+            "1",
+            "--duration",
+            "10",
+            "--format",
+            "hls",
+        ]);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn rejects_headless_options_in_gui_mode() {
+        let result = CaptureArgs::try_parse_from(["blip-capture", "--duration", "10"]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn rejects_zero_length_headless_recording() {
+        let result = CaptureArgs::try_parse_from([
+            "blip-capture",
+            "--headless",
+            "--server-url",
+            "https://blip.example#secret",
+            "--duration",
+            "0",
+        ]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn accepts_path_to_open_bundle() {
+        let result = CaptureArgs::try_parse_from(["blip-capture", "/tmp/test.blip"]);
+        assert!(result.is_ok());
+        assert_eq!(
+            result.unwrap().path,
+            Some(std::path::PathBuf::from("/tmp/test.blip"))
+        );
+    }
+
+    #[test]
+    fn calculates_dynamic_toolbar_dimensions() {
+        assert_eq!(super::toolbar_dimensions_for_label("Dev"), (368.0, 56.0));
+        assert_eq!(
+            super::toolbar_dimensions_for_label("Prod Server"),
+            (432.0, 56.0)
+        );
+        assert_eq!(
+            super::toolbar_dimensions_for_label("A Very Long Server Name That Exceeds Max"),
+            (584.0, 56.0)
+        );
+    }
 }

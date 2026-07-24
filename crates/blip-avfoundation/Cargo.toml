@@ -8,6 +8,8 @@ workspace = true
 
 [dependencies]
 block2.workspace = true
+core-foundation.workspace = true
+core-video.workspace = true
 dispatch2 = "0.3.0"
 objc2.workspace = true
 objc2-av-foundation.workspace = true
@@ -16,4 +18,5 @@ objc2-core-media.workspace = true
 objc2-core-video.workspace = true
 objc2-foundation.workspace = true
 objc2-io-surface.workspace = true
+objc2-uniform-type-identifiers.workspace = true
 thiserror.workspace = true

@@ -1,0 +1,22 @@
+[package]
+name = "blip-compositor"
+version = "0.1.0"
+edition.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow.workspace = true
+bytemuck.workspace = true
+core-foundation.workspace = true
+core-video.workspace = true
+foreign-types.workspace = true
+metal.workspace = true
+objc2.workspace = true
+objc2-metal.workspace = true
+pollster.workspace = true
+wgpu.workspace = true
+
+[build-dependencies]
+wgsl_bindgen.workspace = true

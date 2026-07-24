@@ -1,0 +1,34 @@
+{
+  "name": "blip-server-cloudflare",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "deploy": "alchemy deploy",
+    "dev": "alchemy dev",
+    "destroy": "alchemy destroy",
+    "build": "vite build",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@better-auth/api-key": "1.6.25",
+    "@blip/server-core": "workspace:*",
+    "@effect/platform-node": "4.0.0-beta.101",
+    "@effect/sql-d1": "4.0.0-beta.101",
+    "@effect/sql-pg": "4.0.0-beta.101",
+    "@solidjs/router": "^0.16.2",
+    "@solidjs/start": "2.0.0-rc.1",
+    "@tanstack/solid-query": "^5.101.4",
+    "alchemy": "2.0.0-beta.64",
+    "better-auth": "1.6.25",
+    "effect": "4.0.0-beta.101",
+    "solid-js": "^1.9.14"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "5.20260724.1",
+    "@distilled.cloud/cloudflare-rolldown-plugin": "0.13.8",
+    "@types/node": "24.1.0",
+    "lightningcss-darwin-arm64": "^1.33.0",
+    "typescript": "5.9.2",
+    "vite": "^8.1.5"
+  }
+}

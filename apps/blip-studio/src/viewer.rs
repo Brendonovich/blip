@@ -10,15 +10,16 @@ use std::time::{Duration, Instant};
 
 use crate::StreamArgs;
 use crate::assets::{CHEVRON_DOWN, GRIP_VERTICAL, StudioAssets};
-use crate::compositor::{
-    CompositorItem, CompositorItemContent, CompositorSource, FrameCompositor, ItemTransform,
-};
 use crate::numeric_input::{NumericInput, NumericInputEvent};
 use crate::rtmp::{RtmpConfig, RtmpStream};
 use crate::theme;
 use anyhow::Context as _;
 use async_channel::Sender;
 use blip_avfoundation::{CameraCapturer, CameraDevice, CameraFrame};
+use blip_compositor::{
+    CompositorItem, CompositorItemContent, CompositorSource, ContentRect, FrameCompositor,
+    ItemTransform,
+};
 use blip_sck::{
     CaptureError, CaptureFilter, Capturer, Display as CaptureDisplay, PixelFormat,
     ShareableContent, StreamConfig, StreamConfigBuilder, VideoFrame, Window as CaptureWindow,
@@ -136,18 +137,16 @@ impl SourceGroup {
 const fn full_canvas_layout() -> ItemLayout {
     ItemLayout {
         center: [0.5, 0.5],
-        base_size: [1.0, 1.0],
-        scale: 1.0,
-        corner_radius: 0.0,
+        size: [1.0, 1.0],
+        corner_radius_ratio: 0.0,
     }
 }
 
 const fn inset_layout() -> ItemLayout {
     ItemLayout {
         center: [0.5, 0.5],
-        base_size: [0.5, 0.5],
-        scale: 1.0,
-        corner_radius: 48.0,
+        size: [0.5, 0.5],
+        corner_radius_ratio: 0.08,
     }
 }
 
@@ -203,9 +202,8 @@ struct ColorSource {
 #[derive(Clone, Copy)]
 struct ItemLayout {
     center: [f32; 2],
-    base_size: [f32; 2],
-    scale: f32,
-    corner_radius: f32,
+    size: [f32; 2],
+    corner_radius_ratio: f32,
 }
 
 type ElementId = u64;
@@ -252,6 +250,12 @@ impl Scene {
 
     fn uses_source(&self, source: SourceId) -> bool {
         self.elements.iter().any(|element| element.source == source)
+    }
+
+    fn replace_source(&mut self, id: ElementId, source: SourceId) -> Option<SourceId> {
+        let element = self.element_mut(id)?;
+        let previous = std::mem::replace(&mut element.source, source);
+        Some(previous)
     }
 
     fn move_to_index(&mut self, item: ElementId, index: usize) -> bool {
@@ -321,7 +325,7 @@ impl Render for SceneDrag {
 #[derive(Clone)]
 struct SourceFrame {
     pixel_buffer: CVPixelBuffer,
-    content_rect: Option<blip_sck::FrameRect>,
+    content_rect: Option<ContentRect>,
     dimensions: (f64, f64),
 }
 
@@ -559,6 +563,12 @@ enum TransformAdjustment {
     ColorBlue,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum OpenMenu {
+    Source,
+    Capture,
+}
+
 impl ResizeHandle {
     const fn axes(self) -> [f32; 2] {
         match self {
@@ -584,13 +594,12 @@ enum DragOperation {
         item: ElementId,
         handle: ResizeHandle,
         initial_transform: ItemTransform,
-        initial_scale: f32,
+        initial_size: [f32; 2],
         anchor: [f32; 2],
     },
     CornerRadius {
         item: ElementId,
         bounds: Bounds<Pixels>,
-        preview_scale: f32,
     },
 }
 
@@ -612,7 +621,7 @@ struct FrameViewer {
     corner_handle_hovered: bool,
     transform_inputs: TransformInputs,
     focused_transform_inputs: HashSet<TransformAdjustment>,
-    source_menu_open: bool,
+    open_menu: Option<OpenMenu>,
     source_menu_visible: bool,
     source_menu_transition: u64,
     scene_dragging_item: Option<ElementId>,
@@ -697,8 +706,12 @@ fn transform_input(
 impl FrameViewer {
     fn blur_inputs(&mut self, _: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         window.blur();
-        if self.source_menu_open {
+        if self.open_menu == Some(OpenMenu::Source) {
             self.close_source_menu(cx);
+        }
+        if self.open_menu == Some(OpenMenu::Capture) {
+            self.open_menu = None;
+            cx.notify();
         }
     }
 
@@ -713,30 +726,32 @@ impl FrameViewer {
     }
 
     fn toggle_source_menu(&mut self, cx: &mut Context<Self>) {
-        if self.source_menu_open {
+        if self.open_menu == Some(OpenMenu::Source) {
             self.close_source_menu(cx);
             return;
         }
         self.source_menu_transition = self.source_menu_transition.saturating_add(1);
         self.source_menu_visible = true;
-        self.source_menu_open = true;
+        self.open_menu = Some(OpenMenu::Source);
         cx.notify();
     }
 
     fn close_source_menu(&mut self, cx: &mut Context<Self>) {
-        if !self.source_menu_visible || !self.source_menu_open {
+        if !self.source_menu_visible || self.open_menu != Some(OpenMenu::Source) {
             return;
         }
         self.source_menu_transition = self.source_menu_transition.saturating_add(1);
         let transition = self.source_menu_transition;
-        self.source_menu_open = false;
+        self.open_menu = None;
         let viewer = cx.entity().downgrade();
         cx.spawn(async move |_, cx| {
             cx.background_executor()
                 .timer(SOURCE_MENU_ANIMATION_DURATION)
                 .await;
             let _ = viewer.update(cx, |viewer, cx| {
-                if !viewer.source_menu_open && viewer.source_menu_transition == transition {
+                if viewer.open_menu != Some(OpenMenu::Source)
+                    && viewer.source_menu_transition == transition
+                {
                     viewer.source_menu_visible = false;
                     cx.notify();
                 }
@@ -1017,6 +1032,73 @@ impl FrameViewer {
         cx.notify();
     }
 
+    fn replace_selected_capture(&mut self, target_index: usize, cx: &mut Context<Self>) {
+        let (Some(item), Some(target)) =
+            (self.selected_item, self.targets.get(target_index).cloned())
+        else {
+            return;
+        };
+        if !matches!(target, CaptureTarget::Display(_) | CaptureTarget::Window(_)) {
+            return;
+        }
+        let source = target.id();
+        let Some(previous) = self
+            .scene
+            .borrow()
+            .element(item)
+            .map(|element| element.source)
+        else {
+            return;
+        };
+        if source == previous {
+            self.open_menu = None;
+            cx.notify();
+            return;
+        }
+        if !self.captures.borrow().contains_key(&source) {
+            let generation = 1;
+            let (capturer, configuration) =
+                match build_capturer(&target, self.options, generation, &self.frame_hub) {
+                    Ok(capturer) => capturer,
+                    Err(error) => {
+                        self.control_error = Some(error.to_string());
+                        cx.notify();
+                        return;
+                    }
+                };
+            if let Err(error) = capturer.start() {
+                self.control_error = Some(error.to_string());
+                cx.notify();
+                return;
+            }
+            self.captures.borrow_mut().insert(
+                source,
+                CaptureResource {
+                    capturer,
+                    generation,
+                    configuration,
+                },
+            );
+        }
+        self.scene.borrow_mut().replace_source(item, source);
+        self.control_error = None;
+        let removed_source = if self.scene.borrow().uses_source(previous) {
+            None
+        } else {
+            self.pending_captures.remove(&previous);
+            self.failed_captures.remove(&previous);
+            if let Some(resource) = self.captures.borrow_mut().remove(&previous)
+                && let Err(error) = resource.capturer.stop()
+            {
+                self.control_error = Some(error.to_string());
+            }
+            Some(previous)
+        };
+        self.open_menu = None;
+        self.frame_hub.scene_changed(removed_source);
+        cx.notify();
+    }
+
     fn add_camera_target(&mut self, camera: CameraDevice, cx: &mut Context<Self>) {
         let source = SourceId::Camera(camera_id(camera.unique_id()));
         let id = self.scene.borrow_mut().add(source, inset_layout());
@@ -1265,12 +1347,7 @@ impl FrameViewer {
             let bounds = transform_bounds(frame_bounds, transform);
             let radius = item_corner_radius(frame_bounds, dimensions, transform);
             if corner_radius_handle_bounds(bounds, radius).contains(&event.position) {
-                let preview_scale = frame_bounds.size.width / px(dimensions.0 as f32);
-                self.drag_operation = Some(DragOperation::CornerRadius {
-                    item,
-                    bounds,
-                    preview_scale,
-                });
+                self.drag_operation = Some(DragOperation::CornerRadius { item, bounds });
                 self.corner_handle_hovered = true;
                 self.hovered_handle = None;
                 cx.notify();
@@ -1285,7 +1362,7 @@ impl FrameViewer {
                 else {
                     return;
                 };
-                self.drag_operation = Some(resize_operation(item, handle, transform, layout.scale));
+                self.drag_operation = Some(resize_operation(item, handle, transform, layout.size));
                 self.hovered_handle = Some(handle);
                 self.corner_handle_hovered = false;
                 cx.notify();
@@ -1418,7 +1495,7 @@ impl FrameViewer {
             item,
             handle,
             initial_transform,
-            initial_scale,
+            initial_size,
             anchor,
         } = operation
         else {
@@ -1439,29 +1516,24 @@ impl FrameViewer {
             initial_transform,
             anchor,
             pointer,
-            MIN_ITEM_SCALE / initial_scale,
+            minimum_resize_ratio(initial_size),
             normalized_snap_threshold(frame),
         );
         self.snap_guides = guides;
         if let Some(element) = self.scene.borrow_mut().element_mut(item) {
             element.layout.center = center;
-            element.layout.scale = initial_scale * scale_ratio;
+            element.layout.size = scaled_size(initial_size, scale_ratio);
             self.frame_hub.scene_changed(None);
         }
     }
 
     fn adjust_corner_radius(&self, operation: DragOperation, position: Point<Pixels>) {
-        let DragOperation::CornerRadius {
-            item,
-            bounds,
-            preview_scale,
-        } = operation
-        else {
+        let DragOperation::CornerRadius { item, bounds } = operation else {
             return;
         };
-        let radius = corner_radius_from_position(bounds, preview_scale, position);
+        let ratio = corner_radius_ratio_from_position(bounds, position);
         if let Some(element) = self.scene.borrow_mut().element_mut(item) {
-            element.layout.corner_radius = radius;
+            element.layout.corner_radius_ratio = ratio;
             self.frame_hub.scene_changed(None);
         }
     }
@@ -1534,16 +1606,20 @@ impl FrameViewer {
             }
             TransformAdjustment::Width => {
                 let width = transform.size[0] * canvas_width;
-                layout.scale = (layout.scale * value.max(1.0) / width).max(MIN_ITEM_SCALE);
+                layout.size = scaled_size(layout.size, value.max(1.0) / width);
             }
             TransformAdjustment::Height => {
                 let height = transform.size[1] * canvas_height;
-                layout.scale = (layout.scale * value.max(1.0) / height).max(MIN_ITEM_SCALE);
+                layout.size = scaled_size(layout.size, value.max(1.0) / height);
             }
             TransformAdjustment::CornerRadius => {
                 let maximum =
                     (transform.size[0] * canvas_width).min(transform.size[1] * canvas_height) * 0.5;
-                layout.corner_radius = value.clamp(0.0, maximum);
+                layout.corner_radius_ratio = if maximum > 0.0 {
+                    value.clamp(0.0, maximum) / (maximum * 2.0)
+                } else {
+                    0.0
+                };
             }
             TransformAdjustment::ColorRed
             | TransformAdjustment::ColorGreen
@@ -1607,6 +1683,12 @@ impl FrameViewer {
                 .font_weight(FontWeight::SEMIBOLD)
                 .child(format!("Element {item}")),
         );
+        let is_screen_capture = matches!(source, SourceId::Display(_) | SourceId::Window(_));
+        let panel = if is_screen_capture {
+            panel.child(self.capture_picker(source, cx))
+        } else {
+            panel
+        };
         let panel = if let Some(configuration) = configuration {
             panel.child(Self::source_configuration(configuration))
         } else {
@@ -1655,7 +1737,7 @@ impl FrameViewer {
             .font_weight(FontWeight::MEDIUM)
             .text_color(rgb(theme::TEXT_MUTED))
             .child("Position");
-        let position_heading = if configuration.is_some() {
+        let position_heading = if configuration.is_some() || is_screen_capture {
             position_heading
                 .mt_1()
                 .pt_3()
@@ -1736,6 +1818,134 @@ impl FrameViewer {
                 "Frame rate",
                 frame_rate_label(configuration.fps),
             ))
+    }
+
+    fn capture_picker(&self, source: SourceId, cx: &mut Context<Self>) -> Div {
+        let mut picker = div().relative().flex().flex_col().gap_2().child(
+            div()
+                .text_xs()
+                .font_weight(FontWeight::MEDIUM)
+                .text_color(rgb(theme::TEXT_MUTED))
+                .child("Capture"),
+        );
+        picker = picker.child(
+            div()
+                .id("capture-source")
+                .w_full()
+                .h(px(30.0))
+                .px_2()
+                .flex()
+                .items_center()
+                .justify_between()
+                .gap_2()
+                .rounded_sm()
+                .bg(rgb(theme::CONTROL_BACKGROUND))
+                .border_1()
+                .border_color(rgb(theme::BORDER_SUBTLE))
+                .hover(|button| button.bg(rgb(theme::CONTROL_HOVER)))
+                .child(
+                    div()
+                        .min_w_0()
+                        .flex_1()
+                        .overflow_hidden()
+                        .whitespace_nowrap()
+                        .text_ellipsis()
+                        .text_xs()
+                        .child(self.source_label(source)),
+                )
+                .child(
+                    svg()
+                        .size(px(14.0))
+                        .flex_none()
+                        .path(CHEVRON_DOWN)
+                        .text_color(rgb(theme::TEXT_MUTED)),
+                )
+                .on_mouse_down(MouseButton::Left, cx.listener(Self::stop_mouse_propagation))
+                .on_click(cx.listener(|viewer, _, _, cx| {
+                    viewer.open_menu = if viewer.open_menu == Some(OpenMenu::Capture) {
+                        None
+                    } else {
+                        Some(OpenMenu::Capture)
+                    };
+                    cx.notify();
+                })),
+        );
+        if self.open_menu == Some(OpenMenu::Capture) {
+            let menu = div()
+                .id("capture-source-menu")
+                .absolute()
+                .top(px(54.0))
+                .left_0()
+                .right_0()
+                .max_h(px(280.0))
+                .p_1()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .overflow_y_scroll()
+                .rounded_sm()
+                .bg(rgb(theme::CONTROL_BACKGROUND))
+                .border_1()
+                .border_color(rgb(theme::BORDER))
+                .on_mouse_down(MouseButton::Left, cx.listener(Self::stop_mouse_propagation))
+                .child(self.capture_picker_group("Displays", SourceGroup::Displays, source, cx))
+                .child(self.capture_picker_group("Windows", SourceGroup::Windows, source, cx));
+            picker = picker.child(deferred(menu).priority(2));
+        }
+        picker
+    }
+
+    fn capture_picker_group(
+        &self,
+        title: &'static str,
+        group: SourceGroup,
+        source: SourceId,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        let targets = self
+            .targets
+            .iter()
+            .enumerate()
+            .filter(|(_, target)| group.contains(target))
+            .map(|(index, target)| {
+                let selected = target.id() == source;
+                div()
+                    .id(format!("capture-source-option-{index}"))
+                    .w_full()
+                    .min_h(px(28.0))
+                    .px_2()
+                    .flex()
+                    .items_center()
+                    .rounded_sm()
+                    .text_xs()
+                    .when(selected, |option| option.bg(rgb(theme::CONTROL_ACTIVE)))
+                    .hover(|option| option.bg(rgb(theme::CONTROL_HOVER)))
+                    .child(
+                        div()
+                            .min_w_0()
+                            .flex_1()
+                            .overflow_hidden()
+                            .whitespace_nowrap()
+                            .text_ellipsis()
+                            .child(target.label()),
+                    )
+                    .on_click(cx.listener(move |viewer, _, _, cx| {
+                        viewer.replace_selected_capture(index, cx);
+                    }))
+            });
+        div()
+            .flex()
+            .flex_col()
+            .child(
+                div()
+                    .px_2()
+                    .py_1()
+                    .text_xs()
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(rgb(theme::TEXT_DIM))
+                    .child(title),
+            )
+            .children(targets)
     }
 
     fn source_property(label: &'static str, value: String) -> Div {
@@ -1825,7 +2035,7 @@ impl FrameViewer {
     }
 
     fn source_picker(&self, cx: &mut Context<Self>) -> Div {
-        let opening = self.source_menu_open;
+        let opening = self.open_menu == Some(OpenMenu::Source);
         let transition = self.source_menu_transition;
         let chevron = svg()
             .size(px(14.0))
@@ -2481,7 +2691,7 @@ pub(crate) fn view(args: &StreamArgs) -> Result<(), Box<dyn Error>> {
                     corner_handle_hovered: false,
                     transform_inputs,
                     focused_transform_inputs: HashSet::new(),
-                    source_menu_open: false,
+                    open_menu: None,
                     source_menu_visible: false,
                     source_menu_transition: 0,
                     scene_dragging_item: None,
@@ -2643,7 +2853,12 @@ fn source_frame(frame: &CapturedFrame) -> anyhow::Result<SourceFrame> {
     match frame {
         CapturedFrame::Screen(frame) => {
             let geometry = frame.geometry();
-            let content_rect = geometry.map(|geometry| geometry.content_rect);
+            let content_rect = geometry.map(|geometry| ContentRect {
+                x: geometry.content_rect.x,
+                y: geometry.content_rect.y,
+                width: geometry.content_rect.width,
+                height: geometry.content_rect.height,
+            });
             let dimensions = if let Some(rect) = content_rect {
                 (rect.width, rect.height)
             } else {
@@ -2830,14 +3045,12 @@ fn element_transform(
         f64::from(u32::try_from(canvas_dimensions.0).context("canvas width exceeds u32")?),
         f64::from(u32::try_from(canvas_dimensions.1).context("canvas height exceeds u32")?),
     );
-    Ok(ItemTransform::new(
-        layout.center,
-        scaled_size(
-            aspect_fit_size(layout.base_size, source_dimensions, canvas_dimensions),
-            layout.scale,
-        ),
-    )
-    .with_corner_radius(layout.corner_radius))
+    let size = aspect_fit_size(layout.size, source_dimensions, canvas_dimensions);
+    let corner_radius = (f64::from(size[0]) * canvas_dimensions.0)
+        .min(f64::from(size[1]) * canvas_dimensions.1)
+        * f64::from(layout.corner_radius_ratio);
+    #[allow(clippy::as_conversions, clippy::cast_possible_truncation)]
+    Ok(ItemTransform::new(layout.center, size).with_corner_radius(corner_radius as f32))
 }
 
 fn scaled_size(size: [f32; 2], scale: f32) -> [f32; 2] {
@@ -3061,7 +3274,7 @@ fn resize_operation(
     item: ElementId,
     handle: ResizeHandle,
     transform: ItemTransform,
-    initial_scale: f32,
+    initial_size: [f32; 2],
 ) -> DragOperation {
     let [horizontal, vertical] = handle.axes();
     let anchor = [
@@ -3072,9 +3285,13 @@ fn resize_operation(
         item,
         handle,
         initial_transform: transform,
-        initial_scale,
+        initial_size,
         anchor,
     }
+}
+
+fn minimum_resize_ratio(size: [f32; 2]) -> f32 {
+    MIN_ITEM_SCALE / size[0].max(size[1])
 }
 
 fn resized_item(
@@ -3264,11 +3481,7 @@ fn corner_radius_handle_bounds(bounds: Bounds<Pixels>, radius: Pixels) -> Bounds
 }
 
 #[allow(clippy::arithmetic_side_effects)]
-fn corner_radius_from_position(
-    bounds: Bounds<Pixels>,
-    preview_scale: f32,
-    position: Point<Pixels>,
-) -> f32 {
+fn corner_radius_ratio_from_position(bounds: Bounds<Pixels>, position: Point<Pixels>) -> f32 {
     let maximum_inset = bounds.size.width.min(bounds.size.height).as_f32() * 0.5;
     let fixed_inset = CORNER_HANDLE_INSET.as_f32();
     if maximum_inset <= fixed_inset {
@@ -3278,7 +3491,7 @@ fn corner_radius_from_position(
     let pointer_inset =
         ((right - position.x).as_f32() + (position.y - bounds.origin.y).as_f32()) * 0.5;
     let ratio = ((pointer_inset - fixed_inset) / (maximum_inset - fixed_inset)).clamp(0.0, 1.0);
-    maximum_inset * ratio / preview_scale
+    ratio * 0.5
 }
 
 fn content_frame_bounds(
@@ -3559,24 +3772,20 @@ mod tests {
     #[test]
     fn corner_radius_handle_maps_between_zero_and_maximum_radius() {
         let bounds = Bounds::new(Point::new(px(0.0), px(0.0)), size(px(200.0), px(100.0)));
-        let preview_scale = 0.5;
 
-        let zero =
-            corner_radius_from_position(bounds, preview_scale, Point::new(px(184.0), px(16.0)));
-        let half =
-            corner_radius_from_position(bounds, preview_scale, Point::new(px(167.0), px(33.0)));
-        let maximum =
-            corner_radius_from_position(bounds, preview_scale, Point::new(px(150.0), px(50.0)));
+        let zero = corner_radius_ratio_from_position(bounds, Point::new(px(184.0), px(16.0)));
+        let half = corner_radius_ratio_from_position(bounds, Point::new(px(167.0), px(33.0)));
+        let maximum = corner_radius_ratio_from_position(bounds, Point::new(px(150.0), px(50.0)));
 
         assert!(zero.abs() < f32::EPSILON);
-        assert!((half - 50.0).abs() < 0.000_1);
-        assert!((maximum - 100.0).abs() < f32::EPSILON);
+        assert!((half - 0.25).abs() < 0.000_1);
+        assert!((maximum - 0.5).abs() < f32::EPSILON);
     }
 
     #[test]
     fn element_transform_carries_corner_radius() {
         let mut layout = inset_layout();
-        layout.corner_radius = 36.0;
+        layout.corner_radius_ratio = 36.0 / 540.0;
 
         let transform = element_transform(layout, (1920.0, 1080.0), (1920, 1080));
 
@@ -3584,6 +3793,24 @@ mod tests {
         if let Ok(transform) = transform {
             assert!((transform.corner_radius - 36.0).abs() < f32::EPSILON);
         }
+    }
+
+    #[test]
+    fn normalized_layout_adapts_to_replacement_source_aspect_ratio() -> anyhow::Result<()> {
+        let layout = inset_layout();
+
+        let widescreen = element_transform(layout, (1920.0, 1080.0), (1920, 1080))?;
+        let standard = element_transform(layout, (1024.0, 768.0), (1920, 1080))?;
+
+        assert!((widescreen.center[0] - standard.center[0]).abs() < f32::EPSILON);
+        assert!((widescreen.center[1] - standard.center[1]).abs() < f32::EPSILON);
+        assert!((widescreen.size[0] - 0.5).abs() < f32::EPSILON);
+        assert!((widescreen.size[1] - 0.5).abs() < f32::EPSILON);
+        assert!((standard.size[0] - 0.375).abs() < f32::EPSILON);
+        assert!((standard.size[1] - 0.5).abs() < f32::EPSILON);
+        assert!((widescreen.corner_radius / 540.0 - layout.corner_radius_ratio).abs() < 0.000_001);
+        assert!((standard.corner_radius / 540.0 - layout.corner_radius_ratio).abs() < 0.000_001);
+        Ok(())
     }
 
     #[test]
@@ -3720,6 +3947,31 @@ mod tests {
         assert!(scene.uses_source(source));
         assert!(scene.remove(second).is_some());
         assert!(!scene.uses_source(source));
+    }
+
+    #[test]
+    fn replacing_an_element_source_preserves_its_normalized_layout() -> anyhow::Result<()> {
+        let old_source = SourceId::Window(1);
+        let new_source = SourceId::Window(2);
+        let mut scene = Scene::new();
+        let item = scene.add(old_source, inset_layout());
+
+        assert_eq!(scene.replace_source(item, new_source), Some(old_source));
+        let element = scene
+            .element(item)
+            .context("replaced element should remain")?;
+        assert_eq!(element.source, new_source);
+        for (actual, expected) in element.layout.center.into_iter().zip(inset_layout().center) {
+            assert!((actual - expected).abs() < f32::EPSILON);
+        }
+        for (actual, expected) in element.layout.size.into_iter().zip(inset_layout().size) {
+            assert!((actual - expected).abs() < f32::EPSILON);
+        }
+        assert!(
+            (element.layout.corner_radius_ratio - inset_layout().corner_radius_ratio).abs()
+                < f32::EPSILON
+        );
+        Ok(())
     }
 
     #[test]

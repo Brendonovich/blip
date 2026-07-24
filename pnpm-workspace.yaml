@@ -1,0 +1,9 @@
+packages:
+  - apps/blip-server-cloudflare
+  - packages/blip-server-core
+allowBuilds:
+  esbuild: true
+  msgpackr-extract: true
+  workerd: true
+patchedDependencies:
+  '@distilled.cloud/cloudflare-rolldown-plugin@0.13.8': patches/@distilled.cloud__cloudflare-rolldown-plugin@0.13.8.patch

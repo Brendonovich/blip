@@ -1,13 +1,20 @@
 # Blip
 
 Blip is a little Rust workspace for experimenting with native macOS screen
-capture, recording, compositing, and streaming. There are three apps in here:
+capture, recording, compositing, and streaming. The main apps are:
 
 ## Blip Capture
 
 The simple, everyday recorder. Pick a display, window, or region, hit record,
 and save the result to a folder or the clipboard. See
 [`apps/blip-capture`](apps/blip-capture) for macOS build instructions.
+
+## Blip Server
+
+The optional private recording backend. It uses Effect v4 with per-user
+S3-compatible storage. Deploy the [Node/SQLite app](apps/blip-server) or the
+[Alchemy Cloudflare/D1 app](apps/blip-server-cloudflare); both share
+[`packages/blip-server-core`](packages/blip-server-core).
 
 ## Blip Studio
 

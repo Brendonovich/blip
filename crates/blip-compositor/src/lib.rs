@@ -1,5 +1,10 @@
+//! Real-time composition of caller-provided `CoreVideo` frames.
+//!
+//! This crate owns rendering only. Capture, decoding, timeline evaluation, and output delivery
+//! remain with the caller. Supply the frames available for the current render and refer to them
+//! by index from [`CompositorItemContent::Source`].
+
 use anyhow::{Context as _, Result, anyhow};
-use blip_sck::FrameRect;
 use core_foundation::{
     base::{CFType, TCFType},
     boolean::CFBoolean,
@@ -44,7 +49,8 @@ mod shader_bindings {
 
 use shader_bindings::compositor as shader;
 
-pub(crate) struct FrameCompositor {
+/// A Metal compositor for `CoreVideo` frames and solid-color layers.
+pub struct FrameCompositor {
     device: wgpu::Device,
     queue: wgpu::Queue,
     texture_cache: CVMetalTextureCache,
@@ -59,15 +65,16 @@ struct OutputPool {
     pool: CVPixelBufferPool,
 }
 
-#[derive(Clone, Copy)]
-pub(crate) struct ItemTransform {
-    pub(crate) center: [f32; 2],
-    pub(crate) size: [f32; 2],
-    pub(crate) corner_radius: f32,
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ItemTransform {
+    pub center: [f32; 2],
+    pub size: [f32; 2],
+    pub corner_radius: f32,
 }
 
 impl ItemTransform {
-    pub(crate) const fn new(center: [f32; 2], size: [f32; 2]) -> Self {
+    #[must_use]
+    pub const fn new(center: [f32; 2], size: [f32; 2]) -> Self {
         Self {
             center,
             size,
@@ -75,32 +82,43 @@ impl ItemTransform {
         }
     }
 
-    pub(crate) const fn with_corner_radius(mut self, corner_radius: f32) -> Self {
+    #[must_use]
+    pub const fn with_corner_radius(mut self, corner_radius: f32) -> Self {
         self.corner_radius = corner_radius;
         self
     }
 
-    pub(crate) fn clamped_corner_radius(self, canvas_size: [f32; 2]) -> f32 {
+    #[must_use]
+    pub fn clamped_corner_radius(self, canvas_size: [f32; 2]) -> f32 {
         let width = canvas_size[0] * self.size[0];
         let height = canvas_size[1] * self.size[1];
         self.corner_radius.clamp(0.0, width.min(height) * 0.5)
     }
 }
 
-#[derive(Clone, Copy)]
-pub(crate) struct CompositorSource<'a> {
-    pub(crate) pixel_buffer: &'a CVPixelBuffer,
-    pub(crate) content_rect: Option<FrameRect>,
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ContentRect {
+    pub x: f64,
+    pub y: f64,
+    pub width: f64,
+    pub height: f64,
 }
 
+/// A frame supplied by the caller for use in a composition.
 #[derive(Clone, Copy)]
-pub(crate) struct CompositorItem {
-    pub(crate) content: CompositorItemContent,
-    pub(crate) transform: ItemTransform,
+pub struct CompositorSource<'a> {
+    pub pixel_buffer: &'a CVPixelBuffer,
+    pub content_rect: Option<ContentRect>,
 }
 
-#[derive(Clone, Copy)]
-pub(crate) enum CompositorItemContent {
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CompositorItem {
+    pub content: CompositorItemContent,
+    pub transform: ItemTransform,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum CompositorItemContent {
     Source(usize),
     Color([f32; 4]),
 }
@@ -112,7 +130,13 @@ struct SourceTextures {
 }
 
 impl FrameCompositor {
-    pub(crate) fn new() -> Result<Self> {
+    /// Creates a compositor backed by a high-performance Metal device.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a Metal adapter, device, or `CoreVideo` texture cache cannot be
+    /// created.
+    pub fn new() -> Result<Self> {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
             backends: wgpu::Backends::METAL,
             flags: wgpu::InstanceFlags::default(),
@@ -125,7 +149,7 @@ impl FrameCompositor {
             force_fallback_adapter: false,
             compatible_surface: None,
         }))
-        .context("failed to find a Metal adapter for the viewer")?;
+        .context("failed to find a Metal adapter for the compositor")?;
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("blip-studio compositor"),
             required_features: wgpu::Features::empty(),
@@ -134,7 +158,7 @@ impl FrameCompositor {
             trace: wgpu::Trace::Off,
             experimental_features: wgpu::ExperimentalFeatures::disabled(),
         }))
-        .context("failed to create the viewer GPU device")?;
+        .context("failed to create the compositor GPU device")?;
 
         // SAFETY: The requested backend is Metal, and the cloned retain is transferred
         // to the `metal` wrapper consumed by CoreVideo's texture cache.
@@ -217,7 +241,13 @@ impl FrameCompositor {
     }
 
     #[allow(clippy::too_many_lines)]
-    pub(crate) fn render(
+    /// Renders the items in slice order into a pooled BGRA pixel buffer.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when dimensions or source indexes are invalid, a source pixel format is
+    /// unsupported, or frame allocation, import, or GPU rendering fails.
+    pub fn render(
         &mut self,
         sources: &[CompositorSource<'_>],
         items: &[CompositorItem],
@@ -384,7 +414,7 @@ impl FrameCompositor {
             Ok(SourceTextures {
                 frame: self.import_pixel_buffer_plane(
                     pixel_buffer,
-                    "blip captured BGRA frame",
+                    "blip source BGRA frame",
                     MTLPixelFormat::BGRA8Unorm,
                     wgpu::TextureFormat::Bgra8Unorm,
                     pixel_buffer.get_width(),
@@ -405,7 +435,7 @@ impl FrameCompositor {
             Ok(SourceTextures {
                 frame: self.import_pixel_buffer_plane(
                     pixel_buffer,
-                    "blip captured NV12 luma",
+                    "blip source NV12 luma",
                     MTLPixelFormat::R8Unorm,
                     wgpu::TextureFormat::R8Unorm,
                     pixel_buffer.get_width_of_plane(0),
@@ -416,7 +446,7 @@ impl FrameCompositor {
                 )?,
                 chroma: Some(self.import_pixel_buffer_plane(
                     pixel_buffer,
-                    "blip captured NV12 chroma",
+                    "blip source NV12 chroma",
                     MTLPixelFormat::RG8Unorm,
                     wgpu::TextureFormat::Rg8Unorm,
                     pixel_buffer.get_width_of_plane(1),
@@ -438,7 +468,7 @@ impl FrameCompositor {
                 },
             })
         } else {
-            Err(anyhow!("unsupported capture pixel format {format:#010x}"))
+            Err(anyhow!("unsupported source pixel format {format:#010x}"))
         }
     }
 
@@ -532,13 +562,13 @@ fn transform_data(transform: ItemTransform) -> [f32; 4] {
     clippy::cast_possible_truncation
 )]
 fn gpu_content_rect(
-    content_rect: Option<FrameRect>,
+    content_rect: Option<ContentRect>,
     width: usize,
     height: usize,
 ) -> Result<[f32; 4]> {
     let width = f64::from(u32::try_from(width).context("frame width exceeds u32")?);
     let height = f64::from(u32::try_from(height).context("frame height exceeds u32")?);
-    let rect = content_rect.unwrap_or(FrameRect {
+    let rect = content_rect.unwrap_or(ContentRect {
         x: 0.0,
         y: 0.0,
         width,

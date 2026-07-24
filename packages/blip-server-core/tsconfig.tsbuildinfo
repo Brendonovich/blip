@@ -1,0 +1,1 @@
+{"root":["./src/api.ts","./src/http.ts","./src/index.ts","./src/domain/policy.ts","./src/domain/storagepolicy.ts","./src/domain/videospolicy.ts","./src/domain/auth.ts","./src/domain/errors.ts","./src/domain/model.ts","./src/domain/object-storage.ts","./src/domain/repository.ts","./src/domain/vault.ts"],"version":"5.9.2"}

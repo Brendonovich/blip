@@ -92,6 +92,12 @@ impl NumericInput {
         }
     }
 
+    pub(crate) fn set_text(&mut self, value: impl Into<SharedString>, cx: &mut Context<Self>) {
+        self.content = value.into();
+        self.selected_range = self.content.len()..self.content.len();
+        cx.notify();
+    }
+
     pub(crate) fn focus_handle(&self) -> &FocusHandle {
         &self.focus_handle
     }

@@ -10,24 +10,16 @@ workspace = true
 anyhow.workspace = true
 async-channel.workspace = true
 blip-avfoundation.workspace = true
+blip-compositor.workspace = true
 blip-sck.workspace = true
-bytemuck.workspace = true
 clap.workspace = true
 core-foundation.workspace = true
 core-video.workspace = true
-foreign-types.workspace = true
 ffmpeg.workspace = true
 ffmpeg-sys-next.workspace = true
 gpui.workspace = true
 gpui_platform.workspace = true
 libc.workspace = true
-metal.workspace = true
 objc2.workspace = true
-objc2-metal.workspace = true
-pollster.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-wgpu.workspace = true
-
-[build-dependencies]
-wgsl_bindgen.workspace = true

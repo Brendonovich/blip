@@ -4,7 +4,6 @@ use std::process::ExitCode;
 use clap::Parser;
 
 mod assets;
-mod compositor;
 mod headless;
 mod numeric_input;
 mod rtmp;

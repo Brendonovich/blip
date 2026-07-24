@@ -1,0 +1,40 @@
+diff --git a/dist/plugins/options.js b/dist/plugins/options.js
+index 64b907d5ffb82376ba151e135e9b696f2d20dd4f..d2fcdc707587076c3d3375cac821ec86c059c9b7 100644
+--- a/dist/plugins/options.js
++++ b/dist/plugins/options.js
+@@ -143,10 +143,14 @@ export const optionsPlugin = createPlugin("options", (pluginOptions) => {
+                             // We need to include this for `builder.buildApp()` to work
+                             // because not all frameworks provide it...
+                             buildApp: async (builder) => {
++                                const client = builder.environments.client;
++                                if (client && !client.isBuilt) {
++                                    await builder.build(client);
++                                }
+                                 for (const environment of Object.values(builder.environments)) {
+                                     // ...however, if your framework does provide a `buildApp` hook,
+                                     // this check prevents us from building the environment twice.
+-                                    if (environment.isBuilt)
++                                    if (environment === client || environment.isBuilt)
+                                         continue;
+                                     await builder.build(environment);
+                                 }
+diff --git a/src/plugins/options.ts b/src/plugins/options.ts
+index b3710f0c6806af5a3f7d9cda2d2752c1a90b3a15..02289ccf7048e8ea75b6d181ef9e062c12ddd1c1 100644
+--- a/src/plugins/options.ts
++++ b/src/plugins/options.ts
+@@ -166,10 +166,14 @@ export const optionsPlugin = createPlugin<"options", OptionsApi>("options", (plu
+                   // We need to include this for `builder.buildApp()` to work
+                   // because not all frameworks provide it...
+                   buildApp: async (builder) => {
++                    const client = builder.environments.client;
++                    if (client && !client.isBuilt) {
++                      await builder.build(client);
++                    }
+                     for (const environment of Object.values(builder.environments)) {
+                       // ...however, if your framework does provide a `buildApp` hook,
+                       // this check prevents us from building the environment twice.
+-                      if (environment.isBuilt) continue;
++                      if (environment === client || environment.isBuilt) continue;
+                       await builder.build(environment);
+                     }
+                   },

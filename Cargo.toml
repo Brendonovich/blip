@@ -14,6 +14,7 @@ members = [
     "gpui/gpui_wgpu",
     "gpui/gpui_windows",
 ]
+exclude = ["apps/blip-server", "apps/blip-server-cloudflare", "apps/blip-server-proxy"]
 resolver = "3"
 
 [workspace.package]
@@ -33,6 +34,7 @@ backtrace = "0.3"
 bitflags = "2.6.0"
 blip-sck = { path = "crates/blip-sck" }
 blip-avfoundation = { path = "crates/blip-avfoundation" }
+blip-compositor = { path = "crates/blip-compositor" }
 bytemuck = { version = "1", features = ["derive"] }
 block = "0.1"
 block2 = "0.6"
@@ -91,10 +93,11 @@ objc2-metal = "0.3.2"
 objc = "0.2"
 objc2 = "0.6"
 objc2-app-kit = { version = "0.3.2", default-features = false, features = ["NSButton", "NSControl", "NSGraphics", "NSResponder", "NSView", "NSWindow", "objc2-core-foundation"] }
-objc2-av-foundation = { version = "0.3.2", default-features = false, features = ["std", "AVAssetWriter", "AVAssetWriterInput", "AVCaptureDevice", "AVCaptureInput", "AVCaptureOutputBase", "AVCaptureSession", "AVCaptureVideoDataOutput", "AVMediaFormat", "AVVideoSettings", "block2", "dispatch2", "objc2-core-media", "objc2-core-video"] }
-objc2-core-media = { version = "0.3.2", features = ["CMFormatDescription", "CMSampleBuffer", "CMTime"] }
+objc2-av-foundation = { version = "0.3.2", default-features = false, features = ["std", "AVAsset", "AVAssetReader", "AVAssetReaderOutput", "AVAssetSegmentReport", "AVAssetTrack", "AVAssetWriter", "AVAssetWriterInput", "AVAsynchronousKeyValueLoading", "AVCaptureDevice", "AVCaptureInput", "AVCaptureOutputBase", "AVCaptureSession", "AVCaptureVideoDataOutput", "AVMediaFormat", "AVVideoSettings", "block2", "dispatch2", "objc2-core-foundation", "objc2-core-media", "objc2-core-video", "objc2-uniform-type-identifiers"] }
+objc2-core-media = { version = "0.3.2", features = ["CMFormatDescription", "CMSampleBuffer", "CMTime", "CMTimeRange"] }
 objc2-foundation = { version = "=0.3.2", default-features = false, features = ["NSArray", "NSAttributedString", "NSBundle", "NSCoder", "NSData", "NSDate", "NSDictionary", "NSEnumerator", "NSError", "NSGeometry", "NSNotification", "NSNull", "NSObjCRuntime", "NSObject", "NSProcessInfo", "NSRange", "NSRunLoop", "NSSet", "NSString", "NSURL", "NSUndoManager", "NSValue", "objc2-core-foundation", "std"] }
 objc2-user-notifications = "0.3"
+objc2-uniform-type-identifiers = { version = "0.3.2", features = ["UTCoreTypes", "UTType"] }
 parking_lot = "0.12.1"
 pathfinder_geometry = "0.5"
 pollster = "0.4.0"
@@ -108,6 +111,7 @@ raw-window-handle = "0.6"
 refineable = { git = "https://github.com/zed-industries/zed", rev = "aba12fc8a0fe44a0742acc0d096e843d07385962" }
 regex = "1.5"
 reqwest_client = { git = "https://github.com/zed-industries/zed", rev = "aba12fc8a0fe44a0742acc0d096e843d07385962" }
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 resvg = { version = "0.46.0", default-features = false, features = ["text", "system-fonts", "memmap-fonts", "raster-images"] }
 scap = { git = "https://github.com/zed-industries/scap", rev = "4afea48c3b002197176fb19cd0f9b180dd36eaac", default-features = false, package = "zed-scap", version = "0.0.8-zed" }
 scheduler = { git = "https://github.com/zed-industries/zed", rev = "aba12fc8a0fe44a0742acc0d096e843d07385962" }
@@ -125,6 +129,8 @@ swash = "0.2.6"
 syn = { version = "2.0.101", features = ["full", "extra-traits", "visit-mut"] }
 thiserror = "2.0.12"
 tokio = "1"
+tracing = "0.1"
+tracing-subscriber = "0.3"
 unicode-segmentation = "1.10"
 url = "2.2"
 usvg = { version = "0.46.0", default-features = false }

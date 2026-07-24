@@ -1,0 +1,12 @@
+{
+  "rewrites": [
+    {
+      "source": "/",
+      "destination": "https://blipserver-worker-production-okguj6zqlc2vezdw.brendonovich.workers.dev/"
+    },
+    {
+      "source": "/:path*",
+      "destination": "https://blipserver-worker-production-okguj6zqlc2vezdw.brendonovich.workers.dev/:path*"
+    }
+  ]
+}

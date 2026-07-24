@@ -149,6 +149,12 @@ impl AsyncApp {
         lock.refresh_windows();
     }
 
+    pub(crate) fn can_update(&self) -> bool {
+        self.app
+            .upgrade()
+            .is_some_and(|app| app.try_borrow_mut().is_ok())
+    }
+
     /// Get an executor which can be used to spawn futures in the background.
     pub fn background_executor(&self) -> &BackgroundExecutor {
         &self.background_executor

@@ -8,15 +8,14 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, anyhow};
 use blip_avfoundation::{CameraCapturer, CameraDevice, CameraFrame};
+use blip_compositor::{
+    CompositorItem, CompositorItemContent, CompositorSource, FrameCompositor, ItemTransform,
+};
 use core_foundation::base::TCFType as _;
 use core_video::pixel_buffer::CVPixelBuffer;
 use serde::Deserialize;
 
 use crate::StreamArgs;
-use crate::compositor::{
-    CompositorItem, CompositorItemContent, CompositorSource, FrameCompositor, ItemTransform,
-};
-
 const REPORT_INTERVAL: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Deserialize)]
