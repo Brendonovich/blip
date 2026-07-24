@@ -50,7 +50,6 @@ const SOURCE_MENU_ANIMATION_DURATION: Duration = Duration::from_millis(150);
 const SCENE_ROW_ANIMATION_DURATION: Duration = Duration::from_millis(140);
 const SCENE_ROW_STRIDE: f32 = 36.0;
 const DEFAULT_CANVAS_DIMENSIONS: (usize, usize) = (1920, 1080);
-const PREVIEW_CANVAS_DIMENSIONS: (usize, usize) = (1280, 720);
 const PREFERRED_CAMERA_FPS: u32 = 60;
 const MIN_ITEM_SCALE: f32 = 0.05;
 const SNAP_THRESHOLD_PX: f32 = 8.0;
@@ -2722,7 +2721,7 @@ fn compose_scene(
     locked_dimensions: Option<(usize, usize)>,
 ) -> anyhow::Result<(CVPixelBuffer, (usize, usize), Vec<RenderedElement>)> {
     let canvas_dimensions = locked_dimensions.unwrap_or(DEFAULT_CANVAS_DIMENSIONS);
-    let output_dimensions = locked_dimensions.unwrap_or(PREVIEW_CANVAS_DIMENSIONS);
+    let output_dimensions = canvas_dimensions;
     let mut source_ids = Vec::new();
     let mut source_indices = HashMap::new();
     for element in elements {

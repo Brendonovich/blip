@@ -57,84 +57,14 @@ fn nv12_to_rgb(y_sample: f32, chroma: vec2<f32>, full_range: bool, bt601: bool) 
     return clamp(select(bt709_color, bt601_color, bt601), vec3(0.0), vec3(1.0));
 }
 
-fn sample_uv(
-    center: vec2<f32>,
-    offset: vec2<f32>,
-    texture_dimensions: vec2<f32>,
-    content_min: vec2<f32>,
-    content_max: vec2<f32>,
-) -> vec2<f32> {
-    let half_texel = 0.5 / texture_dimensions;
-    return clamp(center + offset / texture_dimensions, content_min + half_texel, content_max - half_texel);
-}
-
-fn sample_bgra(
-    center: vec2<f32>,
-    footprint: vec2<f32>,
-    texture_dimensions: vec2<f32>,
-    content_min: vec2<f32>,
-    content_max: vec2<f32>,
-) -> vec4<f32> {
-    if max(footprint.x, footprint.y) <= 1.1 {
-        return textureSample(frame, frame_sampler, center);
-    }
-
-    let offsets = array(-0.375, -0.125, 0.125, 0.375);
-    let span = select(vec2(0.0), footprint, footprint > vec2(1.1));
-    var color = vec4(0.0);
-    for (var y = 0u; y < 4u; y += 1u) {
-        for (var x = 0u; x < 4u; x += 1u) {
-            let uv = sample_uv(
-                center,
-                vec2(offsets[x] * span.x, offsets[y] * span.y),
-                texture_dimensions,
-                content_min,
-                content_max,
-            );
-            color += textureSample(frame, frame_sampler, uv);
-        }
-    }
-    return color * (1.0 / 16.0);
-}
-
 fn sample_nv12(
     center: vec2<f32>,
-    footprint: vec2<f32>,
-    texture_dimensions: vec2<f32>,
-    content_min: vec2<f32>,
-    content_max: vec2<f32>,
     full_range: bool,
     bt601: bool,
 ) -> vec3<f32> {
-    if max(footprint.x, footprint.y) <= 1.1 {
-        let y = textureSample(frame, frame_sampler, center).r;
-        let chroma = textureSample(frame_chroma, frame_sampler, center).rg;
-        return nv12_to_rgb(y, chroma, full_range, bt601);
-    }
-
-    let offsets = array(-0.375, -0.125, 0.125, 0.375);
-    let span = select(vec2(0.0), footprint, footprint > vec2(1.1));
-    var y_sample = 0.0;
-    var chroma = vec2(0.0);
-    for (var y = 0u; y < 4u; y += 1u) {
-        for (var x = 0u; x < 4u; x += 1u) {
-            let uv = sample_uv(
-                center,
-                vec2(offsets[x] * span.x, offsets[y] * span.y),
-                texture_dimensions,
-                content_min,
-                content_max,
-            );
-            y_sample += textureSample(frame, frame_sampler, uv).r;
-            chroma += textureSample(frame_chroma, frame_sampler, uv).rg;
-        }
-    }
-    return nv12_to_rgb(
-        y_sample * (1.0 / 16.0),
-        chroma * (1.0 / 16.0),
-        full_range,
-        bt601,
-    );
+    let y = textureSample(frame, frame_sampler, center).r;
+    let chroma = textureSample(frame_chroma, frame_sampler, center).rg;
+    return nv12_to_rgb(y, chroma, full_range, bt601);
 }
 
 @fragment
@@ -143,27 +73,14 @@ fn fragment(input: VertexOutput) -> @location(0) vec4<f32> {
     let source_uv = (
         settings.content_rect.xy + input.uv * settings.content_rect.zw
     ) / texture_dimensions;
-    let content_min = settings.content_rect.xy / texture_dimensions;
-    let content_max = (settings.content_rect.xy + settings.content_rect.zw) / texture_dimensions;
-    let footprint = fwidth(source_uv) * texture_dimensions;
     let content_kind = settings.canvas_data.w;
-    var color = sample_bgra(
-        source_uv,
-        footprint,
-        texture_dimensions,
-        content_min,
-        content_max,
-    );
+    var color = textureSample(frame, frame_sampler, source_uv);
     if content_kind > 0.5 && content_kind < 1.5 {
         color = settings.color;
     } else if content_kind > 1.5 {
         let full_range = content_kind == 3.0 || content_kind == 5.0;
         color = vec4(sample_nv12(
             source_uv,
-            footprint,
-            texture_dimensions,
-            content_min,
-            content_max,
             full_range,
             content_kind > 3.5,
         ), 1.0);
