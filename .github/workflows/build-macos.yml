@@ -23,15 +23,24 @@ jobs:
       - name: Cache Rust build
         uses: Swatinem/rust-cache@v2
 
+      - name: Set up Apple signing
+        uses: ./.github/actions/setup-apple-signing
+        with:
+          certificate-p12-base64: ${{ secrets.APPLE_CERTIFICATE_P12_BASE64 }}
+          certificate-password: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          api-key-p8-base64: ${{ secrets.APPLE_API_KEY_P8_BASE64 }}
+          api-key-id: ${{ secrets.APPLE_API_KEY_ID }}
+          signing-identity: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+
       - name: Build Blip Capture DMG
         env:
           BLIP_BUILD_NUMBER: ${{ github.run_number }}
-        run: apps/blip-capture/build-app.sh --dmg
+        run: apps/blip-capture/build-app.sh --notarize
 
       - name: Build Blip Studio DMG
         env:
           BLIP_BUILD_NUMBER: ${{ github.run_number }}
-        run: apps/blip-studio/build-app.sh --dmg
+        run: apps/blip-studio/build-app.sh --notarize
 
       - name: Upload Blip Capture
         uses: actions/upload-artifact@v7

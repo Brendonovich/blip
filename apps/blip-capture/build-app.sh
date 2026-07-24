@@ -59,8 +59,10 @@ if [[ "$notarize" == true && "$identity" == "-" ]]; then
     exit 2
 fi
 if [[ "$notarize" == true && -z "${APPLE_NOTARY_PROFILE:-}" ]]; then
-    print -u2 "--notarize requires APPLE_NOTARY_PROFILE."
-    exit 2
+    if [[ -z "${APPLE_NOTARY_KEY_PATH:-}" || -z "${APPLE_NOTARY_KEY_ID:-}" ]]; then
+        print -u2 "--notarize requires APPLE_NOTARY_PROFILE or an API key path and ID."
+        exit 2
+    fi
 fi
 if [[ ! "$build_number" =~ '^[0-9]+([.][0-9]+)*$' ]]; then
     print -u2 "BLIP_BUILD_NUMBER must contain only integers separated by periods."
@@ -131,9 +133,15 @@ if [[ "$make_dmg" == true ]]; then
 fi
 
 if [[ "$notarize" == true ]]; then
-    xcrun notarytool submit "$dmg" \
-        --keychain-profile "$APPLE_NOTARY_PROFILE" \
-        --wait
+    if [[ -n "${APPLE_NOTARY_PROFILE:-}" ]]; then
+        notary_args=(--keychain-profile "$APPLE_NOTARY_PROFILE")
+    else
+        notary_args=(--key "$APPLE_NOTARY_KEY_PATH" --key-id "$APPLE_NOTARY_KEY_ID")
+        if [[ -n "${APPLE_NOTARY_ISSUER_ID:-}" ]]; then
+            notary_args+=(--issuer "$APPLE_NOTARY_ISSUER_ID")
+        fi
+    fi
+    xcrun notarytool submit "$dmg" "${notary_args[@]}" --wait
     xcrun stapler staple "$dmg"
     xcrun stapler validate "$dmg"
     spctl --assess --type open --context context:primary-signature --verbose=2 "$dmg"

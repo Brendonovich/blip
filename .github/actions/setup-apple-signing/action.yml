@@ -1,0 +1,62 @@
+name: Set up Apple signing
+description: Installs a Developer ID certificate and App Store Connect API key.
+
+inputs:
+  certificate-p12-base64:
+    description: Base64-encoded Developer ID certificate and private key.
+    required: true
+  certificate-password:
+    description: Password for the PKCS#12 archive.
+    required: false
+  api-key-p8-base64:
+    description: Base64-encoded App Store Connect API private key.
+    required: true
+  api-key-id:
+    description: App Store Connect API key ID.
+    required: true
+  signing-identity:
+    description: Developer ID Application identity name or fingerprint.
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Install signing credentials
+      shell: bash
+      env:
+        CERTIFICATE_P12_BASE64: ${{ inputs.certificate-p12-base64 }}
+        CERTIFICATE_PASSWORD: ${{ inputs.certificate-password }}
+        API_KEY_P8_BASE64: ${{ inputs.api-key-p8-base64 }}
+        API_KEY_ID: ${{ inputs.api-key-id }}
+        SIGNING_IDENTITY: ${{ inputs.signing-identity }}
+      run: |
+        certificate_path="$RUNNER_TEMP/developer-id.p12"
+        api_key_path="$RUNNER_TEMP/AuthKey_${API_KEY_ID}.p8"
+        keychain_path="$RUNNER_TEMP/blip-signing.keychain-db"
+        keychain_password="$(openssl rand -hex 32)"
+
+        printf '%s' "$CERTIFICATE_P12_BASE64" | openssl base64 -d -A -out "$certificate_path"
+        printf '%s' "$API_KEY_P8_BASE64" | openssl base64 -d -A -out "$api_key_path"
+        chmod 600 "$certificate_path" "$api_key_path"
+
+        security create-keychain -p "$keychain_password" "$keychain_path"
+        security set-keychain-settings -lut 21600 "$keychain_path"
+        security unlock-keychain -p "$keychain_password" "$keychain_path"
+        security import "$certificate_path" \
+          -P "$CERTIFICATE_PASSWORD" \
+          -A \
+          -t cert \
+          -f pkcs12 \
+          -k "$keychain_path"
+        security set-key-partition-list \
+          -S apple-tool:,apple: \
+          -s \
+          -k "$keychain_password" \
+          "$keychain_path"
+        security list-keychains -d user -s "$keychain_path"
+
+        {
+          echo "APPLE_SIGNING_IDENTITY=$SIGNING_IDENTITY"
+          echo "APPLE_NOTARY_KEY_PATH=$api_key_path"
+          echo "APPLE_NOTARY_KEY_ID=$API_KEY_ID"
+        } >> "$GITHUB_ENV"
