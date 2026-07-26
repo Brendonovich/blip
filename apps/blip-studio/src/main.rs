@@ -1,6 +1,8 @@
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::time::Duration;
 
+use blip_avfoundation::CameraAuthorizationStatus;
 use clap::Parser;
 
 mod assets;
@@ -55,6 +57,9 @@ struct StreamArgs {
 
 fn main() -> ExitCode {
     let args = StreamArgs::parse();
+    if let Err(error) = request_camera_access_on_startup() {
+        eprintln!("blip-studio: failed to request camera access: {error}");
+    }
     let result = if args.headless {
         headless::run(&args)
     } else {
@@ -67,6 +72,13 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+fn request_camera_access_on_startup() -> Result<(), blip_avfoundation::CameraError> {
+    if blip_avfoundation::camera_authorization_status()? != CameraAuthorizationStatus::Authorized {
+        _ = blip_avfoundation::request_camera_access(Duration::from_secs(30))?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]

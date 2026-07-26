@@ -1,8 +1,8 @@
 # Blip Server
 
-A single-process Node deployment of the Effect v4 Blip recording server. It uses
-local SQLite and the shared [`@blip/server-core`](../../packages/blip-server-core)
-domain and typed `HttpApi` implementation.
+A single-process Node deployment of the Blip SolidStart application. It uses
+local SQLite and the shared
+[`@blip/server-app`](../../packages/blip-server-app).
 
 ## Configuration
 
@@ -17,19 +17,39 @@ credentials with AES-256-GCM and must remain stable for the lifetime of the
 database. Set `BLIP_PUBLIC_ORIGIN` to the canonical HTTPS origin users will open,
 such as `https://blip.example.com`.
 
+Set `BETTER_AUTH_SECRET` to another stable random value and configure
+`GITHUB_CLIENT_ID` and `GITHUB_CLIENT_SECRET` for the public origin's OAuth
+callback URL.
+
 ## Run
 
-Use Node `22.22.2+`, `24.15.0+`, or `26+`. Run one process against a local
-persistent disk (the container build can compile the TypeScript entry):
+Use Node 24 or newer. From the repository root:
 
 ```sh
 pnpm install
-DATABASE_PATH=/var/lib/blip/blip.sqlite pnpm start
+pnpm --filter blip-server build
+DATABASE_PATH=/var/lib/blip/blip.sqlite pnpm --filter blip-server start
 ```
+
+Nitro emits a self-contained Node deployment in `.output`; the start command
+runs `.output/server/index.mjs` and serves the generated client assets itself.
 
 `HOST` defaults to `0.0.0.0`, `PORT` to `3000`, and the SQLite parent directory
 is created automatically. Put the process behind an HTTPS reverse proxy. Do not
 run multiple Node replicas against the same SQLite file.
+
+## Docker
+
+Build from the repository root and mount a persistent data directory:
+
+```sh
+docker build -f apps/blip-server/Dockerfile -t blip-server .
+docker run --rm -p 3000:3000 \
+  --env-file apps/blip-server/.env \
+  -e DATABASE_PATH=/var/lib/blip/blip.sqlite \
+  -v blip-data:/var/lib/blip \
+  blip-server
+```
 
 ## Configure Storage
 
@@ -65,8 +85,8 @@ Bearer credential.
 
 ## API
 
-The contract is defined with Effect's typed `HttpApi`. OpenAPI is served from
-`/openapi.json`.
+The contract is defined with Effect's typed `HttpApi`. Scalar is served from
+`/api`, and the OpenAPI document is available at `/openapi.json`.
 
 - `GET|PUT|DELETE /api/storage` manages the authenticated user's bucket.
 - `POST /api/uploads` creates a video and starts its multipart upload.

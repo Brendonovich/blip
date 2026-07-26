@@ -28,9 +28,9 @@ use objc2::{
     AnyThread, DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send, sel,
 };
 use objc2_app_kit::{
-    NSApplicationActivationOptions, NSControlStateValueOn, NSMenu, NSMenuItem,
-    NSRunningApplication, NSView, NSWindowAnimationBehavior, NSWindowCollectionBehavior,
-    NSWindowStyleMask,
+    NSApplication, NSApplicationActivationOptions, NSApplicationActivationPolicy,
+    NSControlStateValueOn, NSMenu, NSMenuItem, NSRunningApplication, NSScreen, NSView,
+    NSWindowAnimationBehavior, NSWindowCollectionBehavior, NSWindowStyleMask,
 };
 use objc2_foundation::{NSObject, NSObjectProtocol, NSPoint, NSString};
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
@@ -124,6 +124,7 @@ enum Status {
     Starting,
     Recording,
     Finalizing,
+    Uploading,
 }
 
 enum DestinationMenuAction {
@@ -218,6 +219,7 @@ struct CaptureApp {
     visual_windows: Vec<AnyWindowHandle>,
     status: Status,
     started_at: Option<Instant>,
+    recorded_duration: Duration,
     stop_sender: Option<mpsc::Sender<()>>,
     event_sender: async_channel::Sender<RecordingEvent>,
     visible: Rc<Cell<bool>>,
@@ -339,6 +341,7 @@ impl CaptureApp {
             visual_windows: Vec::new(),
             status: Status::Idle,
             started_at: None,
+            recorded_duration: Duration::ZERO,
             stop_sender: None,
             event_sender,
             visible,
@@ -481,11 +484,13 @@ impl CaptureApp {
         let controller = cx.entity();
         let profiles = self.profiles.clone();
         let options = profile_settings_options(cx);
+        set_activation_policy(NSApplicationActivationPolicy::Regular);
         let settings_window = match cx.open_window(options, move |_, cx| {
             cx.new(|cx| ProfileSettings::new(controller, profiles, cx))
         }) {
             Ok(window) => window,
             Err(error) => {
+                set_activation_policy(NSApplicationActivationPolicy::Accessory);
                 self.error = Some(format!(
                     "Failed to open recording profile settings: {error}"
                 ));
@@ -515,6 +520,7 @@ impl CaptureApp {
             if window_id != settings_window_id || restored.replace(true) {
                 return;
             }
+            set_activation_policy(NSApplicationActivationPolicy::Accessory);
             let Some(controller) = controller_window.downcast::<CaptureApp>() else {
                 return;
             };
@@ -677,7 +683,8 @@ impl CaptureApp {
             cx.notify();
             return;
         }
-        let output = match output_destination(&profile) {
+        let target_name = self.capture_target_name(spec);
+        let output = match output_destination(&profile, &target_name) {
             Ok(output) => output,
             Err(error) => {
                 self.error = Some(error);
@@ -715,10 +722,30 @@ impl CaptureApp {
         cx.notify();
     }
 
+    fn capture_target_name(&self, spec: CaptureSpec) -> String {
+        match spec {
+            CaptureSpec::Window(window_id) => self
+                .windows
+                .iter()
+                .find(|window| window.id() == window_id)
+                .map(window_name)
+                .unwrap_or_else(|| format!("Window {window_id}")),
+            CaptureSpec::Display(display_id) | CaptureSpec::Region { display_id, .. } => {
+                display_name(display_id).unwrap_or_else(|| format!("Display {display_id}"))
+            }
+        }
+    }
+
     fn stop(&mut self, cx: &mut Context<Self>) {
         if !matches!(self.status, Status::Recording) {
             return;
         }
+        self.recorded_duration = self
+            .started_at
+            .take()
+            .map_or(Duration::ZERO, |start| start.elapsed());
+        self.selection.recording.set(false);
+        self.close_selection_windows(cx);
         self.status = Status::Finalizing;
         if let Some(sender) = self.stop_sender.take() {
             sender.send(()).ok();
@@ -765,6 +792,7 @@ impl CaptureApp {
             RecordingEvent::Started => {
                 self.status = Status::Recording;
                 self.started_at = Some(Instant::now());
+                self.recorded_duration = Duration::ZERO;
                 self.resize_toolbar((300.0, 56.0), cx);
                 cx.spawn(async move |app, cx| {
                     loop {
@@ -774,7 +802,7 @@ impl CaptureApp {
                         let keep_ticking = app
                             .update(cx, |app, cx| {
                                 cx.notify();
-                                matches!(app.status, Status::Recording | Status::Finalizing)
+                                matches!(app.status, Status::Recording)
                             })
                             .unwrap_or(false);
                         if !keep_ticking {
@@ -783,6 +811,9 @@ impl CaptureApp {
                     }
                 })
                 .detach();
+            }
+            RecordingEvent::Uploading => {
+                self.status = Status::Uploading;
             }
             RecordingEvent::Finished { path, viewer_url } => {
                 if let Some(viewer_url) = viewer_url {
@@ -827,6 +858,7 @@ impl CaptureApp {
             RecordingEvent::Failed(message) => {
                 self.status = Status::Idle;
                 self.started_at = None;
+                self.recorded_duration = Duration::ZERO;
                 self.stop_sender = None;
                 self.selection.recording.set(false);
                 self.error = Some(message);
@@ -986,17 +1018,21 @@ impl Render for CaptureApp {
 
         let elapsed = self
             .started_at
-            .map_or(Duration::ZERO, |start| start.elapsed());
+            .map_or(self.recorded_duration, |start| start.elapsed());
         let seconds = elapsed.as_secs();
         let time = format!(
             "{:02}:{:02}",
             seconds.div_euclid(60),
             seconds.rem_euclid(60)
         );
-        let disabled = matches!(self.status, Status::Starting | Status::Finalizing);
+        let disabled = matches!(
+            self.status,
+            Status::Starting | Status::Finalizing | Status::Uploading
+        );
         let label = match self.status {
             Status::Starting => "Starting…",
             Status::Finalizing => "Finishing…",
+            Status::Uploading => "Uploading…",
             Status::Idle | Status::Recording => "Stop",
         };
         shell
@@ -1118,6 +1154,19 @@ impl ProfileSettings {
         self.profiles
             .profiles
             .push(RecordingProfile::new_local(folder));
+        self.selected = self.profiles.profiles.len().saturating_sub(1);
+        self.error = None;
+        self.load_inputs(cx);
+        cx.notify();
+    }
+
+    fn duplicate(&mut self, cx: &mut Context<Self>) {
+        self.commit_inputs(cx);
+        let Some(profile) = self.profiles.profiles.get(self.selected) else {
+            return;
+        };
+        let duplicate = profile.duplicate();
+        self.profiles.profiles.push(duplicate);
         self.selected = self.profiles.profiles.len().saturating_sub(1);
         self.error = None;
         self.load_inputs(cx);
@@ -1312,10 +1361,16 @@ impl Render for ProfileSettings {
                         div()
                             .mt_3()
                             .flex()
+                            .flex_wrap()
                             .gap_2()
                             .child(
                                 settings_button("add-profile", "Add")
                                     .on_click(cx.listener(|settings, _, _, cx| settings.add(cx))),
+                            )
+                            .child(
+                                settings_button("duplicate-profile", "Duplicate").on_click(
+                                    cx.listener(|settings, _, _, cx| settings.duplicate(cx)),
+                                ),
                             )
                             .child(
                                 settings_button("delete-profile", "Delete").on_click(
@@ -2603,16 +2658,23 @@ struct OutputDestination {
     cleanup_on_failure: Option<PathBuf>,
 }
 
-fn output_destination(profile: &RecordingProfile) -> Result<OutputDestination, String> {
+fn output_destination(
+    profile: &RecordingProfile,
+    target_name: &str,
+) -> Result<OutputDestination, String> {
     let folder = match &profile.target {
         RecordingTarget::Local { folder } => folder.clone(),
         RecordingTarget::Remote { .. } => std::env::temp_dir().join("blip-capture"),
     };
     std::fs::create_dir_all(&folder)
         .map_err(|error| format!("failed to create recording folder: {error}"))?;
-    let timestamp = Local::now().format("%Y-%m-%d at %H.%M.%S");
+    let filename = format!(
+        "{} - {}",
+        sanitize_filename(target_name),
+        Local::now().format("%Y-%m-%d")
+    );
     if profile.format == RecordingFormat::Hls {
-        let output = folder.join(format!("Blip Capture {timestamp}.hls"));
+        let output = unique_output_path(&folder, &filename, "hls");
         return Ok(OutputDestination {
             media_path: output.clone(),
             completed_path: output.clone(),
@@ -2620,7 +2682,7 @@ fn output_destination(profile: &RecordingProfile) -> Result<OutputDestination, S
         });
     }
     if profile.format == RecordingFormat::BlipBundle {
-        let completed_path = folder.join(format!("Blip Capture {timestamp}.blip"));
+        let completed_path = unique_output_path(&folder, &filename, "blip");
         let bundle = BlipBundle::create(&completed_path)?;
         let media_path = bundle.media_path(&completed_path)?;
         return Ok(OutputDestination {
@@ -2629,12 +2691,69 @@ fn output_destination(profile: &RecordingProfile) -> Result<OutputDestination, S
             cleanup_on_failure: Some(completed_path),
         });
     }
-    let completed_path = folder.join(format!("Blip Capture {timestamp}.mp4"));
+    let completed_path = unique_output_path(&folder, &filename, "mp4");
     Ok(OutputDestination {
         media_path: completed_path.clone(),
         completed_path,
         cleanup_on_failure: None,
     })
+}
+
+fn display_name(display_id: u32) -> Option<String> {
+    let mtm = MainThreadMarker::new()?;
+    NSScreen::screens(mtm)
+        .iter()
+        .find(|screen| screen.CGDirectDisplayID() == display_id)
+        .map(|screen| screen.localizedName().to_string())
+}
+
+fn window_name(window: &CaptureWindow) -> String {
+    let application = window.application().map(|app| app.name());
+    let title = window.title().filter(|title| !title.trim().is_empty());
+    match (application, title) {
+        (Some(application), Some(title)) => format!("{application} - {title}"),
+        (Some(application), None) => application,
+        (None, Some(title)) => title,
+        (None, None) => format!("Window {}", window.id()),
+    }
+}
+
+fn sanitize_filename(name: &str) -> String {
+    let mut sanitized = name
+        .trim()
+        .chars()
+        .map(|character| {
+            if character == '/' || character == ':' || character.is_control() {
+                '-'
+            } else {
+                character
+            }
+        })
+        .collect::<String>();
+    if sanitized.is_empty() {
+        "Recording".into()
+    } else {
+        let mut end = sanitized.len().min(150);
+        while !sanitized.is_char_boundary(end) {
+            end = end.saturating_sub(1);
+        }
+        sanitized.truncate(end);
+        sanitized
+    }
+}
+
+fn unique_output_path(folder: &Path, filename: &str, extension: &str) -> PathBuf {
+    let initial = folder.join(format!("{filename}.{extension}"));
+    if !initial.exists() {
+        return initial;
+    }
+    for suffix in 2_u32.. {
+        let candidate = folder.join(format!("{filename} {suffix}.{extension}"));
+        if !candidate.exists() {
+            return candidate;
+        }
+    }
+    unreachable!()
 }
 
 #[repr(C)]
@@ -2941,6 +3060,7 @@ fn run_app(open_path: Option<PathBuf>) {
         profile_sender.try_send(urls).ok();
     });
     app.run(move |cx| {
+        set_activation_policy(NSApplicationActivationPolicy::Accessory);
         if let Some(path) = open_path {
             if let Err(error) = BundleEditor::open(path, cx) {
                 eprintln!("blip-capture: {error}");
@@ -2982,6 +3102,12 @@ fn run_app(open_path: Option<PathBuf>) {
         .detach();
         open_capture(cx, &visible, &escape_hotkey, &target_cache);
     });
+}
+
+fn set_activation_policy(policy: NSApplicationActivationPolicy) {
+    if let Some(main_thread) = MainThreadMarker::new() {
+        NSApplication::sharedApplication(main_thread).setActivationPolicy(policy);
+    }
 }
 
 fn init_tracing() {
@@ -3084,5 +3210,14 @@ mod tests {
             super::toolbar_dimensions_for_label("A Very Long Server Name That Exceeds Max"),
             (584.0, 56.0)
         );
+    }
+
+    #[test]
+    fn sanitizes_capture_target_for_filename() {
+        assert_eq!(
+            super::sanitize_filename("Safari: Docs/Reference\n"),
+            "Safari- Docs-Reference"
+        );
+        assert_eq!(super::sanitize_filename(" \n "), "Recording");
     }
 }

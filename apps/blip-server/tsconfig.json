@@ -3,14 +3,19 @@
     "allowImportingTsExtensions": true,
     "exactOptionalPropertyTypes": true,
     "lib": ["ES2023", "DOM"],
-    "module": "NodeNext",
-    "moduleResolution": "NodeNext",
+    "jsx": "preserve",
+    "jsxImportSource": "solid-js",
+    "module": "Preserve",
+    "moduleResolution": "Bundler",
     "noEmit": true,
     "noUncheckedIndexedAccess": true,
     "skipLibCheck": true,
     "strict": true,
+    "paths": {
+      "@blip/server-runtime": ["./src/server.ts"]
+    },
     "target": "ESNext",
     "types": ["node"]
   },
-  "include": ["src/**/*.ts"]
+  "include": ["src/**/*.ts", "vite.config.ts"]
 }

@@ -1,19 +1,27 @@
 import * as Alchemy from "alchemy";
 import * as Cloudflare from "alchemy/Cloudflare";
+import * as Drizzle from "alchemy/Drizzle";
 import * as Config from "effect/Config";
 import * as Effect from "effect/Effect";
-import { Database } from "./src/database.ts";
+import * as Layer from "effect/Layer";
 
 export default Alchemy.Stack(
 	"BlipServer",
 	{
-		providers: Cloudflare.providers(),
+		providers: Layer.mergeAll(Cloudflare.providers(), Drizzle.providers()),
 		state: Cloudflare.state(),
 	},
 	Effect.gen(function* () {
-		const database = yield* Database;
-		const isDev = (yield* Alchemy.ALCHEMY_DEV) || process.env.NODE_ENV === "development" || process.argv.includes("dev");
-		const publicOrigin = isDev
+		const schema = yield* Drizzle.Schema("Schema", {
+			schema: "../../packages/blip-server-app/src/schema.ts",
+			out: "../../packages/blip-server-app/migrations",
+			dialect: "sqlite",
+		});
+		const database = yield* Cloudflare.D1.Database("Database", {
+			migrationsDir: schema.out,
+		});
+
+		const publicOrigin = (yield* Alchemy.ALCHEMY_DEV)
 			? "http://localhost:1337"
 			: yield* Config.nonEmptyString("BLIP_PUBLIC_ORIGIN");
 		const worker = yield* Cloudflare.Website.Vite("Worker", {

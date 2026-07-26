@@ -1,6 +1,8 @@
 packages:
   - apps/blip-server-cloudflare
-  - packages/blip-server-core
+  - apps/blip-server
+  - packages/blip-server-app
+  - packages/blip-server-domain
 allowBuilds:
   esbuild: true
   msgpackr-extract: true

@@ -31,6 +31,8 @@
     <string>1</string>
     <key>LSApplicationCategoryType</key>
     <string>public.app-category.video</string>
+    <key>LSUIElement</key>
+    <true/>
     <key>NSHighResolutionCapable</key>
     <true/>
     <key>NSScreenCaptureUsageDescription</key>

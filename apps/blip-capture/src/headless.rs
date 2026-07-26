@@ -6,7 +6,7 @@ use clap::ValueEnum;
 
 use crate::profiles::{CompletionAction, RecordingFormat, RecordingProfile, RecordingTarget};
 use crate::recording::{CaptureSpec, RecordingEvent};
-use crate::{CAPTURE_TIMEOUT, CaptureArgs, output_destination};
+use crate::{CAPTURE_TIMEOUT, CaptureArgs, display_name, output_destination};
 
 #[derive(Clone, Copy, Debug, Default, ValueEnum)]
 pub(crate) enum HeadlessFormat {
@@ -59,7 +59,9 @@ pub(crate) fn run(args: &CaptureArgs) -> Result<String, String> {
             .main_display()
             .ok_or_else(|| "the main display is not available".to_owned())?,
     };
-    let output = output_destination(&profile)?;
+    let target_name =
+        display_name(display.id()).unwrap_or_else(|| format!("Display {}", display.id()));
+    let output = output_destination(&profile, &target_name)?;
     eprintln!(
         "blip-capture: recording display {} for {} seconds to {}",
         display.id(),
@@ -96,6 +98,7 @@ pub(crate) fn run(args: &CaptureArgs) -> Result<String, String> {
                 }
             }
             RecordingEvent::Started => {}
+            RecordingEvent::Uploading => {}
             RecordingEvent::Finished {
                 viewer_url: Some(viewer_url),
                 ..

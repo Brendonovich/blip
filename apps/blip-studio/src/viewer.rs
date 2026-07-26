@@ -4114,4 +4114,117 @@ mod tests {
         assert!(!should_finish_pending_capture(Some(4), 4, false));
         assert!(!should_finish_pending_capture(None, 4, true));
     }
+
+    #[test]
+    fn generates_image_with_only_a_color_source() {
+        use gpui::HeadlessAppContext;
+        use gpui_platform::{current_headless_renderer, current_platform};
+
+        let mut cx = HeadlessAppContext::with_platform(
+            current_platform(true).text_system(),
+            Arc::new(StudioAssets),
+            || current_headless_renderer(),
+        );
+
+        let window = cx
+            .open_window(size(px(1280.0), px(800.0)), |_, cx| {
+                let (event_sender, _) = async_channel::unbounded();
+                let (stream_error_sender, _) = async_channel::unbounded();
+                let frame_hub = Arc::new(FrameHub {
+                    frames: Mutex::new(HashMap::new()),
+                    camera_statuses: Mutex::new(HashMap::new()),
+                    removed_sources: Mutex::new(Vec::new()),
+                    render_pending: AtomicBool::new(false),
+                    sender: event_sender,
+                });
+                let source = SourceId::Color(1);
+                let colors = Rc::new(RefCell::new(HashMap::from([(
+                    source,
+                    ColorSource {
+                        color: [88, 101, 242],
+                    },
+                )])));
+                let mut initial_scene = Scene::new();
+                let selected_item = initial_scene.add(source, full_canvas_layout());
+                let scene = Rc::new(RefCell::new(initial_scene));
+
+                let viewer = cx.new(|cx| {
+                    let transform_inputs = TransformInputs::new(cx);
+                    let stream_url =
+                        cx.new(|cx| NumericInput::new_text("Stream key (RTMP URL)", cx));
+                    FrameViewer {
+                        image: None,
+                        content_dimensions: None,
+                        scene: Rc::clone(&scene),
+                        rendered_elements: Vec::new(),
+                        selected_item: Some(selected_item),
+                        drag_operation: None,
+                        snap_guides: SnapGuides::default(),
+                        hovered_handle: None,
+                        corner_handle_hovered: false,
+                        transform_inputs,
+                        focused_transform_inputs: HashSet::new(),
+                        open_menu: None,
+                        source_menu_visible: false,
+                        source_menu_transition: 0,
+                        scene_dragging_item: None,
+                        scene_drag_grab_offset: None,
+                        scene_item_offsets: HashMap::new(),
+                        scene_reorder_transition: 0,
+                        scene_item_animation_started: None,
+                        scene_list_bounds: Rc::new(Cell::new(None)),
+                        scene_row_bounds: Rc::new(RefCell::new(HashMap::new())),
+                        targets: Vec::new(),
+                        options: CaptureOptions {
+                            fps: 60,
+                            cursor: false,
+                        },
+                        captures: Rc::new(RefCell::new(HashMap::new())),
+                        pending_captures: HashMap::new(),
+                        failed_captures: HashSet::new(),
+                        next_capture_generation: 1,
+                        colors: Rc::clone(&colors),
+                        next_color_source_id: 2,
+                        frame_hub,
+                        stream: None,
+                        stream_url,
+                        stream_url_focused: false,
+                        stream_fps: 60,
+                        stream_bitrate: 6000,
+                        stream_canvas: Rc::new(Cell::new(None)),
+                        stream_generation: 0,
+                        stream_error_sender,
+                        control_error: None,
+                    }
+                });
+
+                let mut compositor = FrameCompositor::new().expect("compositor");
+                let (image, dimensions, elements) = compose_scene(
+                    &mut compositor,
+                    &scene.borrow().elements,
+                    &HashMap::new(),
+                    &colors.borrow(),
+                    Some((1920, 1080)),
+                )
+                .expect("compose_scene");
+
+                viewer.update(cx, |viewer, cx| {
+                    viewer.show_frame(image, dimensions, elements, cx);
+                });
+
+                viewer
+            })
+            .expect("open_offscreen_window");
+
+        cx.run_until_parked();
+        let image = cx
+            .capture_screenshot(window.into())
+            .expect("capture_screenshot");
+        image
+            .save("blip-studio-color-source.png")
+            .expect("save image");
+        image
+            .save("/tmp/blip-studio-color-source.png")
+            .expect("save image to /tmp");
+    }
 }

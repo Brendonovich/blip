@@ -64,9 +64,13 @@ define_class!(
 );
 
 impl SegmentDelegate {
-    fn new(output: PathBuf, segment_duration: Duration) -> Retained<Self> {
+    fn new(
+        output: PathBuf,
+        segment_duration: Duration,
+        asset_callback: Option<Box<dyn Fn(PathBuf) + Send>>,
+    ) -> Retained<Self> {
         let this = Self::alloc().set_ivars(SegmentDelegateIvars {
-            sink: Mutex::new(PlaylistSink::new(output, segment_duration)),
+            sink: Mutex::new(PlaylistSink::new(output, segment_duration, asset_callback)),
         });
         // SAFETY: `this` is allocated with fully initialized ivars and NSObject permits `init`.
         unsafe { msg_send![super(this), init] }
@@ -102,17 +106,23 @@ struct PlaylistSink {
     output: PathBuf,
     configured_segment_duration: Duration,
     segment_durations: Vec<Duration>,
+    asset_callback: Option<Box<dyn Fn(PathBuf) + Send>>,
     initialized: bool,
     finished: bool,
     error: Option<String>,
 }
 
 impl PlaylistSink {
-    fn new(output: PathBuf, segment_duration: Duration) -> Self {
+    fn new(
+        output: PathBuf,
+        segment_duration: Duration,
+        asset_callback: Option<Box<dyn Fn(PathBuf) + Send>>,
+    ) -> Self {
         Self {
             output,
             configured_segment_duration: segment_duration,
             segment_durations: Vec::new(),
+            asset_callback,
             initialized: false,
             finished: false,
             error: None,
@@ -125,16 +135,26 @@ impl PlaylistSink {
         report: Option<&AVAssetSegmentReport>,
         data: &[u8],
     ) -> Result<(), std::io::Error> {
-        if segment_type == AVAssetSegmentType::Initialization {
-            fs::write(self.output.join(INITIALIZATION_SEGMENT_NAME), data)?;
+        let asset = if segment_type == AVAssetSegmentType::Initialization {
+            let asset = self.output.join(INITIALIZATION_SEGMENT_NAME);
+            fs::write(&asset, data)?;
             self.initialized = true;
+            Some(asset)
         } else if segment_type == AVAssetSegmentType::Separable {
             let index = self.segment_durations.len();
-            fs::write(self.output.join(segment_name(index)), data)?;
+            let asset = self.output.join(segment_name(index));
+            fs::write(&asset, data)?;
             self.segment_durations
                 .push(report_duration(report).unwrap_or(self.configured_segment_duration));
+            Some(asset)
+        } else {
+            None
+        };
+        self.write_playlist()?;
+        if let (Some(callback), Some(asset)) = (&self.asset_callback, asset) {
+            callback(asset);
         }
-        self.write_playlist()
+        Ok(())
     }
 
     fn write_playlist(&self) -> Result<(), std::io::Error> {
@@ -181,6 +201,24 @@ impl HlsWriter {
         height: usize,
         fps: u32,
         segment_duration: Duration,
+    ) -> Result<Self, WriterError> {
+        Self::new_with_asset_callback(output, width, height, fps, segment_duration, |_| {})
+    }
+
+    /// Creates an HLS writer that reports each initialization or media asset
+    /// after it has been fully written to disk.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the dimensions, frame rate, or segment duration
+    /// are invalid, or `AVFoundation` rejects the HLS writer configuration.
+    pub fn new_with_asset_callback(
+        output: &Path,
+        width: usize,
+        height: usize,
+        fps: u32,
+        segment_duration: Duration,
+        asset_callback: impl Fn(PathBuf) + Send + 'static,
     ) -> Result<Self, WriterError> {
         if width == 0 || height == 0 {
             return Err(WriterError::InvalidDimensions);
@@ -249,7 +287,11 @@ impl HlsWriter {
                 None,
             )
         };
-        let delegate = SegmentDelegate::new(output.to_owned(), segment_duration);
+        let delegate = SegmentDelegate::new(
+            output.to_owned(),
+            segment_duration,
+            Some(Box::new(asset_callback)),
+        );
         // SAFETY: The retained delegate implements AVAssetWriterDelegate and outlives the writer.
         unsafe {
             writer.setDelegate(Some(ProtocolObject::from_ref(&*delegate)));

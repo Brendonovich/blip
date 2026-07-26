@@ -1,7 +1,8 @@
 {
   "files": [],
   "references": [
-    { "path": "./packages/blip-server-core" },
+    { "path": "./packages/blip-server-domain" },
+    { "path": "./packages/blip-server-app" },
     { "path": "./apps/blip-server" },
     { "path": "./apps/blip-server-cloudflare" }
   ]

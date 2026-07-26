@@ -1,12 +1,14 @@
 import { D1Client } from "@effect/sql-d1"
+import * as Drizzle from "drizzle-orm/effect-d1"
 import {
   objectStorageLayer,
   provideServerServices,
-  repositoryLayer,
   serverLayer,
   vaultLayer
-} from "@blip/server-core"
+} from "@blip/server-app/Server"
+import { repositoryLayer } from "@blip/server-app/Repository"
 import type { APIHandler } from "@solidjs/start/server"
+import { setInMemoryAuthHandler, setInMemoryHttpClient } from "@blip/server-app/in-memory-api"
 import * as Effect from "effect/Effect"
 import * as FileSystem from "effect/FileSystem"
 import * as Layer from "effect/Layer"
@@ -19,7 +21,6 @@ import * as HttpRouter from "effect/unstable/http/HttpRouter"
 import * as HttpServerRequest from "effect/unstable/http/HttpServerRequest"
 import { authLayer, makeAuth } from "./auth.ts"
 import { env } from "./env.ts"
-import { setInMemoryAuthHandler, setInMemoryHttpClient } from "./in-memory-api.ts"
 
 const HttpPlatformStub = Layer.succeed(HttpPlatform.HttpPlatform, {
   fileResponse: () => Effect.die("HttpPlatform.fileResponse is not supported"),
@@ -37,7 +38,7 @@ const getApiHandler = () => {
     githubClientSecret: env.GITHUB_CLIENT_SECRET
   }
   const SqlLive = D1Client.layer({ db: env.DB })
-  const RepositoryLive = repositoryLayer.pipe(Layer.provide(SqlLive))
+  const RepositoryLive = repositoryLayer(Drizzle.makeWithDefaults({})).pipe(Layer.provide(SqlLive))
   const ServicesLive = Layer.mergeAll(
     RepositoryLive,
     objectStorageLayer,

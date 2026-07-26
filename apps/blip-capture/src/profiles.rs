@@ -82,11 +82,8 @@ impl RecordingProfile {
     }
 
     pub(crate) fn new_local(folder: PathBuf) -> Self {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_or(0, |duration| duration.as_nanos());
         Self::local(
-            format!("profile-{nanos}"),
+            new_profile_id(),
             "New profile",
             folder,
             CompletionAction::Reveal,
@@ -94,16 +91,20 @@ impl RecordingProfile {
     }
 
     fn new_remote(name: String, server_url: String) -> Self {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_or(0, |duration| duration.as_nanos());
         Self {
-            id: format!("profile-{nanos}"),
+            id: new_profile_id(),
             name,
             target: RecordingTarget::Remote { server_url },
             format: RecordingFormat::Mp4,
             completion_action: CompletionAction::None,
         }
+    }
+
+    pub(crate) fn duplicate(&self) -> Self {
+        let mut duplicate = self.clone();
+        duplicate.id = new_profile_id();
+        duplicate.name = format!("{} copy", self.name);
+        duplicate
     }
 
     pub(crate) fn validate(&self) -> Result<(), String> {
@@ -140,6 +141,13 @@ impl RecordingProfile {
             }
         }
     }
+}
+
+fn new_profile_id() -> String {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_nanos());
+    format!("profile-{nanos}")
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -292,6 +300,18 @@ mod tests {
         };
         profile.format = super::RecordingFormat::Hls;
         assert!(profile.validate().is_ok());
+    }
+
+    #[test]
+    fn duplicates_profile_settings_with_a_new_identity() {
+        let profile = RecordingProfiles::default().profiles.remove(0);
+        let duplicate = profile.duplicate();
+
+        assert_ne!(duplicate.id, profile.id);
+        assert_eq!(duplicate.name, "Desktop copy");
+        assert_eq!(duplicate.target, profile.target);
+        assert_eq!(duplicate.format, profile.format);
+        assert_eq!(duplicate.completion_action, profile.completion_action);
     }
 
     #[test]

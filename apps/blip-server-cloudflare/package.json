@@ -7,11 +7,12 @@
     "dev": "alchemy dev",
     "destroy": "alchemy destroy",
     "build": "vite build",
+    "db:generate": "pnpm --filter @blip/server-app db:generate",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
     "@better-auth/api-key": "1.6.25",
-    "@blip/server-core": "workspace:*",
+    "@blip/server-app": "workspace:*",
     "@effect/platform-node": "4.0.0-beta.101",
     "@effect/sql-d1": "4.0.0-beta.101",
     "@effect/sql-pg": "4.0.0-beta.101",
@@ -20,6 +21,7 @@
     "@tanstack/solid-query": "^5.101.4",
     "alchemy": "2.0.0-beta.64",
     "better-auth": "1.6.25",
+    "drizzle-orm": "1.0.0-rc.4",
     "effect": "4.0.0-beta.101",
     "solid-js": "^1.9.14"
   },
@@ -27,6 +29,7 @@
     "@cloudflare/workers-types": "5.20260724.1",
     "@distilled.cloud/cloudflare-rolldown-plugin": "0.13.8",
     "@types/node": "24.1.0",
+    "drizzle-kit": "1.0.0-rc.4",
     "lightningcss-darwin-arm64": "^1.33.0",
     "typescript": "5.9.2",
     "vite": "^8.1.5"

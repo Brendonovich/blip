@@ -1,6 +1,9 @@
 import { apiKey } from "@better-auth/api-key"
-import { Auth } from "@blip/server-core"
+import { user, users } from "@blip/server-app/schema"
+import { Auth } from "@blip/server-app/Server"
 import { betterAuth } from "better-auth"
+import { eq } from "drizzle-orm"
+import { drizzle } from "drizzle-orm/d1"
 import * as Effect from "effect/Effect"
 import * as Layer from "effect/Layer"
 
@@ -36,23 +39,22 @@ export const authLayer = (
   database: D1Database,
   config: Omit<AuthConfig, "secret">,
   secret: string
-) => Layer.succeed(Auth)({
+) => Layer.succeed(Auth.Service)({
   verifyApiKey: (key) => Effect.gen(function*() {
     const auth = makeAuth(database, { ...config, secret })
+    const db = drizzle(database)
     return yield* Effect.promise(async () => {
     try {
       const result = await auth.api.verifyApiKey({ body: { key } })
       if (result.valid && result.key) {
-        const user = await database.prepare("SELECT name FROM user WHERE id = ? LIMIT 1")
-          .bind(result.key.referenceId)
-          .first<{ name: string }>()
-        if (user) return { id: result.key.referenceId, name: user.name }
+        const userRecord = await db.select({ name: user.name }).from(user)
+          .where(eq(user.id, result.key.referenceId)).get()
+        if (userRecord) return { id: result.key.referenceId, name: userRecord.name }
       }
       const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(key))
       const hash = Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("")
-      const legacyUser = await database.prepare("SELECT id, name FROM users WHERE api_key_hash = ? LIMIT 1")
-        .bind(hash)
-        .first<{ id: string; name: string }>()
+      const legacyUser = await db.select({ id: users.id, name: users.name }).from(users)
+        .where(eq(users.apiKeyHash, hash)).get()
       if (legacyUser) return legacyUser
     } catch {}
     })

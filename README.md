@@ -14,7 +14,8 @@ and save the result to a folder or the clipboard. See
 The optional private recording backend. It uses Effect v4 with per-user
 S3-compatible storage. Deploy the [Node/SQLite app](apps/blip-server) or the
 [Alchemy Cloudflare/D1 app](apps/blip-server-cloudflare); both share
-[`packages/blip-server-core`](packages/blip-server-core).
+[`packages/blip-server-app`](packages/blip-server-app), with contracts in
+[`packages/blip-server-domain`](packages/blip-server-domain).
 
 ## Blip Studio
 
