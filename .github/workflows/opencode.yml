@@ -28,7 +28,6 @@ jobs:
         uses: anomalyco/opencode/github@2c14fc5586fe0b88e5c04732d2e846769cc35671 # latest
         env:
           GITHUB_TOKEN: ${{ github.token }}
-          OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
         with:
-          model: opencode/gpt-5.6-sol
+          model: opencode/big-pickle
           use_github_token: true
