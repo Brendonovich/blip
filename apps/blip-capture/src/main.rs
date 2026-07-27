@@ -78,6 +78,7 @@ actions!(
     [
         CloseWindow,
         CloseAllWindows,
+        TogglePlayback,
         ToggleCutMode,
         DeleteSelected,
         CloseExportDialog
@@ -3134,6 +3135,7 @@ fn run_app(open_path: Option<PathBuf>) {
         cx.bind_keys([
             KeyBinding::new("cmd-w", CloseWindow, None),
             KeyBinding::new("cmd-q", CloseAllWindows, None),
+            KeyBinding::new("space", TogglePlayback, Some("BundleEditor")),
             KeyBinding::new("c", ToggleCutMode, Some("BundleEditor")),
             KeyBinding::new("delete", DeleteSelected, Some("BundleEditor")),
             KeyBinding::new("backspace", DeleteSelected, Some("BundleEditor")),

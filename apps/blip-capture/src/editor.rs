@@ -10,7 +10,7 @@
 use std::cell::Cell;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use core_foundation::{
     base::{CFType, TCFType},
@@ -35,6 +35,7 @@ const ACCENT: u32 = 0x00ff_4f58;
 const SIDEBAR_WIDTH: Pixels = px(280.0);
 const PREVIEW_LOADING_DURATION: Duration = Duration::from_millis(1_400);
 const PREVIEW_FADE_DURATION: Duration = Duration::from_millis(240);
+const PLAYBACK_TICK_INTERVAL: Duration = Duration::from_millis(16);
 const BUNDLED_BACKGROUNDS: [(&str, &[u8], &[u8]); 15] = [
     (
         "tahoe-dusk.jpg",
@@ -257,6 +258,9 @@ pub(crate) struct BundleEditor {
     timeline_view_start_secs: f64,
     timeline_view_duration_secs: f64,
     current_time_secs: f64,
+    is_playing: bool,
+    playback_started_at: Option<(Instant, f64)>,
+    playback_generation: u64,
     cursor_time_secs: Option<f64>,
     zoom_hover_range: Option<(f64, f64)>,
     current_frame: Option<core_video::pixel_buffer::CVPixelBuffer>,
@@ -439,6 +443,9 @@ impl BundleEditor {
                         timeline_view_start_secs: 0.0,
                         timeline_view_duration_secs: timeline_duration,
                         current_time_secs: 0.0,
+                        is_playing: false,
+                        playback_started_at: None,
+                        playback_generation: 0,
                         cursor_time_secs: None,
                         zoom_hover_range: None,
                         current_frame: None,
@@ -1099,8 +1106,72 @@ impl BundleEditor {
     }
 
     fn set_playback_time(&mut self, time_secs: f64) {
+        self.stop_playback();
         self.current_time_secs = time_secs.clamp(0.0, self.duration_secs);
         self.request_preview();
+    }
+
+    fn stop_playback(&mut self) {
+        self.is_playing = false;
+        self.playback_started_at = None;
+        self.playback_generation = self.playback_generation.wrapping_add(1);
+    }
+
+    fn toggle_playback(&mut self, cx: &mut Context<Self>) {
+        if self.is_playing {
+            self.stop_playback();
+            cx.notify();
+            return;
+        }
+        if self.duration_secs <= 0.0 {
+            return;
+        }
+
+        if let Some(cursor_time_secs) = self.cursor_time_secs {
+            self.current_time_secs = cursor_time_secs.clamp(0.0, self.duration_secs);
+        } else if self.current_time_secs >= self.duration_secs {
+            self.current_time_secs = 0.0;
+        }
+        self.cursor_time_secs = None;
+        self.zoom_hover_range = None;
+        self.is_playing = true;
+        self.playback_generation = self.playback_generation.wrapping_add(1);
+        let generation = self.playback_generation;
+        self.playback_started_at = Some((Instant::now(), self.current_time_secs));
+        self.request_preview();
+        cx.notify();
+
+        cx.spawn(async move |editor, cx| {
+            loop {
+                cx.background_executor().timer(PLAYBACK_TICK_INTERVAL).await;
+                let keep_playing = editor
+                    .update(cx, |editor, cx| {
+                        if !editor.is_playing || editor.playback_generation != generation {
+                            return false;
+                        }
+                        let Some((started_at, start_time_secs)) = editor.playback_started_at else {
+                            return false;
+                        };
+                        let (time_secs, finished) = playback_position(
+                            start_time_secs,
+                            started_at.elapsed().as_secs_f64(),
+                            editor.duration_secs,
+                        );
+                        editor.current_time_secs = time_secs;
+                        editor.request_preview();
+                        if finished {
+                            editor.stop_playback();
+                        }
+                        cx.notify();
+                        !finished
+                    })
+                    .unwrap_or(false);
+                if !keep_playing {
+                    break;
+                }
+            }
+        })
+        .detach();
     }
 
     fn timeline_time_at(&self, x: Pixels) -> Option<f64> {
@@ -1170,6 +1241,9 @@ impl BundleEditor {
     }
 
     fn update_timeline_hover(&mut self, position: gpui::Point<Pixels>, cx: &mut Context<Self>) {
+        if self.is_playing {
+            return;
+        }
         let timeline = self.timeline_bounds.get();
         let rows = self.timeline_rows_bounds.get();
         let hovering = self.zoom_segment_drag.is_none()
@@ -2797,7 +2871,7 @@ impl BundleEditor {
                     .child(
                         div()
                             .absolute()
-                            .top_0()
+                            .top(px(-8.0))
                             .bottom_0()
                             .left(relative(playback_fraction))
                             .w(px(2.0))
@@ -2805,7 +2879,7 @@ impl BundleEditor {
                             .child(
                                 div()
                                     .absolute()
-                                    .top(px(-10.0))
+                                    .top(px(-5.0))
                                     .left(px(-4.0))
                                     .size(px(10.0))
                                     .rounded_full()
@@ -2825,7 +2899,7 @@ impl BundleEditor {
                     .child(
                         div()
                             .absolute()
-                            .top_0()
+                            .top(px(-8.0))
                             .bottom_0()
                             .left(relative(fraction))
                             .w(px(2.0))
@@ -2834,7 +2908,7 @@ impl BundleEditor {
                             .child(
                                 div()
                                     .absolute()
-                                    .top(px(-10.0))
+                                    .top(px(-5.0))
                                     .left(px(-4.0))
                                     .size(px(10.0))
                                     .rounded_full()
@@ -2895,6 +2969,7 @@ impl BundleEditor {
                     .flex()
                     .items_center()
                     .gap_3()
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                     .child(
                         div()
                             .w(px(80.0))
@@ -2903,34 +2978,60 @@ impl BundleEditor {
                             .child("TIMELINE"),
                     )
                     .child(
-                        div().flex_1().flex().items_center().text_xs().child(
-                            div()
-                                .id("cut-mode")
-                                .px_2()
-                                .py_1()
-                                .rounded_sm()
-                                .bg(rgb(if self.cut_mode {
-                                    theme::CONTROL_ACTIVE
-                                } else {
-                                    theme::CONTROL_BACKGROUND
-                                }))
-                                .border_1()
-                                .border_color(rgb(if self.cut_mode {
-                                    theme::SELECTION
-                                } else {
-                                    theme::BORDER_SUBTLE
-                                }))
-                                .cursor_pointer()
-                                .text_color(rgb(if self.cut_mode {
-                                    theme::TEXT
-                                } else {
-                                    theme::TEXT_MUTED
-                                }))
-                                .on_click(cx.listener(|editor, _, _, cx| {
-                                    editor.toggle_cut_mode(cx);
-                                }))
-                                .child("Cut (C)"),
-                        ),
+                        div()
+                            .flex_1()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .text_xs()
+                            .child(
+                                div()
+                                    .id("toggle-playback")
+                                    .px_2()
+                                    .py_1()
+                                    .rounded_sm()
+                                    .bg(rgb(theme::CONTROL_BACKGROUND))
+                                    .border_1()
+                                    .border_color(rgb(theme::BORDER_SUBTLE))
+                                    .cursor_pointer()
+                                    .text_color(rgb(theme::TEXT))
+                                    .on_click(cx.listener(|editor, _, _, cx| {
+                                        editor.toggle_playback(cx);
+                                    }))
+                                    .child(if self.is_playing {
+                                        "Pause (Space)"
+                                    } else {
+                                        "Play (Space)"
+                                    }),
+                            )
+                            .child(
+                                div()
+                                    .id("cut-mode")
+                                    .px_2()
+                                    .py_1()
+                                    .rounded_sm()
+                                    .bg(rgb(if self.cut_mode {
+                                        theme::CONTROL_ACTIVE
+                                    } else {
+                                        theme::CONTROL_BACKGROUND
+                                    }))
+                                    .border_1()
+                                    .border_color(rgb(if self.cut_mode {
+                                        theme::SELECTION
+                                    } else {
+                                        theme::BORDER_SUBTLE
+                                    }))
+                                    .cursor_pointer()
+                                    .text_color(rgb(if self.cut_mode {
+                                        theme::TEXT
+                                    } else {
+                                        theme::TEXT_MUTED
+                                    }))
+                                    .on_click(cx.listener(|editor, _, _, cx| {
+                                        editor.toggle_cut_mode(cx);
+                                    }))
+                                    .child("Cut (C)"),
+                            ),
                     )
                     .child(
                         div()
@@ -2959,6 +3060,9 @@ impl Render for BundleEditor {
             })
             .on_action(cx.listener(|editor, _: &crate::ToggleCutMode, _, cx| {
                 editor.toggle_cut_mode(cx);
+            }))
+            .on_action(cx.listener(|editor, _: &crate::TogglePlayback, _, cx| {
+                editor.toggle_playback(cx);
             }))
             .on_action(cx.listener(|editor, _: &crate::DeleteSelected, _, cx| {
                 editor.delete_selected(cx);
@@ -3863,6 +3967,11 @@ fn media_name(path: &std::path::Path) -> SharedString {
         .into()
 }
 
+fn playback_position(start_secs: f64, elapsed_secs: f64, duration_secs: f64) -> (f64, bool) {
+    let time_secs = (start_secs + elapsed_secs).clamp(0.0, duration_secs);
+    (time_secs, time_secs >= duration_secs)
+}
+
 fn timeline_time_fraction(
     time_secs: f64,
     view_start_secs: f64,
@@ -4167,12 +4276,22 @@ mod tests {
 
     use super::{
         VideoSegmentEdge, cubic_bezier_ease, cut_gap_label, edit_video_cut,
-        map_output_transform_to_item, panned_timeline_view, resize_video_segment_range,
-        ripple_delete_ranges, ripple_insert_ranges, source_time_at, timeline_range_fraction,
-        timeline_ruler_interval, timeline_ruler_label, timeline_segment_range_fraction,
-        timeline_time_fraction, video_cut_gap_secs, zoom_segment_range_at, zoom_transform_at,
-        zoomed_timeline_view,
+        map_output_transform_to_item, panned_timeline_view, playback_position,
+        resize_video_segment_range, ripple_delete_ranges, ripple_insert_ranges, source_time_at,
+        timeline_range_fraction, timeline_ruler_interval, timeline_ruler_label,
+        timeline_segment_range_fraction, timeline_time_fraction, video_cut_gap_secs,
+        zoom_segment_range_at, zoom_transform_at, zoomed_timeline_view,
     };
+
+    #[test]
+    fn playback_position_uses_elapsed_wall_clock_time() {
+        assert_eq!(playback_position(2.0, 1.5, 10.0), (3.5, false));
+    }
+
+    #[test]
+    fn playback_position_stops_at_the_timeline_end() {
+        assert_eq!(playback_position(9.0, 2.0, 10.0), (10.0, true));
+    }
 
     #[test]
     fn timeline_zoom_keeps_the_focal_time_in_place() {
