@@ -70,6 +70,55 @@ pub struct ItemTransform {
     pub center: [f32; 2],
     pub size: [f32; 2],
     pub corner_radius: f32,
+    pub squircle: bool,
+    pub box_shadow: Option<BoxShadow>,
+}
+
+/// A drop shadow matching the offset, color, blur, and spread of CSS `box-shadow`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct BoxShadow {
+    pub offset: [f32; 2],
+    pub color: [f32; 4],
+    pub blur_radius: f32,
+    pub spread_radius: f32,
+}
+
+impl BoxShadow {
+    #[must_use]
+    pub const fn new(offset: [f32; 2], color: [f32; 4]) -> Self {
+        Self {
+            offset,
+            color,
+            blur_radius: 0.0,
+            spread_radius: 0.0,
+        }
+    }
+
+    #[must_use]
+    pub const fn with_blur_radius(mut self, blur_radius: f32) -> Self {
+        self.blur_radius = blur_radius;
+        self
+    }
+
+    #[must_use]
+    pub const fn with_spread_radius(mut self, spread_radius: f32) -> Self {
+        self.spread_radius = spread_radius;
+        self
+    }
+}
+
+/// A scale applied to the fully composed output around a normalized focal point.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct OutputTransform {
+    pub center: [f32; 2],
+    pub scale: f32,
+}
+
+impl OutputTransform {
+    pub const IDENTITY: Self = Self {
+        center: [0.5, 0.5],
+        scale: 1.0,
+    };
 }
 
 impl ItemTransform {
@@ -79,12 +128,26 @@ impl ItemTransform {
             center,
             size,
             corner_radius: 0.0,
+            squircle: false,
+            box_shadow: None,
         }
     }
 
     #[must_use]
     pub const fn with_corner_radius(mut self, corner_radius: f32) -> Self {
         self.corner_radius = corner_radius;
+        self
+    }
+
+    #[must_use]
+    pub const fn with_squircle(mut self, squircle: bool) -> Self {
+        self.squircle = squircle;
+        self
+    }
+
+    #[must_use]
+    pub const fn with_box_shadow(mut self, box_shadow: BoxShadow) -> Self {
+        self.box_shadow = Some(box_shadow);
         self
     }
 
@@ -121,6 +184,8 @@ pub struct CompositorItem {
 pub enum CompositorItemContent {
     Source(usize),
     Color([f32; 4]),
+    Gradient { start: [f32; 4], end: [f32; 4] },
+    Checkerboard { first: [f32; 4], second: [f32; 4] },
 }
 
 struct SourceTextures {
@@ -316,17 +381,27 @@ impl FrameCompositor {
                     (content_rect, [0.0; 4], content_kind)
                 }
                 CompositorItemContent::Color(color) => ([0.0, 0.0, 1.0, 1.0], color, 1.0),
+                CompositorItemContent::Gradient { start, end } => (end, start, 6.0),
+                CompositorItemContent::Checkerboard { first, second } => (second, first, 7.0),
             };
+            let corner_radius = item.transform.clamped_corner_radius(canvas_size)
+                * if item.transform.squircle { -1.0 } else { 1.0 };
+            let box_shadow = item
+                .transform
+                .box_shadow
+                .unwrap_or_else(|| BoxShadow::new([0.0; 2], [0.0; 4]));
             let settings = shader::CompositorSettings::new(
                 content_rect,
                 transform_data(item.transform),
-                [
-                    canvas_size[0],
-                    canvas_size[1],
-                    item.transform.clamped_corner_radius(canvas_size),
-                    content_kind,
-                ],
+                [canvas_size[0], canvas_size[1], corner_radius, content_kind],
                 color,
+                [
+                    box_shadow.offset[0],
+                    box_shadow.offset[1],
+                    box_shadow.blur_radius.max(0.0),
+                    box_shadow.spread_radius,
+                ],
+                box_shadow.color,
             );
             settings_buffers.push(self.device.create_buffer_init(
                 &wgpu::util::BufferInitDescriptor {
@@ -348,7 +423,9 @@ impl FrameCompositor {
                             })?;
                         (frame, chroma.as_ref().unwrap_or(&dummy_view))
                     }
-                    CompositorItemContent::Color(_) => (&dummy_view, &dummy_view),
+                    CompositorItemContent::Color(_)
+                    | CompositorItemContent::Gradient { .. }
+                    | CompositorItemContent::Checkerboard { .. } => (&dummy_view, &dummy_view),
                 };
                 Ok(shader::WgpuBindGroup0::from_bindings(
                     &self.device,
@@ -375,6 +452,52 @@ impl FrameCompositor {
             })
             .context("failed while waiting for frame composition")?;
         Ok(output)
+    }
+
+    /// Renders all items as one layer, then transforms that combined output around `center`.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Self::render`].
+    pub fn render_with_output_transform(
+        &mut self,
+        sources: &[CompositorSource<'_>],
+        items: &[CompositorItem],
+        output_dimensions: (usize, usize),
+        transform: OutputTransform,
+    ) -> Result<CVPixelBuffer> {
+        let combined = self.render(sources, items, output_dimensions)?;
+        let scale = if transform.scale.is_finite() {
+            transform.scale.max(1.0)
+        } else {
+            1.0
+        };
+        let focus = transform.center.map(|value| {
+            if value.is_finite() {
+                value.clamp(0.0, 1.0)
+            } else {
+                0.5
+            }
+        });
+        if scale == 1.0 {
+            return Ok(combined);
+        }
+
+        let output_transform = transformed_output_item(OutputTransform {
+            center: focus,
+            scale,
+        });
+        self.render(
+            &[CompositorSource {
+                pixel_buffer: &combined,
+                content_rect: None,
+            }],
+            &[CompositorItem {
+                content: CompositorItemContent::Source(0),
+                transform: output_transform,
+            }],
+            output_dimensions,
+        )
     }
 
     fn render_frame(
@@ -547,6 +670,14 @@ impl FrameCompositor {
     }
 }
 
+fn transformed_output_item(transform: OutputTransform) -> ItemTransform {
+    let center = [
+        transform.center[0] + transform.scale * (0.5 - transform.center[0]),
+        transform.center[1] + transform.scale * (0.5 - transform.center[1]),
+    ];
+    ItemTransform::new(center, [transform.scale, transform.scale])
+}
+
 fn transform_data(transform: ItemTransform) -> [f32; 4] {
     [
         transform.center[0],
@@ -646,4 +777,34 @@ fn hal_texture(
             },
         )
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{OutputTransform, transformed_output_item};
+
+    #[test]
+    fn output_transform_keeps_focal_point_fixed() {
+        let focus = [0.25, 0.75];
+        let transform = transformed_output_item(OutputTransform {
+            center: focus,
+            scale: 3.0,
+        });
+        let top_left = [
+            transform.center[0] - transform.size[0] * 0.5,
+            transform.center[1] - transform.size[1] * 0.5,
+        ];
+        let transformed_focus = [
+            top_left[0] + focus[0] * transform.size[0],
+            top_left[1] + focus[1] * transform.size[1],
+        ];
+        assert_eq!(transformed_focus, focus);
+    }
+
+    #[test]
+    fn identity_output_transform_is_full_frame() {
+        let transform = transformed_output_item(OutputTransform::IDENTITY);
+        assert_eq!(transform.center, [0.5, 0.5]);
+        assert_eq!(transform.size, [1.0, 1.0]);
+    }
 }

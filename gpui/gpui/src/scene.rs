@@ -767,6 +767,7 @@ impl From<PolychromeSprite> for Primitive {
 #[allow(missing_docs)]
 pub struct PaintSurface {
     pub order: DrawOrder,
+    pub opacity: f32,
     pub bounds: Bounds<ScaledPixels>,
     pub content_mask: ContentMask<ScaledPixels>,
     #[cfg(target_os = "macos")]

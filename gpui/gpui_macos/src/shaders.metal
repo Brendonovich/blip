@@ -850,12 +850,14 @@ fragment float4 path_sprite_fragment(
 struct SurfaceVertexOutput {
   float4 position [[position]];
   float2 texture_position;
+  float opacity;
   float clip_distance [[clip_distance]][4];
 };
 
 struct SurfaceFragmentInput {
   float4 position [[position]];
   float2 texture_position;
+  float opacity;
 };
 
 vertex SurfaceVertexOutput surface_vertex(
@@ -878,6 +880,7 @@ vertex SurfaceVertexOutput surface_vertex(
   return SurfaceVertexOutput{
       device_position,
       texture_position,
+      surface.opacity,
       {clip_distance.x, clip_distance.y, clip_distance.z, clip_distance.w}};
 }
 
@@ -896,7 +899,7 @@ fragment float4 surface_fragment(SurfaceFragmentInput input [[stage_in]],
       y_texture.sample(texture_sampler, input.texture_position).r,
       cb_cr_texture.sample(texture_sampler, input.texture_position).rg, 1.0);
 
-  return ycbcrToRGBTransform * ycbcr;
+  return (ycbcrToRGBTransform * ycbcr) * input.opacity;
 }
 
 // Single-plane BGRA surfaces (e.g. IOSurfaces from offscreen renderers). The
@@ -906,7 +909,7 @@ fragment float4 surface_fragment_bgra(SurfaceFragmentInput input [[stage_in]],
                                       texture2d<float> bgra_texture
                                       [[texture(SurfaceInputIndex_YTexture)]]) {
   constexpr sampler texture_sampler(mag_filter::linear, min_filter::linear);
-  return bgra_texture.sample(texture_sampler, input.texture_position);
+  return bgra_texture.sample(texture_sampler, input.texture_position) * input.opacity;
 }
 
 float4 hsla_to_rgba(Hsla hsla) {

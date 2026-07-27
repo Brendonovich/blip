@@ -22,6 +22,47 @@ use objc2_core_video::kCVPixelFormatType_32BGRA;
 use objc2_foundation::{NSDictionary, NSNumber, NSString, NSURL};
 
 const TIMESCALE: i32 = 1_000_000;
+const FALLBACK_GOP_DURATION_SECS: f64 = 3.0;
+const GOP_INTERVALS_TO_SAMPLE: usize = 3;
+const MAX_GOP_SAMPLES_TO_SCAN: usize = 10_000;
+
+fn can_decode_sequentially(delta: f64, gop_duration: f64) -> bool {
+    delta >= -0.01 && delta <= gop_duration
+}
+
+fn estimate_gop_duration(track: &AVAssetTrack) -> Option<f64> {
+    if !unsafe { track.canProvideSampleCursors() } {
+        return None;
+    }
+
+    let cursor = unsafe { track.makeSampleCursorAtFirstSampleInDecodeOrder() }?;
+    let mut sync_timestamps = Vec::with_capacity(GOP_INTERVALS_TO_SAMPLE + 1);
+
+    for _ in 0..MAX_GOP_SAMPLES_TO_SCAN {
+        let sync_info = unsafe { cursor.currentSampleSyncInfo() };
+        if sync_info.sampleIsFullSync.as_bool() {
+            let timestamp = unsafe { cursor.presentationTimeStamp().seconds() };
+            if timestamp.is_finite() {
+                sync_timestamps.push(timestamp);
+                if sync_timestamps.len() > GOP_INTERVALS_TO_SAMPLE {
+                    break;
+                }
+            }
+        }
+
+        if unsafe { cursor.stepInDecodeOrderByCount(1) } != 1 {
+            break;
+        }
+    }
+
+    let mut intervals = sync_timestamps
+        .windows(2)
+        .map(|timestamps| timestamps[1] - timestamps[0])
+        .filter(|interval| interval.is_finite() && *interval > 0.0)
+        .collect::<Vec<_>>();
+    intervals.sort_by(f64::total_cmp);
+    intervals.get(intervals.len() / 2).copied()
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum DecoderError {
@@ -54,6 +95,7 @@ pub struct VideoDecoder {
     width: usize,
     height: usize,
     nominal_fps: f64,
+    gop_duration: f64,
     reader: Option<ActiveReader>,
     cache: std::collections::BTreeMap<i64, core_video::pixel_buffer::CVPixelBuffer>,
 }
@@ -85,6 +127,7 @@ impl VideoDecoder {
 
         let nominal_fps = unsafe { track.nominalFrameRate() } as f64;
         let nominal_fps = if nominal_fps > 0.0 { nominal_fps } else { 30.0 };
+        let gop_duration = estimate_gop_duration(&track).unwrap_or(FALLBACK_GOP_DURATION_SECS);
 
         Ok(Self {
             path,
@@ -94,6 +137,7 @@ impl VideoDecoder {
             width,
             height,
             nominal_fps,
+            gop_duration,
             reader: None,
             cache: std::collections::BTreeMap::new(),
         })
@@ -140,7 +184,7 @@ impl VideoDecoder {
         }
         if let Some(mut active) = self.reader.take() {
             let delta = time_secs - active.last_ts;
-            if delta >= -0.01 && delta <= 3.0 {
+            if can_decode_sequentially(delta, self.gop_duration) {
                 if delta <= tolerance {
                     let res = active.last_frame.clone();
                     self.reader = Some(active);
@@ -255,6 +299,12 @@ impl VideoDecoder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn large_advance_seeks_instead_of_decoding_sequentially() {
+        assert!(can_decode_sequentially(2.0, 2.0));
+        assert!(!can_decode_sequentially(2.01, 2.0));
+    }
 
     #[test]
     fn test_decoder_cache_backward_scrubbing() {

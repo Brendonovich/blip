@@ -1605,6 +1605,7 @@ impl MetalRenderer {
                     SurfaceBounds {
                         bounds: surface.bounds,
                         content_mask: surface.content_mask,
+                        opacity: surface.opacity,
                     },
                 );
             }
@@ -1807,11 +1808,12 @@ pub struct PathSprite {
     pub bounds: Bounds<ScaledPixels>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 #[repr(C)]
 pub struct SurfaceBounds {
     pub bounds: Bounds<ScaledPixels>,
     pub content_mask: ContentMask<ScaledPixels>,
+    pub opacity: f32,
 }
 
 #[cfg(any(test, feature = "test-support"))]

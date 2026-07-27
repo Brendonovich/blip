@@ -19,9 +19,10 @@ use core_graphics::window::{
 use dispatch2::DispatchQueue;
 use gpui::{
     AnyWindowHandle, App, Bounds, ClipboardEntry, ClipboardItem, Context, CursorStyle, Div, Entity,
-    ExternalPaths, FontWeight, IntoElement, MouseButton, MouseDownEvent, MouseMoveEvent,
-    MouseUpEvent, Pixels, Point, Render, SharedString, Window, WindowBackgroundAppearance,
-    WindowBounds, WindowKind, WindowOptions, div, point, prelude::*, px, rgb, rgba, size,
+    ExternalPaths, FontWeight, IntoElement, KeyBinding, Menu, MenuItem, MouseButton,
+    MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, Render, SharedString, Window,
+    WindowBackgroundAppearance, WindowBounds, WindowKind, WindowOptions, actions, div, point,
+    prelude::*, px, rgb, rgba, size,
 };
 use gpui_platform::application;
 use objc2::rc::Retained;
@@ -71,6 +72,18 @@ const OVERLAY_BLACK: u32 = 0x0000_0060;
 const OVERLAY_BLUE_TINT: u32 = 0x184d_8280;
 const CAPTURE_TIMEOUT: Duration = Duration::from_secs(5);
 const WINDOW_POLL_INTERVAL: Duration = Duration::from_millis(250);
+
+actions!(
+    blip_capture,
+    [
+        CloseWindow,
+        CloseAllWindows,
+        ToggleCutMode,
+        DeleteSelected,
+        CloseExportDialog
+    ]
+);
+
 #[allow(clippy::arithmetic_side_effects)]
 fn toolbar_dimensions_for_label(label: &str) -> (f32, f32) {
     let char_count = label.chars().count().clamp(3, 30);
@@ -491,7 +504,7 @@ impl CaptureApp {
         }) {
             Ok(window) => window,
             Err(error) => {
-                set_activation_policy(NSApplicationActivationPolicy::Accessory);
+                refresh_activation_policy(cx);
                 self.error = Some(format!(
                     "Failed to open recording profile settings: {error}"
                 ));
@@ -521,7 +534,7 @@ impl CaptureApp {
             if window_id != settings_window_id || restored.replace(true) {
                 return;
             }
-            set_activation_policy(NSApplicationActivationPolicy::Accessory);
+            refresh_activation_policy(cx);
             let Some(controller) = controller_window.downcast::<CaptureApp>() else {
                 return;
             };
@@ -1343,6 +1356,8 @@ impl Render for ProfileSettings {
         };
         div()
             .size_full()
+            .on_action(|_: &CloseWindow, window, _| window.remove_window())
+            .on_action(|action: &CloseAllWindows, _, cx| close_all_windows(action, cx))
             .on_mouse_down(MouseButton::Left, cx.listener(Self::blur_input))
             .flex()
             .bg(rgb(0x0014_1518))
@@ -3010,6 +3025,47 @@ fn handle_escape(cx: &mut App) {
     }
 }
 
+fn close_window(_: &CloseWindow, cx: &mut App) {
+    let window_handle = cx.active_window().or_else(|| {
+        cx.window_stack()?.into_iter().find(|window| {
+            window.downcast::<BundleEditor>().is_some()
+                || window.downcast::<ProfileSettings>().is_some()
+                || window.downcast::<CaptureApp>().is_some()
+        })
+    });
+    let Some(window_handle) = window_handle else {
+        return;
+    };
+    cx.defer(move |cx| close_window_handle(window_handle, cx));
+}
+
+fn close_window_handle(window_handle: AnyWindowHandle, cx: &mut App) {
+    if let Some(controller) = window_handle.downcast::<CaptureApp>() {
+        controller.update(cx, CaptureApp::close_windows).ok();
+    } else {
+        window_handle
+            .update(cx, |_, window, _| window.remove_window())
+            .ok();
+    }
+}
+
+fn close_all_windows(_: &CloseAllWindows, cx: &mut App) {
+    cx.defer(perform_close_all_windows);
+}
+
+fn perform_close_all_windows(cx: &mut App) {
+    for window_handle in cx.windows() {
+        if let Some(controller) = window_handle.downcast::<CaptureApp>() {
+            controller.update(cx, CaptureApp::close_windows).ok();
+        }
+    }
+    for window_handle in cx.windows() {
+        window_handle
+            .update(cx, |_, window, _| window.remove_window())
+            .ok();
+    }
+}
+
 fn import_profile_urls(cx: &mut App, urls: Vec<String>) {
     let mut profile_urls = Vec::new();
     for url_str in urls {
@@ -3075,7 +3131,23 @@ fn run_app(open_path: Option<PathBuf>) {
         profile_sender.try_send(urls).ok();
     });
     app.run(move |cx| {
+        cx.bind_keys([
+            KeyBinding::new("cmd-w", CloseWindow, None),
+            KeyBinding::new("cmd-q", CloseAllWindows, None),
+            KeyBinding::new("c", ToggleCutMode, Some("BundleEditor")),
+            KeyBinding::new("delete", DeleteSelected, Some("BundleEditor")),
+            KeyBinding::new("backspace", DeleteSelected, Some("BundleEditor")),
+            KeyBinding::new("escape", CloseExportDialog, Some("BundleEditor")),
+        ]);
+        cx.on_action(close_window);
+        cx.on_action(close_all_windows);
+        cx.set_menus([Menu::new("Blip Capture").items([
+            MenuItem::action("Close Window", CloseWindow),
+            MenuItem::action("Close All Windows", CloseAllWindows),
+        ])]);
         set_activation_policy(NSApplicationActivationPolicy::Accessory);
+        cx.on_window_closed(|cx, _| refresh_activation_policy(cx))
+            .detach();
         if let Some(path) = open_path {
             if let Err(error) = BundleEditor::open(path, cx) {
                 eprintln!("blip-capture: {error}");
@@ -3125,11 +3197,29 @@ fn set_activation_policy(policy: NSApplicationActivationPolicy) {
     }
 }
 
+fn show_in_dock() {
+    set_activation_policy(NSApplicationActivationPolicy::Regular);
+}
+
+fn refresh_activation_policy(cx: &App) {
+    let has_regular_window = cx.windows().into_iter().any(|window| {
+        window.downcast::<BundleEditor>().is_some()
+            || window.downcast::<ProfileSettings>().is_some()
+    });
+    set_activation_policy(if has_regular_window {
+        NSApplicationActivationPolicy::Regular
+    } else {
+        NSApplicationActivationPolicy::Accessory
+    });
+}
+
 fn init_tracing() {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-                tracing_subscriber::EnvFilter::new("info,blip_capture=debug,blip_avfoundation=debug")
+                tracing_subscriber::EnvFilter::new(
+                    "info,blip_capture=debug,blip_avfoundation=debug",
+                )
             }),
         )
         .with_target(true)

@@ -4412,6 +4412,7 @@ impl Window {
         let content_mask = self.snapped_content_mask();
         self.next_frame.scene.insert_primitive(PaintSurface {
             order: 0,
+            opacity: self.element_opacity(),
             bounds,
             content_mask,
             image_buffer,

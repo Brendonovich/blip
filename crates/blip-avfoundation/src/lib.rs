@@ -17,12 +17,13 @@ use std::sync::mpsc;
 use std::time::Duration;
 
 use block2::RcBlock;
+use core_foundation::base::TCFType as _;
 use objc2::rc::Retained;
 use objc2::runtime::AnyObject;
 use objc2_av_foundation::{
     AVAssetWriter, AVAssetWriterInput, AVAssetWriterInputPixelBufferAdaptor, AVAssetWriterStatus,
-    AVFileTypeMPEG4, AVMediaTypeVideo, AVVideoCodecKey, AVVideoCodecTypeH264, AVVideoHeightKey,
-    AVVideoWidthKey,
+    AVFileTypeMPEG4, AVFileTypeQuickTimeMovie, AVMediaTypeVideo, AVVideoCodecKey,
+    AVVideoCodecTypeH264, AVVideoHeightKey, AVVideoWidthKey,
 };
 use objc2_core_media::CMTime;
 use objc2_core_video::CVPixelBuffer;
@@ -65,6 +66,12 @@ pub enum WriterError {
     Finish(String),
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VideoFileType {
+    Mp4,
+    Mov,
+}
+
 pub struct Mp4Writer {
     writer: Retained<AVAssetWriter>,
     input: Retained<AVAssetWriterInput>,
@@ -84,6 +91,22 @@ impl Mp4Writer {
     /// Returns an error if the output cannot be prepared or `AVFoundation`
     /// rejects the writer configuration.
     pub fn new(output: &Path, width: usize, height: usize, fps: u32) -> Result<Self, WriterError> {
+        Self::new_with_file_type(output, width, height, fps, VideoFileType::Mp4)
+    }
+
+    /// Creates an H.264 writer for BGRA pixel buffers in the selected container.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the output cannot be prepared or `AVFoundation`
+    /// rejects the writer configuration.
+    pub fn new_with_file_type(
+        output: &Path,
+        width: usize,
+        height: usize,
+        fps: u32,
+        file_type: VideoFileType,
+    ) -> Result<Self, WriterError> {
         if width == 0 || height == 0 {
             return Err(WriterError::InvalidDimensions);
         }
@@ -103,8 +126,16 @@ impl Mp4Writer {
         let path = output.to_str().ok_or(WriterError::InvalidOutputPath)?;
         let url = NSURL::fileURLWithPath(&NSString::from_str(path));
         // SAFETY: These framework constants exist on every macOS version supported by AVAssetWriter.
-        let file_type =
-            unsafe { AVFileTypeMPEG4 }.ok_or(WriterError::MissingConstant("AVFileTypeMPEG4"))?;
+        // SAFETY: These framework constants exist on every macOS version supported by AVAssetWriter.
+        let (mp4_file_type, mov_file_type) = unsafe { (AVFileTypeMPEG4, AVFileTypeQuickTimeMovie) };
+        let file_type = match file_type {
+            VideoFileType::Mp4 => {
+                mp4_file_type.ok_or(WriterError::MissingConstant("AVFileTypeMPEG4"))?
+            }
+            VideoFileType::Mov => {
+                mov_file_type.ok_or(WriterError::MissingConstant("AVFileTypeQuickTimeMovie"))?
+            }
+        };
         // SAFETY: The URL is a local file URL and the static file type is provided by AVFoundation.
         let writer =
             unsafe { AVAssetWriter::assetWriterWithURL_fileType_error(&url, file_type) }
@@ -225,6 +256,22 @@ impl Mp4Writer {
         }
         self.last_relative_timestamp_micros = Some(relative_timestamp);
         Ok(true)
+    }
+
+    /// Appends a pixel buffer from the `core-video` crate.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the timestamp overflows or `AVFoundation` cannot
+    /// append the frame.
+    pub fn append_core_video(
+        &mut self,
+        pixel_buffer: &core_video::pixel_buffer::CVPixelBuffer,
+        timestamp: Duration,
+    ) -> Result<bool, WriterError> {
+        let pixel_buffer = pixel_buffer.as_concrete_TypeRef().cast::<CVPixelBuffer>();
+        // SAFETY: Both crates wrap the same Core Video CVPixelBufferRef object.
+        self.append(unsafe { &*pixel_buffer }, timestamp)
     }
 
     /// Finalizes the video track and MP4 container.

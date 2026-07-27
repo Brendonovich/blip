@@ -1,7 +1,14 @@
+pub(crate) const APP_BACKGROUND: u32 = 0x0009_0909;
+pub(crate) const CANVAS_BACKGROUND: u32 = 0x000d_0d0d;
+pub(crate) const PANEL_BACKGROUND: u32 = 0x0015_1515;
 pub(crate) const CONTROL_BACKGROUND: u32 = 0x001c_1c1c;
+pub(crate) const CONTROL_HOVER: u32 = 0x0023_2323;
+pub(crate) const CONTROL_ACTIVE: u32 = 0x0029_2929;
+pub(crate) const BORDER: u32 = 0x0030_3030;
 pub(crate) const BORDER_SUBTLE: u32 = 0x0024_2424;
 pub(crate) const TEXT: u32 = 0x00e8_e8e8;
 pub(crate) const TEXT_MUTED: u32 = 0x0099_9999;
 pub(crate) const TEXT_DIM: u32 = TEXT_MUTED;
 pub(crate) const FOCUS: u32 = 0x007e_8ea6;
+pub(crate) const SELECTION: u32 = 0x0082_94ad;
 pub(crate) const SELECTION_FILL: u32 = 0x0039_4352;
