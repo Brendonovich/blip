@@ -437,10 +437,6 @@ function CaptureKeysPanel() {
 		return "";
 	};
 
-	const captureUrl = () => `${window.location.origin}#${newKey()}`;
-	const captureAppUrl = () =>
-		`blip-capture://add-profile?url=${encodeURIComponent(captureUrl())}`;
-
 	return (
 		<section class="panel keys-panel">
 			<div class="panel-heading">
@@ -464,12 +460,11 @@ function CaptureKeysPanel() {
 
 			<Show when={newKey()}>
 				<div class="key-reveal">
-					<span>ADD THIS URL TO BLIP CAPTURE</span>
-					<code>{captureUrl()}</code>
+					<span>CAPTURE KEY</span>
+					<code>{newKey()}</code>
 					<div class="key-reveal-actions">
-						<a href={captureAppUrl()}>Add to Blip Capture</a>
-						<button onClick={() => navigator.clipboard.writeText(captureUrl())}>
-							Copy URL
+						<button onClick={() => navigator.clipboard.writeText(newKey())}>
+							Copy key
 						</button>
 					</div>
 					<small>This secret will not be shown again.</small>
