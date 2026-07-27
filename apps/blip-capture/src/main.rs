@@ -11,9 +11,10 @@ use std::time::{Duration, Instant};
 use blip_sck::{CaptureError, Display, ShareableContent, Window as CaptureWindow};
 use chrono::Local;
 use clap::Parser;
+use core_foundation::{base::TCFType, number::CFNumber, string::CFString};
 use core_graphics::window::{
-    create_window_list, kCGNullWindowID, kCGWindowListExcludeDesktopElements,
-    kCGWindowListOptionOnScreenOnly,
+    create_description_from_array, create_window_list, kCGNullWindowID,
+    kCGWindowListExcludeDesktopElements, kCGWindowListOptionOnScreenOnly, kCGWindowOwnerPID,
 };
 use dispatch2::DispatchQueue;
 use gpui::{
@@ -754,7 +755,7 @@ impl CaptureApp {
     }
 
     fn close_windows(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let application = topmost_application_pid(&self.windows);
+        let application = topmost_application_pid();
         self.selection.recording.set(false);
         self.close_selection_windows(cx);
         self.visible.set(false);
@@ -764,8 +765,15 @@ impl CaptureApp {
             if let Some(process_id) = application
                 && let Some(application) =
                     NSRunningApplication::runningApplicationWithProcessIdentifier(process_id)
+                && let Some(main_thread) = MainThreadMarker::new()
             {
-                application.activateWithOptions(NSApplicationActivationOptions::empty());
+                let current_application = NSRunningApplication::currentApplication();
+                NSApplication::sharedApplication(main_thread)
+                    .yieldActivationToApplication(&application);
+                application.activateFromApplication_options(
+                    &current_application,
+                    NSApplicationActivationOptions::ActivateAllWindows,
+                );
             }
         });
     }
@@ -2393,16 +2401,18 @@ fn window_bounds(window: &CaptureWindow, display_x: f64, display_y: f64) -> Boun
     )
 }
 
-fn topmost_application_pid(windows: &[CaptureWindow]) -> Option<i32> {
+fn topmost_application_pid() -> Option<i32> {
     let options = kCGWindowListOptionOnScreenOnly | kCGWindowListExcludeDesktopElements;
     let window_ids = create_window_list(options, kCGNullWindowID)?;
+    let window_descriptions = create_description_from_array(window_ids)?;
     let own_process_id = i32::try_from(std::process::id()).ok()?;
-    window_ids.iter().find_map(|window_id| {
-        windows
-            .iter()
-            .find(|window| window.id() == *window_id)
-            .and_then(CaptureWindow::application)
-            .map(|application| application.process_id())
+    // SAFETY: CoreGraphics exposes this static dictionary key for the process lifetime.
+    let owner_pid_key = unsafe { CFString::wrap_under_get_rule(kCGWindowOwnerPID) };
+    window_descriptions.iter().find_map(|window| {
+        window
+            .find(&owner_pid_key)
+            .and_then(|value| value.downcast::<CFNumber>())
+            .and_then(|process_id| process_id.to_i32())
             .filter(|process_id| *process_id != own_process_id)
     })
 }

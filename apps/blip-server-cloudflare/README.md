@@ -36,6 +36,19 @@ pnpm install
 pnpm deploy
 ```
 
+Pushes to `main` deploy the `production` stage through GitHub Actions. Configure
+these repository secrets before enabling CD:
+
+- `CLOUDFLARE_API_TOKEN`
+- `CLOUDFLARE_ACCOUNT_ID`
+- `BETTER_AUTH_SECRET`
+- `BLIP_ENCRYPTION_KEY`
+- `BLIP_SETUP_TOKEN`
+- `OAUTH_GITHUB_CLIENT_SECRET`
+
+Also configure the non-secret repository variables `BLIP_PUBLIC_ORIGIN` and
+`OAUTH_GITHUB_CLIENT_ID`.
+
 Alchemy provisions D1, builds the SolidStart app, and deploys its SSR pages,
 Effect API routes, and client assets as one Worker. Use `pnpm dev` for local
 development and `pnpm destroy` to remove the Cloudflare deployment.

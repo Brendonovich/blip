@@ -25,7 +25,7 @@ export const repositoryLayer = <R>(database: Effect.Effect<Database, never, R>) 
 		setStorageConfig: (userId, storageConfig) => databaseError(db.update(users).set({ storageConfig }).where(eq(users.id, userId))).pipe(Effect.asVoid),
 		createVideo: (video, createdAt) => databaseError(db.insert(videos).values({ ...video, createdAt })).pipe(Effect.asVoid),
 		findOwnedVideo: (userId, id) => databaseError(db.select().from(videos).where(and(eq(videos.id, id), eq(videos.userId, userId))).get()),
-		findVideo: (id) => databaseError(db.select().from(videos).where(eq(videos.id, id)).get()),
+		findVideo: (id) => databaseError(db.select().from(videos).where(and(eq(videos.id, id), isNull(videos.archivedAt))).get()),
 		listOwnedVideos: (userId) => databaseError(db.select({
 			id: videos.id,
 			name: videos.name,
