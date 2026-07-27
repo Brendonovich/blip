@@ -163,11 +163,38 @@ impl NumericInput {
         }
     }
 
-    fn on_mouse_down(&mut self, _: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+    fn on_mouse_down(
+        &mut self,
+        event: &MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         cx.stop_propagation();
         window.focus(&self.focus_handle, cx);
-        self.selected_range = 0..self.content.len();
+        if self.numeric {
+            self.selected_range = 0..self.content.len();
+        } else {
+            let offset = self.index_for_mouse_position(event.position);
+            self.selected_range = offset..offset;
+        }
         cx.notify();
+    }
+
+    fn index_for_mouse_position(&self, position: Point<Pixels>) -> usize {
+        if self.content.is_empty() {
+            return 0;
+        }
+        let (Some(bounds), Some(line)) = (self.last_bounds.as_ref(), self.last_layout.as_ref())
+        else {
+            return 0;
+        };
+        if position.y < bounds.top() {
+            return 0;
+        }
+        if position.y > bounds.bottom() {
+            return self.content.len();
+        }
+        line.closest_index_for_x(position.x - bounds.left())
     }
 
     fn replace_selection(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) {

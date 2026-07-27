@@ -1146,6 +1146,10 @@ impl ProfileSettings {
         cx.notify();
     }
 
+    fn blur_input(&mut self, _: &MouseDownEvent, window: &mut Window, _: &mut Context<Self>) {
+        window.blur();
+    }
+
     fn add(&mut self, cx: &mut Context<Self>) {
         self.commit_inputs(cx);
         let folder = std::env::var_os("HOME")
@@ -1331,6 +1335,7 @@ impl Render for ProfileSettings {
         };
         div()
             .size_full()
+            .on_mouse_down(MouseButton::Left, cx.listener(Self::blur_input))
             .flex()
             .bg(rgb(0x0014_1518))
             .text_color(rgb(TEXT))
