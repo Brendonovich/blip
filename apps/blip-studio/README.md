@@ -36,3 +36,9 @@ APPLE_NOTARY_PROFILE="blip-notary" \
 
 Set `BLIP_BUILD_NUMBER` to override `CFBundleVersion`. Set
 `APPLE_ENTITLEMENTS` to an entitlements plist if future features require one.
+
+Production bundles include Sparkle and check the app-specific GitHub release
+feed automatically. The release workflow publishes the corresponding appcast
+alongside each signed and notarized DMG. Developer ID builds require the public
+EdDSA key in `SPARKLE_PUBLIC_KEY`; releases use the matching base64 private key
+from the `SPARKLE_PRIVATE_KEY` Actions secret.

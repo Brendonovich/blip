@@ -35,6 +35,7 @@ bitflags = "2.6.0"
 blip-sck = { path = "crates/blip-sck" }
 blip-avfoundation = { path = "crates/blip-avfoundation" }
 blip-compositor = { path = "crates/blip-compositor" }
+blip-updater = { path = "crates/blip-updater" }
 bytemuck = { version = "1", features = ["derive"] }
 block = "0.1"
 block2 = "0.6"

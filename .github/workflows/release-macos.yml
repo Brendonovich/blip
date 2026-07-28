@@ -44,12 +44,49 @@ jobs:
       - name: Build Blip Capture
         env:
           BLIP_BUILD_NUMBER: ${{ github.run_number }}
+          SPARKLE_PUBLIC_KEY: ${{ vars.SPARKLE_PUBLIC_KEY }}
         run: apps/blip-capture/build-app.sh --notarize
 
       - name: Build Blip Studio
         env:
           BLIP_BUILD_NUMBER: ${{ github.run_number }}
+          SPARKLE_PUBLIC_KEY: ${{ vars.SPARKLE_PUBLIC_KEY }}
         run: apps/blip-studio/build-app.sh --notarize
+
+      - name: Generate update feeds
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
+          BLIP_BUILD_NUMBER: ${{ github.run_number }}
+          SPARKLE_PRIVATE_KEY: ${{ secrets.SPARKLE_PRIVATE_KEY }}
+        run: |
+          if [[ -z "$SPARKLE_PRIVATE_KEY" ]]; then
+            echo "SPARKLE_PRIVATE_KEY is not configured" >&2
+            exit 1
+          fi
+          version="$(cargo pkgid -p blip-capture | perl -ne 'print $1 if /[\@#]([^\@#]+)$/')"
+          studio_version="$(cargo pkgid -p blip-studio | perl -ne 'print $1 if /[\@#]([^\@#]+)$/')"
+          if [[ "$studio_version" != "$version" ]]; then
+            echo "Capture and Studio versions must match for a combined release" >&2
+            exit 1
+          fi
+          if [[ "$RELEASE_TAG" != "v$version" ]]; then
+            echo "Release tag must match the app version: v$version" >&2
+            exit 1
+          fi
+          capture_signature="$(printf '%s' "$SPARKLE_PRIVATE_KEY" | target/sparkle-2.9.4/bin/sign_update --ed-key-file - -p target/release/bundle/dmg/Blip-Capture.dmg)"
+          studio_signature="$(printf '%s' "$SPARKLE_PRIVATE_KEY" | target/sparkle-2.9.4/bin/sign_update --ed-key-file - -p target/release/bundle/dmg/Blip-Studio.dmg)"
+          apps/generate-appcast.sh \
+            "Blip Capture" \
+            target/release/bundle/dmg/Blip-Capture.dmg \
+            Blip-Capture.dmg \
+            target/release/bundle/dmg/Blip-Capture-appcast.xml \
+            "$version" "$BLIP_BUILD_NUMBER" "$RELEASE_TAG" "$capture_signature"
+          apps/generate-appcast.sh \
+            "Blip Studio" \
+            target/release/bundle/dmg/Blip-Studio.dmg \
+            Blip-Studio.dmg \
+            target/release/bundle/dmg/Blip-Studio-appcast.xml \
+            "$version" "$BLIP_BUILD_NUMBER" "$RELEASE_TAG" "$studio_signature"
 
       - name: Create GitHub release
         env:
@@ -64,4 +101,6 @@ jobs:
           gh release create "$RELEASE_TAG" \
             target/release/bundle/dmg/Blip-Capture.dmg \
             target/release/bundle/dmg/Blip-Studio.dmg \
+            target/release/bundle/dmg/Blip-Capture-appcast.xml \
+            target/release/bundle/dmg/Blip-Studio-appcast.xml \
             "${args[@]}"

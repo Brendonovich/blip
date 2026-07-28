@@ -12,6 +12,7 @@ async-channel.workspace = true
 blip-avfoundation.workspace = true
 blip-compositor.workspace = true
 blip-sck.workspace = true
+blip-updater.workspace = true
 clap.workspace = true
 core-foundation.workspace = true
 core-video.workspace = true
@@ -27,4 +28,3 @@ serde_json.workspace = true
 [dev-dependencies]
 gpui = { workspace = true, features = ["test-support"] }
 gpui_platform = { workspace = true, features = ["test-support"] }
-

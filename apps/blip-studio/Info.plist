@@ -28,5 +28,11 @@
     <true/>
     <key>NSScreenCaptureUsageDescription</key>
     <string>Blip Studio captures your screen and windows as scene sources.</string>
+    <key>SUEnableAutomaticChecks</key>
+    <true/>
+    <key>SUAutomaticallyUpdate</key>
+    <true/>
+    <key>SUFeedURL</key>
+    <string>https://github.com/Brendonovich/blip/releases/latest/download/Blip-Studio-appcast.xml</string>
 </dict>
 </plist>

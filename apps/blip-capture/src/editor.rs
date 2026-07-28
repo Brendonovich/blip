@@ -23,15 +23,17 @@ use gpui::{
     IntoElement, MouseButton, MouseDownEvent, MouseExitEvent, MouseMoveEvent, ObjectFit,
     PinchEvent, Pixels, Render, ScrollWheelEvent, SharedString, TextAlign, TextRun,
     TitlebarOptions, Window, WindowOptions, canvas, div, fill, img, point, prelude::*, px,
-    relative, rgb, rgba, size, surface,
+    relative, rgb, rgba, size, surface, svg,
 };
 
 use crate::{
+    assets::{PAUSE, PLAY, PLAYBACK_BACK, PLAYBACK_FORWARD},
     bundle::{BlipBundle, VideoSegment, ZoomSegment, ZoomTransitionSpeed},
     theme,
 };
 
 const ACCENT: u32 = 0x00ff_4f58;
+const PREVIEW_HANDLE: u32 = 0x007f_7f7f;
 const SIDEBAR_WIDTH: Pixels = px(280.0);
 const PREVIEW_LOADING_DURATION: Duration = Duration::from_millis(1_400);
 const PREVIEW_FADE_DURATION: Duration = Duration::from_millis(240);
@@ -200,11 +202,26 @@ enum SliderKind {
 }
 
 #[derive(Clone, Copy)]
+enum ZoomSegmentEdge {
+    Start,
+    End,
+}
+
+#[derive(Clone, Copy)]
+enum ZoomSegmentDragKind {
+    Move,
+    Resize(ZoomSegmentEdge),
+}
+
+#[derive(Clone, Copy)]
 struct ZoomSegmentDrag {
     id: u64,
+    kind: ZoomSegmentDragKind,
     pointer_start_x: Pixels,
     original_start_secs: f64,
-    duration_secs: f64,
+    original_end_secs: f64,
+    minimum_start_secs: f64,
+    maximum_end_secs: f64,
 }
 
 #[derive(Clone, Copy)]
@@ -255,6 +272,7 @@ pub(crate) struct BundleEditor {
     preview_requests: async_channel::Sender<PreviewRequest>,
     zoom_target_requests: async_channel::Sender<f64>,
     duration_secs: f64,
+    timeline_fps: u32,
     timeline_view_start_secs: f64,
     timeline_view_duration_secs: f64,
     current_time_secs: f64,
@@ -304,11 +322,14 @@ impl BundleEditor {
         );
         let mut decoder_inputs = Vec::new();
         let mut max_duration = 0.0;
+        let mut timeline_fps = None;
         for (index, input) in bundle.inputs.iter().enumerate() {
             let media_path = path.join(&input.media);
             match blip_avfoundation::VideoDecoder::open(&media_path) {
                 Ok(decoder) => {
                     let dur = decoder.duration().as_secs_f64();
+                    timeline_fps
+                        .get_or_insert_with(|| decoder.nominal_fps().round().max(1.0) as u32);
                     if dur > max_duration {
                         max_duration = dur;
                     }
@@ -440,6 +461,7 @@ impl BundleEditor {
                         preview_requests,
                         zoom_target_requests,
                         duration_secs: timeline_duration,
+                        timeline_fps: timeline_fps.unwrap_or(60),
                         timeline_view_start_secs: 0.0,
                         timeline_view_duration_secs: timeline_duration,
                         current_time_secs: 0.0,
@@ -836,18 +858,26 @@ impl BundleEditor {
             );
         }
         self.duration_secs = video_timeline_duration(&self.bundle);
-        self.timeline_view_duration_secs = drag
+        self.current_time_secs = self.current_time_secs.min(self.duration_secs);
+        self.request_preview();
+        self.request_zoom_target();
+        cx.notify();
+        true
+    }
+
+    fn finish_video_segment_drag(&mut self, cx: &mut Context<Self>) {
+        if self.video_segment_drag.take().is_none() {
+            return;
+        }
+        self.timeline_view_duration_secs = self
             .timeline_view_duration_secs
             .min(self.duration_secs)
             .max(0.0);
         self.timeline_view_start_secs = self
             .timeline_view_start_secs
             .min((self.duration_secs - self.timeline_view_duration_secs).max(0.0));
-        self.current_time_secs = self.current_time_secs.min(self.duration_secs);
-        self.request_preview();
-        self.request_zoom_target();
+        self.save_bundle();
         cx.notify();
-        true
     }
 
     fn can_delete_video_segment(&self) -> bool {
@@ -1000,7 +1030,13 @@ impl BundleEditor {
         cx.notify();
     }
 
-    fn begin_zoom_segment_drag(&mut self, id: u64, event: &MouseDownEvent, cx: &mut Context<Self>) {
+    fn begin_zoom_segment_drag(
+        &mut self,
+        id: u64,
+        kind: ZoomSegmentDragKind,
+        event: &MouseDownEvent,
+        cx: &mut Context<Self>,
+    ) {
         let Some(segment) = self
             .bundle
             .zoom_segments
@@ -1010,11 +1046,31 @@ impl BundleEditor {
             return;
         };
         let start_secs = segment.start_secs;
+        let end_secs = segment.end_secs;
+        let minimum_start_secs = self
+            .bundle
+            .zoom_segments
+            .iter()
+            .filter(|segment| segment.id != id && segment.end_secs <= start_secs)
+            .map(|segment| segment.end_secs)
+            .max_by(f64::total_cmp)
+            .unwrap_or(0.0);
+        let maximum_end_secs = self
+            .bundle
+            .zoom_segments
+            .iter()
+            .filter(|segment| segment.id != id && segment.start_secs >= end_secs)
+            .map(|segment| segment.start_secs)
+            .min_by(f64::total_cmp)
+            .unwrap_or(self.duration_secs);
         self.zoom_segment_drag = Some(ZoomSegmentDrag {
             id,
+            kind,
             pointer_start_x: event.position.x,
             original_start_secs: start_secs,
-            duration_secs: (segment.end_secs - start_secs).max(0.0),
+            original_end_secs: end_secs,
+            minimum_start_secs,
+            maximum_end_secs,
         });
         if self.selected_zoom != Some(id) {
             self.current_screen_frame = None;
@@ -1039,11 +1095,30 @@ impl BundleEditor {
             return true;
         }
         let delta_fraction = (event.position.x - drag.pointer_start_x) / bounds.size.width;
-        let max_start_secs = (self.duration_secs - drag.duration_secs).max(0.0);
-        let start_secs = (drag.original_start_secs
-            + f64::from(delta_fraction) * self.timeline_view_duration_secs)
-            .clamp(0.0, max_start_secs);
-        let playback_time_secs = self.timeline_time_at(event.position.x);
+        let delta_secs = f64::from(delta_fraction) * self.timeline_view_duration_secs;
+        let (start_secs, end_secs) = match drag.kind {
+            ZoomSegmentDragKind::Move => {
+                let duration_secs = (drag.original_end_secs - drag.original_start_secs).max(0.0);
+                let maximum_start_secs =
+                    (drag.maximum_end_secs - duration_secs).max(drag.minimum_start_secs);
+                let start_secs = (drag.original_start_secs + delta_secs)
+                    .clamp(drag.minimum_start_secs, maximum_start_secs);
+                (start_secs, start_secs + duration_secs)
+            }
+            ZoomSegmentDragKind::Resize(edge) => resize_zoom_segment_range(
+                edge,
+                drag.original_start_secs,
+                drag.original_end_secs,
+                drag.minimum_start_secs,
+                drag.maximum_end_secs,
+                delta_secs,
+            ),
+        };
+        let playback_time_secs = match drag.kind {
+            ZoomSegmentDragKind::Move => self.timeline_time_at(event.position.x),
+            ZoomSegmentDragKind::Resize(ZoomSegmentEdge::Start) => Some(start_secs),
+            ZoomSegmentDragKind::Resize(ZoomSegmentEdge::End) => Some(end_secs),
+        };
         let Some(segment) = self
             .bundle
             .zoom_segments
@@ -1053,15 +1128,16 @@ impl BundleEditor {
             self.zoom_segment_drag = None;
             return true;
         };
-        let segment_moved = segment.start_secs != start_secs;
-        if segment_moved {
+        let segment_changed = segment.start_secs != start_secs || segment.end_secs != end_secs;
+        let start_changed = segment.start_secs != start_secs;
+        if segment_changed {
             segment.start_secs = start_secs;
-            segment.end_secs = start_secs + drag.duration_secs;
+            segment.end_secs = end_secs;
         }
         if let Some(time_secs) = playback_time_secs {
             self.set_playback_time(time_secs);
         }
-        if segment_moved {
+        if start_changed {
             self.request_zoom_target();
         }
         cx.notify();
@@ -2473,6 +2549,8 @@ impl BundleEditor {
             .absolute()
             .size_full(),
         );
+        let mut cut_bubbles = div().absolute().left(px(92.0)).right_0().top_0().bottom_0();
+        let mut video_track_top = 0.0;
         for (index, input) in self.bundle.inputs.iter().enumerate() {
             let bounds_cell = Rc::clone(&bounds_cell);
             let mut video_track = div().h(px(48.0)).flex_1().relative();
@@ -2631,17 +2709,17 @@ impl BundleEditor {
                     div()
                         .absolute()
                         .left(relative(fraction))
-                        .top(px(-18.0))
+                        .top(px(-2.0))
                         .bottom_0()
                         .w(px(1.0))
-                        .child(
-                            div()
-                                .absolute()
-                                .top(px(16.0))
-                                .bottom_0()
-                                .w(px(1.0))
-                                .bg(rgb(ACCENT)),
-                        )
+                        .bg(rgb(ACCENT)),
+                );
+                cut_bubbles = cut_bubbles.child(
+                    div()
+                        .absolute()
+                        .left(relative(fraction))
+                        .top(px(video_track_top - 18.0))
+                        .w(px(1.0))
                         .child(
                             div()
                                 .id(format!("video-cut-{index}-{right_id}"))
@@ -2690,6 +2768,7 @@ impl BundleEditor {
                     )
                     .child(video_track),
             );
+            video_track_top += 56.0;
         }
         let zoom_track_bounds = Rc::clone(&bounds_cell);
         let mut zoom_segments = div().h(px(48.0)).flex_1().relative().overflow_hidden();
@@ -2746,12 +2825,61 @@ impl BundleEditor {
                         .on_mouse_down(
                             MouseButton::Left,
                             cx.listener(move |editor, event: &MouseDownEvent, _, cx| {
-                                editor.begin_zoom_segment_drag(id, event, cx);
+                                editor.begin_zoom_segment_drag(
+                                    id,
+                                    ZoomSegmentDragKind::Move,
+                                    event,
+                                    cx,
+                                );
                                 if let Some(time_secs) = editor.timeline_time_at(event.position.x) {
                                     editor.set_playback_time(time_secs);
                                 }
                                 cx.stop_propagation();
                             }),
+                        )
+                        .child(
+                            div()
+                                .id(("zoom-segment-start", id))
+                                .absolute()
+                                .left_0()
+                                .top_0()
+                                .bottom_0()
+                                .w(px(8.0))
+                                .cursor_e_resize()
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(move |editor, event, _, cx| {
+                                        editor.begin_zoom_segment_drag(
+                                            id,
+                                            ZoomSegmentDragKind::Resize(ZoomSegmentEdge::Start),
+                                            event,
+                                            cx,
+                                        );
+                                        cx.stop_propagation();
+                                    }),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .id(("zoom-segment-end", id))
+                                .absolute()
+                                .right_0()
+                                .top_0()
+                                .bottom_0()
+                                .w(px(8.0))
+                                .cursor_w_resize()
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(move |editor, event, _, cx| {
+                                        editor.begin_zoom_segment_drag(
+                                            id,
+                                            ZoomSegmentDragKind::Resize(ZoomSegmentEdge::End),
+                                            event,
+                                            cx,
+                                        );
+                                        cx.stop_propagation();
+                                    }),
+                                ),
                         ),
                 );
             }
@@ -2795,7 +2923,7 @@ impl BundleEditor {
                             .overflow_hidden()
                             .bg(rgba(0xff4f_5838))
                             .border_1()
-                            .border_color(rgb(theme::SELECTION))
+                            .border_color(rgba(0xff4f_5858))
                             .child(
                                 div()
                                     .absolute()
@@ -2826,7 +2954,7 @@ impl BundleEditor {
                     })
                     .map(|segment| segment.id)
                 {
-                    editor.begin_zoom_segment_drag(id, event, cx);
+                    editor.begin_zoom_segment_drag(id, ZoomSegmentDragKind::Move, event, cx);
                     editor.set_playback_time(time_secs);
                     cx.stop_propagation();
                     return;
@@ -2860,6 +2988,34 @@ impl BundleEditor {
                 )
                 .child(zoom_segments),
         );
+        tracks = tracks.when_some(preview_fraction, |tracks, fraction| {
+            tracks.child(
+                div()
+                    .absolute()
+                    .left(px(92.0))
+                    .right_0()
+                    .top(px(-4.0))
+                    .bottom(px(-8.0))
+                    .child(
+                        div()
+                            .absolute()
+                            .top(px(-8.0))
+                            .bottom_0()
+                            .left(relative(fraction))
+                            .w(px(2.0))
+                            .bg(rgb(PREVIEW_HANDLE))
+                            .child(
+                                div()
+                                    .absolute()
+                                    .top(px(-5.0))
+                                    .left(px(-4.0))
+                                    .size(px(10.0))
+                                    .rounded_full()
+                                    .bg(rgb(PREVIEW_HANDLE)),
+                            ),
+                    ),
+            )
+        });
         tracks = tracks.when_some(playback_fraction, |tracks, playback_fraction| {
             tracks.child(
                 div()
@@ -2888,45 +3044,11 @@ impl BundleEditor {
                     ),
             )
         });
-        tracks = tracks.when_some(preview_fraction, |tracks, fraction| {
-            tracks.child(
-                div()
-                    .absolute()
-                    .left(px(92.0))
-                    .right_0()
-                    .top(px(-4.0))
-                    .bottom(px(-8.0))
-                    .child(
-                        div()
-                            .absolute()
-                            .top(px(-8.0))
-                            .bottom_0()
-                            .left(relative(fraction))
-                            .w(px(2.0))
-                            .bg(rgb(theme::TEXT))
-                            .opacity(0.5)
-                            .child(
-                                div()
-                                    .absolute()
-                                    .top(px(-5.0))
-                                    .left(px(-4.0))
-                                    .size(px(10.0))
-                                    .rounded_full()
-                                    .bg(rgb(theme::TEXT)),
-                            ),
-                    ),
-            )
-        });
+        tracks = tracks.child(cut_bubbles);
 
-        let time_label = format!(
-            "{:02}:{:02}.{:02} / {:02}:{:02}.{:02}",
-            (self.current_time_secs as u64) / 60,
-            (self.current_time_secs as u64) % 60,
-            ((self.current_time_secs % 1.0) * 100.0) as u64,
-            (self.duration_secs as u64) / 60,
-            (self.duration_secs as u64) % 60,
-            ((self.duration_secs % 1.0) * 100.0) as u64,
-        );
+        let display_time_secs = self.cursor_time_secs.unwrap_or(self.current_time_secs);
+        let playback_time_label = timeline_timecode(display_time_secs, self.timeline_fps);
+        let total_time_label = timeline_timecode(self.duration_secs, self.timeline_fps);
 
         div()
             .p_4()
@@ -2982,62 +3104,120 @@ impl BundleEditor {
                             .flex_1()
                             .flex()
                             .items_center()
-                            .gap_2()
+                            .justify_center()
+                            .gap_3()
                             .text_xs()
+                            .text_color(rgb(theme::TEXT_MUTED))
+                            .child(div().w(px(68.0)).text_right().child(playback_time_label))
                             .child(
                                 div()
-                                    .id("toggle-playback")
-                                    .px_2()
-                                    .py_1()
-                                    .rounded_sm()
-                                    .bg(rgb(theme::CONTROL_BACKGROUND))
-                                    .border_1()
-                                    .border_color(rgb(theme::BORDER_SUBTLE))
+                                    .id("playback-back")
+                                    .w(px(32.0))
+                                    .h(px(28.0))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .rounded_full()
                                     .cursor_pointer()
-                                    .text_color(rgb(theme::TEXT))
+                                    .text_color(rgb(theme::TEXT_MUTED))
+                                    .hover(|button| {
+                                        button
+                                            .bg(rgb(theme::CONTROL_HOVER))
+                                            .text_color(rgb(theme::TEXT))
+                                    })
                                     .on_click(cx.listener(|editor, _, _, cx| {
-                                        editor.toggle_playback(cx);
+                                        editor.set_playback_time(editor.current_time_secs - 5.0);
+                                        cx.notify();
                                     }))
-                                    .child(if self.is_playing {
-                                        "Pause (Space)"
-                                    } else {
-                                        "Play (Space)"
-                                    }),
+                                    .child(
+                                        svg()
+                                            .size(px(15.0))
+                                            .path(PLAYBACK_BACK)
+                                            .text_color(rgb(theme::TEXT_MUTED)),
+                                    ),
                             )
                             .child(
                                 div()
-                                    .id("cut-mode")
-                                    .px_2()
-                                    .py_1()
-                                    .rounded_sm()
-                                    .bg(rgb(if self.cut_mode {
-                                        theme::CONTROL_ACTIVE
-                                    } else {
-                                        theme::CONTROL_BACKGROUND
-                                    }))
+                                    .id("toggle-playback")
+                                    .size(px(36.0))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .rounded_full()
+                                    .bg(rgb(theme::CONTROL_BACKGROUND))
                                     .border_1()
-                                    .border_color(rgb(if self.cut_mode {
-                                        theme::SELECTION
-                                    } else {
-                                        theme::BORDER_SUBTLE
-                                    }))
+                                    .border_color(rgb(theme::BORDER))
                                     .cursor_pointer()
-                                    .text_color(rgb(if self.cut_mode {
-                                        theme::TEXT
-                                    } else {
-                                        theme::TEXT_MUTED
-                                    }))
+                                    .text_color(rgb(theme::TEXT))
+                                    .hover(|button| button.bg(rgb(theme::CONTROL_HOVER)))
                                     .on_click(cx.listener(|editor, _, _, cx| {
-                                        editor.toggle_cut_mode(cx);
+                                        editor.toggle_playback(cx);
                                     }))
-                                    .child("Cut (C)"),
-                            ),
+                                    .child(
+                                        svg()
+                                            .size(px(15.0))
+                                            .path(if self.is_playing { PAUSE } else { PLAY })
+                                            .text_color(rgb(theme::TEXT)),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .id("playback-forward")
+                                    .w(px(32.0))
+                                    .h(px(28.0))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .rounded_full()
+                                    .cursor_pointer()
+                                    .text_color(rgb(theme::TEXT_MUTED))
+                                    .hover(|button| {
+                                        button
+                                            .bg(rgb(theme::CONTROL_HOVER))
+                                            .text_color(rgb(theme::TEXT))
+                                    })
+                                    .on_click(cx.listener(|editor, _, _, cx| {
+                                        editor.set_playback_time(editor.current_time_secs + 5.0);
+                                        cx.notify();
+                                    }))
+                                    .child(
+                                        svg()
+                                            .size(px(15.0))
+                                            .path(PLAYBACK_FORWARD)
+                                            .text_color(rgb(theme::TEXT_MUTED)),
+                                    ),
+                            )
+                            .child(div().w(px(68.0)).child(total_time_label)),
                     )
                     .child(
-                        div()
-                            .text_xs()
-                            .text_color(rgb(theme::TEXT_MUTED))
-                            .child(time_label),
+                        div().w(px(80.0)).flex().justify_end().child(
+                            div()
+                                .id("cut-mode")
+                                .px_2()
+                                .py_1()
+                                .rounded_sm()
+                                .bg(rgb(if self.cut_mode {
+                                    theme::CONTROL_ACTIVE
+                                } else {
+                                    theme::CONTROL_BACKGROUND
+                                }))
+                                .border_1()
+                                .border_color(rgb(if self.cut_mode {
+                                    theme::SELECTION
+                                } else {
+                                    theme::BORDER_SUBTLE
+                                }))
+                                .cursor_pointer()
+                                .text_color(rgb(if self.cut_mode {
+                                    theme::TEXT
+                                } else {
+                                    theme::TEXT_MUTED
+                                }))
+                                .on_click(cx.listener(|editor, _, _, cx| {
+                                    editor.toggle_cut_mode(cx);
+                                }))
+                                .child("Cut (C)"),
+                        ),
                     ),
             )
             .child(timeline_ruler(view_start_secs, view_duration_secs))
@@ -3088,7 +3268,7 @@ impl Render for BundleEditor {
             }))
             .on_mouse_up(
                 MouseButton::Left,
-                cx.listener(|editor, _, _, _| {
+                cx.listener(|editor, _, _, cx| {
                     if editor.active_slider == Some(SliderKind::ZoomAmount) {
                         editor.save_bundle();
                     }
@@ -3096,9 +3276,7 @@ impl Render for BundleEditor {
                     if editor.zoom_segment_drag.take().is_some() {
                         editor.save_bundle();
                     }
-                    if editor.video_segment_drag.take().is_some() {
-                        editor.save_bundle();
-                    }
+                    editor.finish_video_segment_drag(cx);
                     if editor.dragging_zoom_target {
                         editor.save_bundle();
                     }
@@ -3107,7 +3285,7 @@ impl Render for BundleEditor {
             )
             .on_mouse_up_out(
                 MouseButton::Left,
-                cx.listener(|editor, _, _, _| {
+                cx.listener(|editor, _, _, cx| {
                     if editor.active_slider == Some(SliderKind::ZoomAmount) {
                         editor.save_bundle();
                     }
@@ -3115,9 +3293,7 @@ impl Render for BundleEditor {
                     if editor.zoom_segment_drag.take().is_some() {
                         editor.save_bundle();
                     }
-                    if editor.video_segment_drag.take().is_some() {
-                        editor.save_bundle();
-                    }
+                    editor.finish_video_segment_drag(cx);
                     if editor.dragging_zoom_target {
                         editor.save_bundle();
                     }
@@ -3312,6 +3488,30 @@ fn resize_video_segment_range(
             (source_end_secs + delta_secs)
                 .min(maximum_source_end_secs)
                 .max(source_start_secs + 0.01),
+        ),
+    }
+}
+
+fn resize_zoom_segment_range(
+    edge: ZoomSegmentEdge,
+    start_secs: f64,
+    end_secs: f64,
+    minimum_start_secs: f64,
+    maximum_end_secs: f64,
+    delta_secs: f64,
+) -> (f64, f64) {
+    match edge {
+        ZoomSegmentEdge::Start => (
+            (start_secs + delta_secs)
+                .max(minimum_start_secs)
+                .min(end_secs - 0.01),
+            end_secs,
+        ),
+        ZoomSegmentEdge::End => (
+            start_secs,
+            (end_secs + delta_secs)
+                .min(maximum_end_secs)
+                .max(start_secs + 0.01),
         ),
     }
 }
@@ -3810,10 +4010,38 @@ fn zoom_transform_at(segments: &[ZoomSegment], time_secs: f64) -> blip_composito
     let attack = cubic_bezier_ease(zoom_in, 0.2, 0.8, 0.2, 1.0);
     let release = cubic_bezier_ease(zoom_out, 0.4, 0.0, 0.6, 1.0);
     let progress = attack.min(release) as f32;
-    blip_compositor::OutputTransform {
+    let mut transform = blip_compositor::OutputTransform {
         center: segment.target,
         scale: 1.0 + (segment.amount.clamp(1.0, 5.0) - 1.0) * progress,
+    };
+
+    if attack < 1.0
+        && let Some(previous) = segments
+            .iter()
+            .filter(|previous| {
+                previous.start_secs < segment.start_secs
+                    && previous.end_secs <= segment.start_secs
+                    && segment.start_secs < previous.end_secs + previous.transition.duration_secs()
+            })
+            .max_by(|a, b| a.start_secs.total_cmp(&b.start_secs))
+    {
+        let previous_transition_secs = previous.transition.duration_secs();
+        let previous_zoom_out = ((previous.end_secs + previous_transition_secs
+            - segment.start_secs)
+            / previous_transition_secs)
+            .clamp(0.0, 1.0);
+        let previous_progress = cubic_bezier_ease(previous_zoom_out, 0.4, 0.0, 0.6, 1.0) as f32;
+        let previous_scale = 1.0 + (previous.amount.clamp(1.0, 5.0) - 1.0) * previous_progress;
+        let incoming_scale = 1.0 + (segment.amount.clamp(1.0, 5.0) - 1.0) * release as f32;
+        let attack = attack as f32;
+        transform.center = [
+            previous.target[0] + (transform.center[0] - previous.target[0]) * attack,
+            previous.target[1] + (transform.center[1] - previous.target[1]) * attack,
+        ];
+        transform.scale = previous_scale + (incoming_scale - previous_scale) * attack;
     }
+
+    transform
 }
 
 fn cubic_bezier_ease(
@@ -4170,6 +4398,18 @@ fn timeline_ruler(view_start_secs: f64, view_duration_secs: f64) -> Div {
         )
 }
 
+fn timeline_timecode(time_secs: f64, fps: u32) -> String {
+    let fps = u64::from(fps.max(1));
+    let total_frames = (time_secs.max(0.0) * fps as f64).floor() as u64;
+    let total_seconds = total_frames / fps;
+    format!(
+        "{:02}:{:02}:{:02}",
+        total_seconds / 60,
+        total_seconds % 60,
+        total_frames % fps,
+    )
+}
+
 fn timeline_ruler_interval(seconds_per_pixel: f64) -> f64 {
     let target_interval = (seconds_per_pixel * 72.0).max(0.001);
     let magnitude = 10.0_f64.powf(target_interval.log10().floor());
@@ -4275,12 +4515,13 @@ mod tests {
     use crate::bundle::{BlipBundle, VideoSegment, ZoomSegment, ZoomTransitionSpeed};
 
     use super::{
-        VideoSegmentEdge, cubic_bezier_ease, cut_gap_label, edit_video_cut,
+        VideoSegmentEdge, ZoomSegmentEdge, cubic_bezier_ease, cut_gap_label, edit_video_cut,
         map_output_transform_to_item, panned_timeline_view, playback_position,
-        resize_video_segment_range, ripple_delete_ranges, ripple_insert_ranges, source_time_at,
-        timeline_range_fraction, timeline_ruler_interval, timeline_ruler_label,
-        timeline_segment_range_fraction, timeline_time_fraction, video_cut_gap_secs,
-        zoom_segment_range_at, zoom_transform_at, zoomed_timeline_view,
+        resize_video_segment_range, resize_zoom_segment_range, ripple_delete_ranges,
+        ripple_insert_ranges, source_time_at, timeline_range_fraction, timeline_ruler_interval,
+        timeline_ruler_label, timeline_segment_range_fraction, timeline_time_fraction,
+        timeline_timecode, video_cut_gap_secs, zoom_segment_range_at, zoom_transform_at,
+        zoomed_timeline_view,
     };
 
     #[test]
@@ -4403,6 +4644,12 @@ mod tests {
     }
 
     #[test]
+    fn timeline_timecode_formats_fractional_seconds_as_frames() {
+        assert_eq!(timeline_timecode(1.5, 60), "00:01:30");
+        assert_eq!(timeline_timecode(65.25, 30), "01:05:07");
+    }
+
+    #[test]
     fn maps_edited_timeline_time_to_source_time() {
         let bundle: BlipBundle = serde_json::from_str(
             r#"{
@@ -4482,6 +4729,30 @@ mod tests {
         assert_eq!(
             resize_video_segment_range(VideoSegmentEdge::Start, 1.5, 4.0, 0.0, 4.0, -10.0),
             (0.0, 4.0)
+        );
+    }
+
+    #[test]
+    fn zoom_segment_edges_resize_within_neighbor_bounds() {
+        assert_eq!(
+            resize_zoom_segment_range(ZoomSegmentEdge::Start, 4.0, 7.0, 2.0, 9.0, -10.0),
+            (2.0, 7.0)
+        );
+        assert_eq!(
+            resize_zoom_segment_range(ZoomSegmentEdge::End, 4.0, 7.0, 2.0, 9.0, 10.0),
+            (4.0, 9.0)
+        );
+    }
+
+    #[test]
+    fn zoom_segment_edges_preserve_a_minimum_duration() {
+        assert_eq!(
+            resize_zoom_segment_range(ZoomSegmentEdge::Start, 4.0, 7.0, 0.0, 10.0, 10.0),
+            (6.99, 7.0)
+        );
+        assert_eq!(
+            resize_zoom_segment_range(ZoomSegmentEdge::End, 4.0, 7.0, 0.0, 10.0, -10.0),
+            (4.0, 4.01)
         );
     }
 
@@ -4580,6 +4851,40 @@ mod tests {
         assert_eq!(zoom_transform_at(&[segment.clone()], 5.0).scale, 3.0);
         assert!(zoom_transform_at(&[segment.clone()], 5.125).scale > 2.5);
         assert_eq!(zoom_transform_at(&[segment], 5.5).scale, 1.0);
+    }
+
+    #[test]
+    fn overlapping_zoom_transitions_continue_from_the_outgoing_zoom() {
+        let first = ZoomSegment {
+            id: 1,
+            start_secs: 1.0,
+            end_secs: 3.0,
+            target: [0.2, 0.3],
+            amount: 3.0,
+            transition: ZoomTransitionSpeed::Medium,
+        };
+        let second = ZoomSegment {
+            id: 2,
+            start_secs: 3.25,
+            end_secs: 5.0,
+            target: [0.8, 0.7],
+            amount: 2.0,
+            transition: ZoomTransitionSpeed::Medium,
+        };
+        let outgoing_at_boundary = zoom_transform_at(&[first.clone()], second.start_secs);
+        let combined_at_boundary =
+            zoom_transform_at(&[first.clone(), second.clone()], second.start_secs);
+
+        assert_eq!(combined_at_boundary, outgoing_at_boundary);
+        assert_eq!(
+            zoom_transform_at(&[first, second.clone()], second.start_secs + 0.5),
+            zoom_transform_at(&[second.clone()], second.start_secs + 0.5)
+        );
+        assert_eq!(
+            zoom_transform_at(&[second.clone()], second.start_secs).scale,
+            1.0
+        );
+        assert!(combined_at_boundary.scale > 1.0);
     }
 
     #[test]

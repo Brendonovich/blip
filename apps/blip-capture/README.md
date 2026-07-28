@@ -44,3 +44,9 @@ finished app. Artifacts are written under `target/release/bundle/`.
 For Developer ID signing and notarization, use the same
 `APPLE_SIGNING_IDENTITY`, `APPLE_NOTARY_PROFILE`, `APPLE_ENTITLEMENTS`, and
 `BLIP_BUILD_NUMBER` settings documented by Blip Studio.
+
+Production bundles include Sparkle and check the app-specific GitHub release
+feed automatically. The release workflow publishes the corresponding appcast
+alongside each signed and notarized DMG. Developer ID builds require the public
+EdDSA key in `SPARKLE_PUBLIC_KEY`; releases use the matching base64 private key
+from the `SPARKLE_PRIVATE_KEY` Actions secret.

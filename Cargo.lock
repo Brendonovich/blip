@@ -764,10 +764,12 @@ dependencies = [
 name = "blip-capture"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "async-channel",
  "blip-avfoundation",
  "blip-compositor",
  "blip-sck",
+ "blip-updater",
  "chrono",
  "clap",
  "core-foundation 0.10.0",
@@ -843,6 +845,7 @@ dependencies = [
  "blip-avfoundation",
  "blip-compositor",
  "blip-sck",
+ "blip-updater",
  "clap",
  "core-foundation 0.10.0",
  "core-video",
@@ -854,6 +857,14 @@ dependencies = [
  "objc2 0.6.4",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "blip-updater"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "objc2 0.6.4",
 ]
 
 [[package]]

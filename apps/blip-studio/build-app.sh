@@ -86,6 +86,15 @@ rm -rf "$app" "$bundle_dir/Blip Studio.dSYM"
 mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
 cp "$binary" "$app/Contents/MacOS/blip-studio"
 cp "$script_dir/Info.plist" "$app/Contents/Info.plist"
+"$workspace/apps/embed-sparkle.sh" "$app" "$target_dir"
+
+if [[ "$identity" != "-" ]]; then
+    if [[ -z "${SPARKLE_PUBLIC_KEY:-}" ]]; then
+        print -u2 "Developer ID builds require SPARKLE_PUBLIC_KEY."
+        exit 2
+    fi
+    plutil -insert SUPublicEDKey -string "$SPARKLE_PUBLIC_KEY" "$app/Contents/Info.plist"
+fi
 
 plutil -replace CFBundleShortVersionString -string "$version" "$app/Contents/Info.plist"
 plutil -replace CFBundleVersion -string "$build_number" "$app/Contents/Info.plist"

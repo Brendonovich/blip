@@ -2647,6 +2647,7 @@ pub(crate) fn view(args: &StreamArgs) -> Result<(), Box<dyn Error>> {
     gpui_platform::application()
         .with_assets(StudioAssets)
         .run(move |cx: &mut App| {
+            blip_updater::start();
             NumericInput::bind_keys(cx);
             #[cfg(target_os = "macos")]
             {

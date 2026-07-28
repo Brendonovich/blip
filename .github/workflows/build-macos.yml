@@ -35,11 +35,13 @@ jobs:
       - name: Build Blip Capture DMG
         env:
           BLIP_BUILD_NUMBER: ${{ github.run_number }}
+          SPARKLE_PUBLIC_KEY: ${{ vars.SPARKLE_PUBLIC_KEY }}
         run: apps/blip-capture/build-app.sh --notarize
 
       - name: Build Blip Studio DMG
         env:
           BLIP_BUILD_NUMBER: ${{ github.run_number }}
+          SPARKLE_PUBLIC_KEY: ${{ vars.SPARKLE_PUBLIC_KEY }}
         run: apps/blip-studio/build-app.sh --notarize
 
       - name: Upload Blip Capture

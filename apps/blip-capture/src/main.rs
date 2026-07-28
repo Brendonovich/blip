@@ -37,6 +37,7 @@ use objc2_app_kit::{
 use objc2_foundation::{NSObject, NSObjectProtocol, NSPoint, NSString};
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 
+mod assets;
 mod bundle;
 mod editor;
 mod headless;
@@ -3127,11 +3128,12 @@ fn import_profile_urls(cx: &mut App, urls: Vec<String>) {
 
 fn run_app(open_path: Option<PathBuf>) {
     let (profile_sender, profile_receiver) = async_channel::unbounded();
-    let app = application();
+    let app = application().with_assets(assets::CaptureAssets);
     app.on_open_urls(move |urls| {
         profile_sender.try_send(urls).ok();
     });
     app.run(move |cx| {
+        blip_updater::start();
         cx.bind_keys([
             KeyBinding::new("cmd-w", CloseWindow, None),
             KeyBinding::new("cmd-q", CloseAllWindows, None),

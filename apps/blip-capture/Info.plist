@@ -37,5 +37,11 @@
     <true/>
     <key>NSScreenCaptureUsageDescription</key>
     <string>Blip Capture records your selected screen, window, or region.</string>
+    <key>SUEnableAutomaticChecks</key>
+    <true/>
+    <key>SUAutomaticallyUpdate</key>
+    <true/>
+    <key>SUFeedURL</key>
+    <string>https://github.com/Brendonovich/blip/releases/latest/download/Blip-Capture-appcast.xml</string>
 </dict>
 </plist>
