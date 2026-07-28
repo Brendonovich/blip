@@ -35,6 +35,8 @@
     <true/>
     <key>NSHighResolutionCapable</key>
     <true/>
+    <key>NSCameraUsageDescription</key>
+    <string>Blip Capture displays your selected camera in a movable preview window.</string>
     <key>NSScreenCaptureUsageDescription</key>
     <string>Blip Capture records your selected screen, window, or region.</string>
     <key>SUEnableAutomaticChecks</key>

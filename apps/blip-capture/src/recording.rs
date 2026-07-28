@@ -56,6 +56,7 @@ type HlsUploadSender = tokio::sync::mpsc::UnboundedSender<HlsUploadMessage>;
 
 pub(crate) fn spawn(
     spec: CaptureSpec,
+    camera_window_id: Option<u32>,
     output: PathBuf,
     completed_path: PathBuf,
     cleanup_on_failure: Option<PathBuf>,
@@ -96,6 +97,7 @@ pub(crate) fn spawn(
                 .map(|(sender, _)| sender.clone());
             let recording = record(
                 spec,
+                camera_window_id,
                 &output,
                 format,
                 &stop_receiver,
@@ -197,6 +199,7 @@ pub(crate) fn spawn(
 
 fn record(
     spec: CaptureSpec,
+    camera_window_id: Option<u32>,
     output: &Path,
     format: RecordingFormat,
     stop_receiver: &mpsc::Receiver<()>,
@@ -204,7 +207,7 @@ fn record(
     upload_assets: Option<HlsUploadSender>,
 ) -> Result<(), String> {
     let content = ShareableContent::current(CAPTURE_TIMEOUT).map_err(|error| error.to_string())?;
-    let (filter, source_rect) = capture_filter(&content, spec)?;
+    let (filter, source_rect) = capture_filter(&content, spec, camera_window_id)?;
     let mut config = StreamConfig::builder()
         .with_fps(60)
         .with_cursor(true)
@@ -261,6 +264,7 @@ type SourceRect = Option<(f64, f64, f64, f64)>;
 fn capture_filter(
     content: &ShareableContent,
     spec: CaptureSpec,
+    camera_window_id: Option<u32>,
 ) -> Result<(CaptureFilter, SourceRect), String> {
     let (display_id, source_rect) = match spec {
         CaptureSpec::Display(display_id) => (display_id, None),
@@ -297,6 +301,7 @@ fn capture_filter(
             .application()
             .is_some_and(|application| application.process_id() == process_id)
             && window.layer() != 0
+            && Some(window.id()) != camera_window_id
     });
     Ok((
         CaptureFilter::display(display)

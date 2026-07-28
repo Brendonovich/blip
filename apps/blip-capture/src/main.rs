@@ -8,6 +8,7 @@ use std::rc::Rc;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
+use blip_avfoundation::{CameraDevice, list_video_devices};
 use blip_sck::{CaptureError, Display, ShareableContent, Window as CaptureWindow};
 use chrono::Local;
 use clap::Parser;
@@ -34,11 +35,12 @@ use objc2_app_kit::{
     NSControlStateValueOn, NSMenu, NSMenuItem, NSRunningApplication, NSScreen, NSView,
     NSWindowAnimationBehavior, NSWindowCollectionBehavior, NSWindowStyleMask,
 };
-use objc2_foundation::{NSObject, NSObjectProtocol, NSPoint, NSString};
+use objc2_foundation::{NSObject, NSObjectProtocol, NSPoint, NSRect, NSSize, NSString};
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 
 mod assets;
 mod bundle;
+mod camera_preview;
 mod editor;
 mod headless;
 #[path = "../../blip-studio/src/numeric_input.rs"]
@@ -50,6 +52,7 @@ mod theme;
 mod upload;
 
 use bundle::BlipBundle;
+use camera_preview::CameraPreview;
 use editor::BundleEditor;
 use numeric_input::{NumericInput, NumericInputEvent};
 use profiles::{
@@ -89,7 +92,7 @@ actions!(
 #[allow(clippy::arithmetic_side_effects)]
 fn toolbar_dimensions_for_label(label: &str) -> (f32, f32) {
     let char_count = label.chars().count().clamp(3, 30);
-    let width = 344.0 + (char_count as f32 * 8.0);
+    let width = 448.0 + (char_count as f32 * 8.0);
     (width, 56.0)
 }
 type RegionSelection = (u32, f64, f64, f64, f64);
@@ -147,6 +150,41 @@ enum DestinationMenuAction {
     SelectProfile(usize),
     ToggleOpenRecording,
     OpenSettings,
+}
+
+struct CameraMenuAction(Option<usize>);
+
+struct CameraMenuHandlerIvars {
+    sender: async_channel::Sender<CameraMenuAction>,
+}
+
+define_class!(
+    #[unsafe(super(NSObject))]
+    #[ivars = CameraMenuHandlerIvars]
+    struct CameraMenuHandler;
+
+    unsafe impl NSObjectProtocol for CameraMenuHandler {}
+
+    impl CameraMenuHandler {
+        #[unsafe(method(selectCamera:))]
+        fn select_camera(&self, item: &NSMenuItem) {
+            let selected = usize::try_from(item.tag())
+                .ok()
+                .and_then(|tag| tag.checked_sub(1));
+            self.ivars()
+                .sender
+                .try_send(CameraMenuAction(selected))
+                .ok();
+        }
+    }
+);
+
+impl CameraMenuHandler {
+    fn new(sender: async_channel::Sender<CameraMenuAction>) -> Retained<Self> {
+        let this = Self::alloc().set_ivars(CameraMenuHandlerIvars { sender });
+        // SAFETY: The object has fully initialized ivars and NSObject permits `init`.
+        unsafe { msg_send![super(this), init] }
+    }
 }
 
 struct DestinationMenuHandlerIvars {
@@ -242,6 +280,11 @@ struct CaptureApp {
     escape_hotkey: Rc<Cell<*mut c_void>>,
     profiles: RecordingProfiles,
     destination_sender: async_channel::Sender<DestinationMenuAction>,
+    cameras: Vec<CameraDevice>,
+    selected_camera: Option<usize>,
+    camera_sender: async_channel::Sender<CameraMenuAction>,
+    camera_window: Option<AnyWindowHandle>,
+    camera_window_id: Option<u32>,
     recording_completion_action: CompletionAction,
     open_recording_when_finished: bool,
     drag_start_window_position: Option<Point<Pixels>>,
@@ -272,12 +315,28 @@ impl CaptureApp {
         });
         let (event_sender, receiver) = async_channel::unbounded();
         let (destination_sender, destination_receiver) = async_channel::unbounded();
+        let cameras = list_video_devices().unwrap_or_else(|error| {
+            eprintln!("blip-capture: failed to list cameras: {error}");
+            Vec::new()
+        });
+        let (camera_sender, camera_receiver) = async_channel::unbounded();
         cx.spawn(async move |app, cx| {
             while let Ok(event) = receiver.recv().await {
                 let finished = app
                     .update(cx, |app, cx| app.handle_event(event, cx))
                     .unwrap_or(false);
                 if finished {
+                    break;
+                }
+            }
+        })
+        .detach();
+        cx.spawn(async move |app, cx| {
+            while let Ok(CameraMenuAction(selected)) = camera_receiver.recv().await {
+                if app
+                    .update(cx, |app, cx| app.select_camera(selected, cx))
+                    .is_err()
+                {
                     break;
                 }
             }
@@ -365,6 +424,11 @@ impl CaptureApp {
             escape_hotkey,
             profiles,
             destination_sender,
+            cameras,
+            selected_camera: None,
+            camera_sender,
+            camera_window: None,
+            camera_window_id: None,
             recording_completion_action: CompletionAction::None,
             open_recording_when_finished: true,
             drag_start_window_position: None,
@@ -494,6 +558,60 @@ impl CaptureApp {
         {
             self.error = Some("Failed to open the destination menu".into());
             cx.notify();
+        }
+    }
+
+    fn show_camera_menu(&mut self, window: &Window, cx: &mut Context<Self>) {
+        if schedule_camera_menu(
+            window,
+            self.cameras
+                .iter()
+                .map(|camera| camera.localized_name().to_owned())
+                .collect(),
+            self.selected_camera,
+            self.camera_sender.clone(),
+        )
+        .is_err()
+        {
+            self.error = Some("Failed to open the camera menu".into());
+            cx.notify();
+        }
+    }
+
+    fn select_camera(&mut self, selected: Option<usize>, cx: &mut Context<Self>) {
+        self.close_camera_window(cx);
+        self.selected_camera = selected;
+        let Some(device) = selected.and_then(|index| self.cameras.get(index)).cloned() else {
+            cx.notify();
+            return;
+        };
+        let options = camera_window_options(cx);
+        let camera_sender = self.camera_sender.clone();
+        match cx.open_window(options, move |_, cx| {
+            cx.new(|cx| CameraPreview::new(device, camera_sender, cx))
+        }) {
+            Ok(preview) => {
+                self.camera_window_id = preview
+                    .update(cx, |_, window, _| configure_camera_window(window))
+                    .ok()
+                    .flatten();
+                self.camera_window = Some(preview.into());
+                self.error = None;
+            }
+            Err(error) => {
+                self.selected_camera = None;
+                self.error = Some(format!("Failed to open camera preview: {error}"));
+            }
+        }
+        cx.notify();
+    }
+
+    fn close_camera_window(&mut self, cx: &mut Context<Self>) {
+        self.camera_window_id = None;
+        if let Some(preview) = self.camera_window.take() {
+            preview
+                .update(cx, |_, window, _| window.remove_window())
+                .ok();
         }
     }
 
@@ -715,6 +833,7 @@ impl CaptureApp {
         };
         let sender = match recording::spawn(
             spec,
+            self.camera_window_id,
             output.media_path,
             output.completed_path,
             output.cleanup_on_failure,
@@ -775,6 +894,7 @@ impl CaptureApp {
         let application = topmost_application_pid();
         self.selection.recording.set(false);
         self.close_selection_windows(cx);
+        self.close_camera_window(cx);
         self.visible.set(false);
         unregister_escape_hotkey(&self.escape_hotkey);
         window.remove_window();
@@ -874,6 +994,7 @@ impl CaptureApp {
                 }
                 self.selection.recording.set(false);
                 self.close_selection_windows(cx);
+                self.close_camera_window(cx);
                 self.visible.set(false);
                 unregister_escape_hotkey(&self.escape_hotkey);
                 let controller = self.controller_window;
@@ -1028,6 +1149,21 @@ impl Render for CaptureApp {
                 .child(self.mode_button(Mode::Display, "Display", cx))
                 .child(self.mode_button(Mode::Window, "Window", cx))
                 .child(self.mode_button(Mode::Region, "Region", cx))
+                .child(
+                    overlay_secondary_button(
+                        "camera",
+                        if self.selected_camera.is_some() {
+                            "Camera: On"
+                        } else {
+                            "Camera: Off"
+                        },
+                    )
+                    .on_click(cx.listener(|app, _, window, cx| {
+                        if !app.was_dragged(window) {
+                            app.show_camera_menu(window, cx);
+                        }
+                    })),
+                )
                 .child(
                     div()
                         .mx_1()
@@ -2510,7 +2646,7 @@ fn configure_toolbar_window(window: &Window) {
     let Some(window) = view.window() else {
         return;
     };
-    window.setStyleMask(NSWindowStyleMask::NonactivatingPanel);
+    window.setStyleMask(NSWindowStyleMask::NonactivatingPanel | NSWindowStyleMask::Resizable);
     window.setHasShadow(false);
     window.setAnimationBehavior(NSWindowAnimationBehavior::None);
     // SAFETY: CoreGraphics accepts this documented window-level key without additional state.
@@ -2524,6 +2660,63 @@ fn configure_toolbar_window(window: &Window) {
             | NSWindowCollectionBehavior::FullScreenAuxiliary,
     );
     window.orderFrontRegardless();
+}
+
+fn configure_camera_window(window: &Window) -> Option<u32> {
+    let handle = HasWindowHandle::window_handle(window).ok()?;
+    let RawWindowHandle::AppKit(handle) = handle.as_raw() else {
+        return None;
+    };
+    // SAFETY: GPUI's AppKit handle points to the live NSView owned by this main-thread window.
+    let view = unsafe { handle.ns_view.cast::<NSView>().as_ref() };
+    let window = view.window()?;
+    window.setStyleMask(NSWindowStyleMask::NonactivatingPanel);
+    window.setHasShadow(false);
+    window.setAnimationBehavior(NSWindowAnimationBehavior::None);
+    // SAFETY: CoreGraphics accepts this documented window-level key without additional state.
+    let maximum_level = unsafe { CGWindowLevelForKey(CG_MAXIMUM_WINDOW_LEVEL_KEY) };
+    let level = isize::try_from(maximum_level.saturating_sub(1)).ok()?;
+    window.setLevel(level);
+    window.setCollectionBehavior(
+        NSWindowCollectionBehavior::CanJoinAllSpaces
+            | NSWindowCollectionBehavior::FullScreenAuxiliary,
+    );
+    window.orderFrontRegardless();
+    u32::try_from(window.windowNumber()).ok()
+}
+
+pub(crate) fn set_camera_window_bounds(window: &Window, bounds: Bounds<Pixels>) {
+    let Ok(handle) = HasWindowHandle::window_handle(window) else {
+        return;
+    };
+    let RawWindowHandle::AppKit(handle) = handle.as_raw() else {
+        return;
+    };
+    let view_address = handle.ns_view.as_ptr() as usize;
+    let origin = bounds.origin.map(f64::from);
+    let size = bounds.size.map(f64::from);
+    DispatchQueue::main().exec_async(move || {
+        let Some(view) = NonNull::new(view_address as *mut c_void) else {
+            return;
+        };
+        // SAFETY: The camera window owns this GPUI view for the duration of an active resize.
+        let view = unsafe { view.cast::<NSView>().as_ref() };
+        let Some(window) = view.window() else {
+            return;
+        };
+        let Some(screen) = window.screen() else {
+            return;
+        };
+        let screen_frame = NSScreen::frame(&screen);
+        let frame = NSRect::new(
+            NSPoint::new(
+                screen_frame.origin.x + origin.x,
+                screen_frame.origin.y + screen_frame.size.height - origin.y - size.height,
+            ),
+            NSSize::new(size.width, size.height),
+        );
+        window.setFrame_display(frame, true);
+    });
 }
 
 fn set_toolbar_window_visible(window: &Window, visible: bool) {
@@ -2543,6 +2736,73 @@ fn set_toolbar_window_visible(window: &Window, visible: bool) {
     } else {
         window.orderOut(None);
     }
+}
+
+#[allow(clippy::as_conversions)]
+fn schedule_camera_menu(
+    window: &Window,
+    camera_names: Vec<String>,
+    selected: Option<usize>,
+    sender: async_channel::Sender<CameraMenuAction>,
+) -> Result<(), ()> {
+    let handle = HasWindowHandle::window_handle(window).map_err(|_| ())?;
+    let RawWindowHandle::AppKit(handle) = handle.as_raw() else {
+        return Err(());
+    };
+    let view_address = handle.ns_view.as_ptr() as usize;
+    DispatchQueue::main().exec_async(move || {
+        let Some(view) = NonNull::new(view_address as *mut c_void) else {
+            return;
+        };
+        native_camera_menu(view, &camera_names, selected, sender);
+    });
+    Ok(())
+}
+
+#[allow(clippy::arithmetic_side_effects)]
+fn native_camera_menu(
+    view: NonNull<c_void>,
+    camera_names: &[String],
+    selected: Option<usize>,
+    sender: async_channel::Sender<CameraMenuAction>,
+) -> Option<()> {
+    // SAFETY: GPUI's AppKit handle points to the live NSView owned by this main-thread window.
+    let view = unsafe { view.cast::<NSView>().as_ref() };
+    let main_thread = MainThreadMarker::new()?;
+    let menu = NSMenu::new(main_thread);
+    menu.setAutoenablesItems(false);
+    menu.setMinimumWidth(180.0);
+    let handler = CameraMenuHandler::new(sender);
+    let empty = NSString::from_str("");
+    for (tag, name) in std::iter::once("No Camera")
+        .chain(camera_names.iter().map(String::as_str))
+        .enumerate()
+    {
+        // SAFETY: The handler implements `selectCamera:` with the NSMenuItem signature.
+        let item = unsafe {
+            NSMenuItem::initWithTitle_action_keyEquivalent(
+                NSMenuItem::alloc(main_thread),
+                &NSString::from_str(name),
+                Some(sel!(selectCamera:)),
+                &empty,
+            )
+        };
+        item.setTag(isize::try_from(tag).ok()?);
+        // SAFETY: `handler` implements the selector and outlives menu tracking.
+        unsafe { item.setTarget(Some(&handler)) };
+        if selected.map_or(tag == 0, |index| tag == index.saturating_add(1)) {
+            item.setState(NSControlStateValueOn);
+        }
+        menu.addItem(&item);
+    }
+    menu.update();
+    let bounds = view.bounds();
+    menu.popUpMenuPositioningItem_atLocation_inView(
+        None,
+        NSPoint::new(250.0, bounds.size.height + menu.size().height),
+        Some(view),
+    );
+    Some(())
 }
 
 #[allow(clippy::arithmetic_side_effects)]
@@ -2677,6 +2937,37 @@ fn toolbar_options(cx: &App, profiles: &RecordingProfiles) -> WindowOptions {
         app_owns_titlebar_drag: true,
         is_resizable: false,
         is_minimizable: false,
+        ..Default::default()
+    }
+}
+
+#[allow(clippy::arithmetic_side_effects)]
+fn camera_window_options(cx: &App) -> WindowOptions {
+    let preview_size = size(px(320.0), px(222.0));
+    let bounds = cx.primary_display().map_or_else(
+        || Bounds::centered(None, preview_size, cx),
+        |display| {
+            let screen = display.bounds();
+            Bounds::new(
+                point(
+                    screen.origin.x + screen.size.width - preview_size.width - px(32.0),
+                    screen.origin.y + screen.size.height - preview_size.height - px(32.0),
+                ),
+                preview_size,
+            )
+        },
+    );
+    WindowOptions {
+        window_bounds: Some(WindowBounds::Windowed(bounds)),
+        titlebar: None,
+        window_background: WindowBackgroundAppearance::Transparent,
+        kind: WindowKind::PopUp,
+        is_movable: true,
+        app_owns_titlebar_drag: true,
+        is_resizable: true,
+        is_minimizable: false,
+        focus: false,
+        window_min_size: Some(size(px(160.0), px(132.0))),
         ..Default::default()
     }
 }
@@ -3325,14 +3616,14 @@ mod tests {
 
     #[test]
     fn calculates_dynamic_toolbar_dimensions() {
-        assert_eq!(super::toolbar_dimensions_for_label("Dev"), (368.0, 56.0));
+        assert_eq!(super::toolbar_dimensions_for_label("Dev"), (472.0, 56.0));
         assert_eq!(
             super::toolbar_dimensions_for_label("Prod Server"),
-            (432.0, 56.0)
+            (536.0, 56.0)
         );
         assert_eq!(
             super::toolbar_dimensions_for_label("A Very Long Server Name That Exceeds Max"),
-            (584.0, 56.0)
+            (688.0, 56.0)
         );
     }
 

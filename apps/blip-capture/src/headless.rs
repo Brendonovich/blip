@@ -72,6 +72,7 @@ pub(crate) fn run(args: &CaptureArgs) -> Result<String, String> {
     let (event_sender, event_receiver) = async_channel::unbounded();
     let stop_sender = crate::recording::spawn(
         CaptureSpec::Display(display.id()),
+        None,
         output.media_path,
         output.completed_path,
         output.cleanup_on_failure,

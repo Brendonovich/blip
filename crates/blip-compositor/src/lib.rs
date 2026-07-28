@@ -318,6 +318,31 @@ impl FrameCompositor {
         items: &[CompositorItem],
         output_dimensions: (usize, usize),
     ) -> Result<CVPixelBuffer> {
+        self.render_with_clear_color(sources, items, output_dimensions, wgpu::Color::BLACK)
+    }
+
+    /// Renders the items over transparency into a pooled BGRA pixel buffer.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Self::render`].
+    pub fn render_transparent(
+        &mut self,
+        sources: &[CompositorSource<'_>],
+        items: &[CompositorItem],
+        output_dimensions: (usize, usize),
+    ) -> Result<CVPixelBuffer> {
+        self.render_with_clear_color(sources, items, output_dimensions, wgpu::Color::TRANSPARENT)
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn render_with_clear_color(
+        &mut self,
+        sources: &[CompositorSource<'_>],
+        items: &[CompositorItem],
+        output_dimensions: (usize, usize),
+        clear_color: wgpu::Color,
+    ) -> Result<CVPixelBuffer> {
         let (output_width, output_height) = output_dimensions;
         let output = self.output_pixel_buffer(output_width, output_height)?;
         let output_texture = self.import_pixel_buffer_plane(
@@ -443,7 +468,7 @@ impl FrameCompositor {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("blip frame compositor"),
             });
-        self.render_frame(&mut encoder, &output_view, &bind_groups);
+        self.render_frame(&mut encoder, &output_view, &bind_groups, clear_color);
         let submission = self.queue.submit([encoder.finish()]);
         self.device
             .poll(wgpu::PollType::Wait {
@@ -505,6 +530,7 @@ impl FrameCompositor {
         encoder: &mut wgpu::CommandEncoder,
         output: &wgpu::TextureView,
         bind_groups: &[shader::WgpuBindGroup0],
+        clear_color: wgpu::Color,
     ) {
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("blip frame composition"),
@@ -513,7 +539,7 @@ impl FrameCompositor {
                 depth_slice: None,
                 resolve_target: None,
                 ops: wgpu::Operations {
-                    load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                    load: wgpu::LoadOp::Clear(clear_color),
                     store: wgpu::StoreOp::Store,
                 },
             })],
@@ -646,7 +672,7 @@ impl FrameCompositor {
                 plane,
             )
             .map_err(|status| anyhow!("failed to import frame into Metal ({status})"))?;
-        let hal_texture = hal_texture(&cv_texture, width, height)?;
+        let hal_texture = hal_texture(&cv_texture, format, width, height)?;
         let descriptor = wgpu::TextureDescriptor {
             label: Some(label),
             size: wgpu::Extent3d {
@@ -751,6 +777,7 @@ fn output_pixel_buffer_pool(width: usize, height: usize) -> Result<CVPixelBuffer
 
 fn hal_texture(
     texture: &CVMetalTexture,
+    format: wgpu::TextureFormat,
     width: u32,
     height: u32,
 ) -> Result<wgpu::hal::metal::Texture> {
@@ -762,11 +789,12 @@ fn hal_texture(
             .ok_or_else(|| anyhow!("CoreVideo returned no Metal texture"))?;
         Retained::cast_unchecked::<ProtocolObject<dyn MTLTexture>>(object)
     };
-    // SAFETY: The retained object is a 2D BGRA texture with one layer and mip level.
+    // SAFETY: The retained object is a 2D texture with the supplied plane format, one layer, and
+    // one mip level.
     Ok(unsafe {
         HalMetalDevice::texture_from_raw(
             retained,
-            wgpu::TextureFormat::Bgra8Unorm,
+            format,
             MTLTextureType::Type2D,
             1,
             1,
