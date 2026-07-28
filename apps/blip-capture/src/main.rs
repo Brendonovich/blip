@@ -255,6 +255,7 @@ impl CaptureApp {
         controller_window: AnyWindowHandle,
         visible: Rc<Cell<bool>>,
         escape_hotkey: Rc<Cell<*mut c_void>>,
+        profiles: RecordingProfiles,
         cx: &mut Context<Self>,
     ) -> Self {
         let displays = targets.displays.clone();
@@ -362,7 +363,7 @@ impl CaptureApp {
             event_sender,
             visible,
             escape_hotkey,
-            profiles: RecordingProfiles::load(),
+            profiles,
             destination_sender,
             recording_completion_action: CompletionAction::None,
             open_recording_when_finished: true,
@@ -729,6 +730,7 @@ impl CaptureApp {
             }
         };
         self.recording_completion_action = profile.completion_action;
+        unregister_escape_hotkey(&self.escape_hotkey);
         self.selection.recording.set(true);
         self.refresh_selection_windows(cx);
         self.close_interaction_windows(cx);
@@ -794,6 +796,10 @@ impl CaptureApp {
     }
 
     fn escape(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !matches!(self.status, Status::Idle) {
+            return;
+        }
+
         if self.mode.take().is_some() {
             self.selected_display = 0;
             self.selected_window = None;
@@ -885,6 +891,12 @@ impl CaptureApp {
                 self.stop_sender = None;
                 self.selection.recording.set(false);
                 self.error = Some(message);
+                match register_escape_hotkey() {
+                    Ok(hotkey) => self.escape_hotkey.set(hotkey),
+                    Err(status) => {
+                        eprintln!("blip-capture: failed to register Escape ({status})");
+                    }
+                }
                 let dimensions = self.idle_toolbar_dimensions();
                 self.resize_toolbar(dimensions, cx);
                 let controller = self.controller_window;
@@ -2637,8 +2649,7 @@ fn native_destination_menu(
 }
 
 #[allow(clippy::arithmetic_side_effects)]
-fn toolbar_options(cx: &App) -> WindowOptions {
-    let profiles = RecordingProfiles::load();
+fn toolbar_options(cx: &App, profiles: &RecordingProfiles) -> WindowOptions {
     let label = profiles
         .selected()
         .map_or("Profile", |profile| profile.name.as_str());
@@ -2987,8 +2998,9 @@ fn open_capture(
         target_cache.replace(Some(targets.clone()));
         targets
     };
-    let options = toolbar_options(cx);
-    let app = match cx.open_window(options, |window, cx| {
+    let profiles = RecordingProfiles::load();
+    let options = toolbar_options(cx, &profiles);
+    let app = match cx.open_window(options, move |window, cx| {
         let window_handle = Window::window_handle(window);
         cx.new(|cx| {
             CaptureApp::new(
@@ -2996,6 +3008,7 @@ fn open_capture(
                 window_handle,
                 Rc::clone(visible),
                 Rc::clone(escape_hotkey),
+                profiles,
                 cx,
             )
         })
@@ -3011,8 +3024,10 @@ fn open_capture(
         Err(status) => eprintln!("blip-capture: failed to register Escape ({status})"),
     }
     visible.set(true);
-    app.update(cx, |_, window, _| {
+    app.update(cx, |app, window, _| {
         configure_toolbar_window(window);
+        let (width, height) = app.idle_toolbar_dimensions();
+        window.resize(size(px(width), px(height)));
     })
     .ok();
 }
@@ -3152,12 +3167,6 @@ fn run_app(open_path: Option<PathBuf>) {
         set_activation_policy(NSApplicationActivationPolicy::Accessory);
         cx.on_window_closed(|cx, _| refresh_activation_policy(cx))
             .detach();
-        if let Some(path) = open_path {
-            if let Err(error) = BundleEditor::open(path, cx) {
-                eprintln!("blip-capture: {error}");
-            }
-            return;
-        }
         NumericInput::bind_keys(cx);
         let visible = Rc::new(Cell::new(false));
         let escape_hotkey = Rc::new(Cell::new(ptr::null_mut()));
@@ -3191,7 +3200,13 @@ fn run_app(open_path: Option<PathBuf>) {
             }
         })
         .detach();
-        open_capture(cx, &visible, &escape_hotkey, &target_cache);
+        if let Some(path) = open_path {
+            if let Err(error) = BundleEditor::open(path, cx) {
+                eprintln!("blip-capture: {error}");
+            }
+        } else {
+            open_capture(cx, &visible, &escape_hotkey, &target_cache);
+        }
     });
 }
 

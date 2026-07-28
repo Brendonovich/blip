@@ -1,5 +1,6 @@
 use objc2::rc::Retained;
 use objc2_core_foundation::{CGPoint, CGRect, CGSize};
+use objc2_core_graphics::kCGColorSpaceSRGB;
 use objc2_core_media::CMTime;
 use objc2_core_video::{kCVPixelFormatType_32BGRA, kCVPixelFormatType_420YpCbCr8BiPlanarFullRange};
 use objc2_screen_capture_kit::SCStreamConfiguration;
@@ -15,6 +16,11 @@ pub enum PixelFormat {
     Bgra,
     /// Eight-bit full-range 4:2:0 YCbCr with separate luma and chroma planes.
     Yuv420BiPlanarFullRange,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum CaptureColorSpace {
+    Srgb,
 }
 
 impl PixelFormat {
@@ -44,6 +50,7 @@ pub struct StreamConfigBuilder {
     shows_cursor: bool,
     queue_depth: Option<u8>,
     pixel_format: PixelFormat,
+    color_space: Option<CaptureColorSpace>,
     source_rect: Option<(f64, f64, f64, f64)>,
 }
 
@@ -90,6 +97,13 @@ impl StreamConfigBuilder {
     #[must_use]
     pub fn with_pixel_format(mut self, pixel_format: PixelFormat) -> Self {
         self.pixel_format = pixel_format;
+        self
+    }
+
+    /// Requests color conversion into a known output color space.
+    #[must_use]
+    pub fn with_color_space(mut self, color_space: CaptureColorSpace) -> Self {
+        self.color_space = Some(color_space);
         self
     }
 
@@ -152,6 +166,12 @@ impl StreamConfigBuilder {
                 config.setQueueDepth(isize::from(queue_depth));
             }
             config.setPixelFormat(self.pixel_format.as_raw());
+            if let Some(color_space) = self.color_space {
+                let name = match color_space {
+                    CaptureColorSpace::Srgb => kCGColorSpaceSRGB,
+                };
+                config.setColorSpaceName(name);
+            }
             config.setShowsCursor(self.shows_cursor);
             if let Some((x, y, width, height)) = self.source_rect {
                 config.setSourceRect(CGRect::new(CGPoint::new(x, y), CGSize::new(width, height)));

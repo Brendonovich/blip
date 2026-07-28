@@ -17,6 +17,8 @@ pub(crate) struct BlipBundle {
     pub(crate) zoom_segments: Vec<ZoomSegment>,
     #[serde(default, skip_serializing)]
     pub(crate) video_segments: Option<Vec<VideoSegment>>,
+    #[serde(default, skip_serializing)]
+    pub(crate) video_segment_resize_mode: VideoSegmentResizeMode,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -25,6 +27,8 @@ struct ProjectConfig {
     zoom_segments: Vec<ZoomSegment>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     video_segments: Option<Vec<VideoSegment>>,
+    #[serde(default)]
+    video_segment_resize_mode: VideoSegmentResizeMode,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -39,6 +43,14 @@ pub(crate) struct VideoSegment {
     pub(crate) id: u64,
     pub(crate) source_start_secs: f64,
     pub(crate) source_end_secs: f64,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum VideoSegmentResizeMode {
+    #[default]
+    Ghost,
+    Live,
 }
 
 impl VideoSegment {
@@ -93,6 +105,7 @@ impl BlipBundle {
             }],
             zoom_segments: Vec::new(),
             video_segments: None,
+            video_segment_resize_mode: VideoSegmentResizeMode::default(),
         };
         if let Err(error) = bundle.save_manifest(path) {
             fs::remove_dir_all(path).ok();
@@ -112,6 +125,7 @@ impl BlipBundle {
                     .map_err(|error| format!("failed to decode project config: {error}"))?;
                 bundle.zoom_segments = config.zoom_segments;
                 bundle.video_segments = config.video_segments;
+                bundle.video_segment_resize_mode = config.video_segment_resize_mode;
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(format!("failed to read project config: {error}")),
@@ -137,6 +151,7 @@ impl BlipBundle {
         let config = ProjectConfig {
             zoom_segments: self.zoom_segments.clone(),
             video_segments: self.video_segments.clone(),
+            video_segment_resize_mode: self.video_segment_resize_mode,
         };
         let contents = serde_json::to_string_pretty(&config)
             .map_err(|error| format!("failed to encode project config: {error}"))?;
@@ -149,7 +164,7 @@ impl BlipBundle {
 mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use super::{BlipBundle, VideoSegment};
+    use super::{BlipBundle, VideoSegment, VideoSegmentResizeMode};
 
     #[test]
     fn creates_a_manifest_and_separate_screen_input() {
@@ -177,6 +192,10 @@ mod tests {
         );
         assert!(bundle.zoom_segments.is_empty());
         assert!(bundle.video_segments.is_none());
+        assert_eq!(
+            bundle.video_segment_resize_mode,
+            VideoSegmentResizeMode::Ghost
+        );
 
         std::fs::remove_dir_all(path).ok();
     }
@@ -224,6 +243,7 @@ mod tests {
             source_start_secs: 1.0,
             source_end_secs: 2.0,
         }]);
+        bundle.video_segment_resize_mode = VideoSegmentResizeMode::Live;
 
         bundle
             .save_project_config(&path)
@@ -234,13 +254,17 @@ mod tests {
             manifest
         );
         assert!(path.join("project-config.json").is_file());
+        let loaded = BlipBundle::load(&path).expect("load bundle");
         assert_eq!(
-            BlipBundle::load(&path)
-                .expect("load bundle")
+            loaded
                 .video_segments
                 .as_deref()
                 .map(|segments| segments.len()),
             Some(1)
+        );
+        assert_eq!(
+            loaded.video_segment_resize_mode,
+            VideoSegmentResizeMode::Live
         );
 
         std::fs::remove_dir_all(path).ok();

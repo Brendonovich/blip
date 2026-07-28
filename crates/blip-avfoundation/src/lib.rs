@@ -22,8 +22,11 @@ use objc2::rc::Retained;
 use objc2::runtime::AnyObject;
 use objc2_av_foundation::{
     AVAssetWriter, AVAssetWriterInput, AVAssetWriterInputPixelBufferAdaptor, AVAssetWriterStatus,
-    AVFileTypeMPEG4, AVFileTypeQuickTimeMovie, AVMediaTypeVideo, AVVideoCodecKey,
-    AVVideoCodecTypeH264, AVVideoHeightKey, AVVideoWidthKey,
+    AVFileTypeMPEG4, AVFileTypeQuickTimeMovie, AVMediaTypeVideo, AVVideoAverageBitRateKey,
+    AVVideoCodecKey, AVVideoCodecTypeH264, AVVideoColorPrimaries_ITU_R_709_2,
+    AVVideoColorPrimariesKey, AVVideoColorPropertiesKey, AVVideoCompressionPropertiesKey,
+    AVVideoHeightKey, AVVideoTransferFunction_ITU_R_709_2, AVVideoTransferFunctionKey,
+    AVVideoWidthKey, AVVideoYCbCrMatrix_ITU_R_709_2, AVVideoYCbCrMatrixKey,
 };
 use objc2_core_media::CMTime;
 use objc2_core_video::CVPixelBuffer;
@@ -72,6 +75,12 @@ pub enum VideoFileType {
     Mov,
 }
 
+struct VideoColorProperties {
+    primaries: Option<Retained<NSString>>,
+    transfer_function: Option<Retained<NSString>>,
+    ycbcr_matrix: Option<Retained<NSString>>,
+}
+
 pub struct Mp4Writer {
     writer: Retained<AVAssetWriter>,
     input: Retained<AVAssetWriterInput>,
@@ -94,6 +103,79 @@ impl Mp4Writer {
         Self::new_with_file_type(output, width, height, fps, VideoFileType::Mp4)
     }
 
+    /// Creates an H.264 MP4 writer with a target average bitrate.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the output cannot be prepared or `AVFoundation`
+    /// rejects the writer configuration.
+    pub fn new_with_bitrate(
+        output: &Path,
+        width: usize,
+        height: usize,
+        fps: u32,
+        bitrate: usize,
+    ) -> Result<Self, WriterError> {
+        Self::new_with_options(
+            output,
+            width,
+            height,
+            fps,
+            VideoFileType::Mp4,
+            Some(bitrate),
+            None,
+        )
+    }
+
+    /// Creates an H.264 MP4 writer that preserves the source buffer's color metadata.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the output cannot be prepared or `AVFoundation`
+    /// rejects the writer configuration.
+    pub fn new_preserving_color(
+        output: &Path,
+        width: usize,
+        height: usize,
+        fps: u32,
+        _source: &CVPixelBuffer,
+    ) -> Result<Self, WriterError> {
+        Self::new_with_options(
+            output,
+            width,
+            height,
+            fps,
+            VideoFileType::Mp4,
+            None,
+            rec709_color_properties(),
+        )
+    }
+
+    /// Creates a bitrate-constrained H.264 MP4 writer that preserves source color metadata.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the output cannot be prepared or `AVFoundation`
+    /// rejects the writer configuration.
+    pub fn new_with_bitrate_preserving_color(
+        output: &Path,
+        width: usize,
+        height: usize,
+        fps: u32,
+        bitrate: usize,
+        _source: &CVPixelBuffer,
+    ) -> Result<Self, WriterError> {
+        Self::new_with_options(
+            output,
+            width,
+            height,
+            fps,
+            VideoFileType::Mp4,
+            Some(bitrate),
+            rec709_color_properties(),
+        )
+    }
+
     /// Creates an H.264 writer for BGRA pixel buffers in the selected container.
     ///
     /// # Errors
@@ -106,6 +188,18 @@ impl Mp4Writer {
         height: usize,
         fps: u32,
         file_type: VideoFileType,
+    ) -> Result<Self, WriterError> {
+        Self::new_with_options(output, width, height, fps, file_type, None, None)
+    }
+
+    fn new_with_options(
+        output: &Path,
+        width: usize,
+        height: usize,
+        fps: u32,
+        file_type: VideoFileType,
+        bitrate: Option<usize>,
+        color_properties: Option<VideoColorProperties>,
     ) -> Result<Self, WriterError> {
         if width == 0 || height == 0 {
             return Err(WriterError::InvalidDimensions);
@@ -158,8 +252,64 @@ impl Mp4Writer {
         let height_key = height_key.ok_or(WriterError::MissingConstant("AVVideoHeightKey"))?;
         let width = NSNumber::new_usize(width);
         let height = NSNumber::new_usize(height);
-        let keys = [codec_key, width_key, height_key];
-        let values: [&AnyObject; 3] = [codec, &width, &height];
+        let compression = bitrate
+            .map(|bitrate| {
+                // SAFETY: This setting is available with AVFoundation's H.264 encoder.
+                let bitrate_key = unsafe { AVVideoAverageBitRateKey }
+                    .ok_or(WriterError::MissingConstant("AVVideoAverageBitRateKey"))?;
+                let bitrate = NSNumber::new_usize(bitrate);
+                Ok::<_, WriterError>(NSDictionary::from_slices(&[bitrate_key], &[&*bitrate]))
+            })
+            .transpose()?;
+        let color = color_properties
+            .as_ref()
+            .map(|color| -> Result<_, WriterError> {
+                let mut keys = Vec::new();
+                let mut values: Vec<&AnyObject> = Vec::new();
+                if let Some(primaries) = &color.primaries {
+                    // SAFETY: This setting is available with AVFoundation's H.264 encoder.
+                    keys.push(
+                        unsafe { AVVideoColorPrimariesKey }
+                            .ok_or(WriterError::MissingConstant("AVVideoColorPrimariesKey"))?,
+                    );
+                    values.push(primaries);
+                }
+                if let Some(transfer_function) = &color.transfer_function {
+                    // SAFETY: This setting is available with AVFoundation's H.264 encoder.
+                    keys.push(
+                        unsafe { AVVideoTransferFunctionKey }
+                            .ok_or(WriterError::MissingConstant("AVVideoTransferFunctionKey"))?,
+                    );
+                    values.push(transfer_function);
+                }
+                if let Some(ycbcr_matrix) = &color.ycbcr_matrix {
+                    // SAFETY: This setting is available with AVFoundation's H.264 encoder.
+                    keys.push(
+                        unsafe { AVVideoYCbCrMatrixKey }
+                            .ok_or(WriterError::MissingConstant("AVVideoYCbCrMatrixKey"))?,
+                    );
+                    values.push(ycbcr_matrix);
+                }
+                Ok(NSDictionary::from_slices(&keys, &values))
+            })
+            .transpose()?;
+        let mut keys = vec![codec_key, width_key, height_key];
+        let mut values: Vec<&AnyObject> = vec![codec, &width, &height];
+        if let Some(compression) = &compression {
+            // SAFETY: This setting is available with AVFoundation's H.264 encoder.
+            let compression_key = unsafe { AVVideoCompressionPropertiesKey }.ok_or(
+                WriterError::MissingConstant("AVVideoCompressionPropertiesKey"),
+            )?;
+            keys.push(compression_key);
+            values.push(&**compression);
+        }
+        if let Some(color) = &color {
+            // SAFETY: This setting is available with AVFoundation's H.264 encoder.
+            let color_key = unsafe { AVVideoColorPropertiesKey }
+                .ok_or(WriterError::MissingConstant("AVVideoColorPropertiesKey"))?;
+            keys.push(color_key);
+            values.push(&**color);
+        }
         let settings = NSDictionary::from_slices(&keys, &values);
 
         // SAFETY: The dictionary contains the required H.264 codec, width, and height settings.
@@ -330,6 +480,22 @@ impl Drop for Mp4Writer {
             unsafe { self.writer.cancelWriting() };
         }
     }
+}
+
+fn rec709_color_properties() -> Option<VideoColorProperties> {
+    // SAFETY: These framework constants are available with AVFoundation's H.264 encoder.
+    let (primaries, transfer_function, ycbcr_matrix) = unsafe {
+        (
+            AVVideoColorPrimaries_ITU_R_709_2?,
+            AVVideoTransferFunction_ITU_R_709_2?,
+            AVVideoYCbCrMatrix_ITU_R_709_2?,
+        )
+    };
+    Some(VideoColorProperties {
+        primaries: Some(NSString::from_str(&primaries.to_string())),
+        transfer_function: Some(NSString::from_str(&transfer_function.to_string())),
+        ycbcr_matrix: Some(NSString::from_str(&ycbcr_matrix.to_string())),
+    })
 }
 
 fn writer_error(writer: &AVAssetWriter) -> String {

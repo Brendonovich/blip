@@ -28,7 +28,7 @@ use gpui::{
 
 use crate::{
     assets::{PAUSE, PLAY, PLAYBACK_BACK, PLAYBACK_FORWARD},
-    bundle::{BlipBundle, VideoSegment, ZoomSegment, ZoomTransitionSpeed},
+    bundle::{BlipBundle, VideoSegment, VideoSegmentResizeMode, ZoomSegment, ZoomTransitionSpeed},
     theme,
 };
 
@@ -37,7 +37,10 @@ const PREVIEW_HANDLE: u32 = 0x007f_7f7f;
 const SIDEBAR_WIDTH: Pixels = px(280.0);
 const PREVIEW_LOADING_DURATION: Duration = Duration::from_millis(1_400);
 const PREVIEW_FADE_DURATION: Duration = Duration::from_millis(240);
+const TIMELINE_RESIZE_DURATION: Duration = Duration::from_millis(180);
 const PLAYBACK_TICK_INTERVAL: Duration = Duration::from_millis(16);
+const MIN_VIDEO_SEGMENT_DURATION_SECS: f64 = 1.0;
+const TIMELINE_EXPANSION_SPACE_SECS: f64 = 5.0;
 const BUNDLED_BACKGROUNDS: [(&str, &[u8], &[u8]); 15] = [
     (
         "tahoe-dusk.jpg",
@@ -199,6 +202,7 @@ enum SliderKind {
     Radius,
     Shadow,
     ZoomAmount,
+    TimelineZoom,
 }
 
 #[derive(Clone, Copy)]
@@ -220,6 +224,8 @@ struct ZoomSegmentDrag {
     pointer_start_x: Pixels,
     original_start_secs: f64,
     original_end_secs: f64,
+    draft_start_secs: f64,
+    draft_end_secs: f64,
     minimum_start_secs: f64,
     maximum_end_secs: f64,
 }
@@ -227,6 +233,19 @@ struct ZoomSegmentDrag {
 #[derive(Clone, Copy)]
 enum VideoSegmentEdge {
     Start,
+    End,
+}
+
+#[derive(Clone, Copy)]
+enum VideoCropIndicatorAction {
+    SegmentEdge(u64, VideoSegmentEdge),
+    Cut(u64),
+}
+
+#[derive(Clone, Copy)]
+enum VideoCropIndicatorAlignment {
+    Start,
+    Center,
     End,
 }
 
@@ -239,9 +258,24 @@ struct VideoSegmentDrag {
     timeline_view_duration_secs: f64,
     original_source_start_secs: f64,
     original_source_end_secs: f64,
+    draft_source_start_secs: f64,
+    draft_source_end_secs: f64,
     minimum_source_start_secs: f64,
     maximum_source_end_secs: f64,
     original_zoom_segments: Vec<ZoomSegment>,
+}
+
+#[derive(Clone)]
+struct VideoTimelineResizeAnimation {
+    from_ranges: Vec<(u64, f64, f64)>,
+    from_zoom_ranges: Vec<(u64, f64, f64)>,
+    ghost_range: Option<(u64, VideoSegmentEdge, f64, f64)>,
+    playback_range: Option<(f32, f32)>,
+    view_start_secs: f64,
+    view_duration_secs: f64,
+    target_view_start_secs: f64,
+    target_view_duration_secs: f64,
+    generation: u64,
 }
 
 #[derive(Clone, Copy)]
@@ -272,6 +306,7 @@ pub(crate) struct BundleEditor {
     preview_requests: async_channel::Sender<PreviewRequest>,
     zoom_target_requests: async_channel::Sender<f64>,
     duration_secs: f64,
+    source_duration_secs: f64,
     timeline_fps: u32,
     timeline_view_start_secs: f64,
     timeline_view_duration_secs: f64,
@@ -297,10 +332,13 @@ pub(crate) struct BundleEditor {
     radius_slider_bounds: Rc<Cell<Bounds<Pixels>>>,
     shadow_slider_bounds: Rc<Cell<Bounds<Pixels>>>,
     zoom_amount_slider_bounds: Rc<Cell<Bounds<Pixels>>>,
+    timeline_zoom_slider_bounds: Rc<Cell<Bounds<Pixels>>>,
     active_slider: Option<SliderKind>,
     dragging_zoom_target: bool,
     zoom_segment_drag: Option<ZoomSegmentDrag>,
     video_segment_drag: Option<VideoSegmentDrag>,
+    video_timeline_resize_animation: Option<VideoTimelineResizeAnimation>,
+    video_timeline_resize_generation: u64,
     export_dialog_open: bool,
     export_format: ExportFormat,
     export_resolution: ExportResolution,
@@ -461,9 +499,10 @@ impl BundleEditor {
                         preview_requests,
                         zoom_target_requests,
                         duration_secs: timeline_duration,
+                        source_duration_secs: max_duration,
                         timeline_fps: timeline_fps.unwrap_or(60),
                         timeline_view_start_secs: 0.0,
-                        timeline_view_duration_secs: timeline_duration,
+                        timeline_view_duration_secs: timeline_extent_secs(timeline_duration),
                         current_time_secs: 0.0,
                         is_playing: false,
                         playback_started_at: None,
@@ -486,10 +525,13 @@ impl BundleEditor {
                         radius_slider_bounds: Rc::new(Cell::new(Bounds::default())),
                         shadow_slider_bounds: Rc::new(Cell::new(Bounds::default())),
                         zoom_amount_slider_bounds: Rc::new(Cell::new(Bounds::default())),
+                        timeline_zoom_slider_bounds: Rc::new(Cell::new(Bounds::default())),
                         active_slider: None,
                         dragging_zoom_target: false,
                         zoom_segment_drag: None,
                         video_segment_drag: None,
+                        video_timeline_resize_animation: None,
+                        video_timeline_resize_generation: 0,
                         export_dialog_open: false,
                         export_format: ExportFormat::Mp4,
                         export_resolution: ExportResolution::P1080,
@@ -725,7 +767,7 @@ impl BundleEditor {
         };
         let offset = timeline_time_secs - timeline_start;
         let duration = segment.duration_secs();
-        if offset <= 0.01 || offset >= duration - 0.01 {
+        if !can_split_video_segment(duration, offset) {
             return;
         }
         let new_id = segments.iter().map(|segment| segment.id).max().unwrap_or(0) + 1;
@@ -777,6 +819,8 @@ impl BundleEditor {
             timeline_view_duration_secs: self.timeline_view_duration_secs,
             original_source_start_secs: segment.source_start_secs,
             original_source_end_secs: segment.source_end_secs,
+            draft_source_start_secs: segment.source_start_secs,
+            draft_source_end_secs: segment.source_end_secs,
             minimum_source_start_secs: index
                 .checked_sub(1)
                 .and_then(|index| segments.get(index))
@@ -785,9 +829,11 @@ impl BundleEditor {
             maximum_source_end_secs: segments
                 .get(index + 1)
                 .map(|segment| segment.source_start_secs)
-                .unwrap_or(segment.source_end_secs),
+                .unwrap_or(self.source_duration_secs),
             original_zoom_segments: self.bundle.zoom_segments.clone(),
         });
+        self.video_timeline_resize_generation += 1;
+        self.video_timeline_resize_animation = None;
         self.selected_video_segment = Some(id);
         self.selected_zoom = None;
         self.cursor_time_secs = None;
@@ -808,7 +854,6 @@ impl BundleEditor {
 
         let delta_fraction = (event.position.x - drag.pointer_start_x) / bounds.size.width;
         let delta_secs = f64::from(delta_fraction) * drag.timeline_view_duration_secs;
-        let original_duration = drag.original_source_end_secs - drag.original_source_start_secs;
         let (source_start_secs, source_end_secs) = resize_video_segment_range(
             drag.edge,
             drag.original_source_start_secs,
@@ -817,23 +862,67 @@ impl BundleEditor {
             drag.maximum_source_end_secs,
             delta_secs,
         );
-        let new_duration = source_end_secs - source_start_secs;
+        if let Some(drag) = self.video_segment_drag.as_mut() {
+            drag.draft_source_start_secs = source_start_secs;
+            drag.draft_source_end_secs = source_end_secs;
+        }
+        if let Some(time_secs) = self.timeline_time_at(event.position.x) {
+            self.set_playback_time(time_secs);
+        }
+        cx.notify();
+        true
+    }
+
+    fn finish_video_segment_drag(&mut self, cx: &mut Context<Self>) {
+        let Some(drag) = self.video_segment_drag.take() else {
+            return;
+        };
+        let original_duration = drag.original_source_end_secs - drag.original_source_start_secs;
+        let new_duration = drag.draft_source_end_secs - drag.draft_source_start_secs;
+        let mut timeline_start = 0.0;
+        let from_ranges = self
+            .bundle
+            .video_segments
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .map(|segment| {
+                let duration = segment.duration_secs();
+                let edge = (segment.id == drag.id).then_some(drag.edge);
+                let (display_start, display_end, next_timeline_start) = video_segment_drag_layout(
+                    self.bundle.video_segment_resize_mode,
+                    edge,
+                    timeline_start,
+                    duration,
+                    new_duration,
+                );
+                timeline_start = next_timeline_start;
+                (segment.id, display_start, display_end)
+            })
+            .collect();
+        let animation_view_start_secs = self.timeline_view_start_secs;
+        let animation_view_duration_secs = self.timeline_view_duration_secs;
+        let from_zoom_ranges = drag
+            .original_zoom_segments
+            .iter()
+            .map(|segment| (segment.id, segment.start_secs, segment.end_secs))
+            .collect();
+        let ghost_range = (
+            drag.id,
+            drag.edge,
+            drag.timeline_start_secs,
+            drag.timeline_start_secs + original_duration,
+        );
         let Some(segment) = self
             .bundle
             .video_segments
             .as_mut()
             .and_then(|segments| segments.iter_mut().find(|segment| segment.id == drag.id))
         else {
-            self.video_segment_drag = None;
-            return true;
+            return;
         };
-        if segment.source_start_secs == source_start_secs
-            && segment.source_end_secs == source_end_secs
-        {
-            return true;
-        }
-        segment.source_start_secs = source_start_secs;
-        segment.source_end_secs = source_end_secs;
+        segment.source_start_secs = drag.draft_source_start_secs;
+        segment.source_end_secs = drag.draft_source_end_secs;
 
         self.bundle.zoom_segments = drag.original_zoom_segments;
         if new_duration < original_duration {
@@ -859,25 +948,95 @@ impl BundleEditor {
         }
         self.duration_secs = video_timeline_duration(&self.bundle);
         self.current_time_secs = self.current_time_secs.min(self.duration_secs);
+        let timeline_extent_secs = timeline_extent_secs(self.duration_secs);
+        let target_view_duration_secs = self
+            .timeline_view_duration_secs
+            .min(timeline_extent_secs)
+            .max(0.0);
+        let target_view_start_secs = self
+            .timeline_view_start_secs
+            .min((timeline_extent_secs - target_view_duration_secs).max(0.0));
         self.request_preview();
         self.request_zoom_target();
-        cx.notify();
-        true
+        self.save_bundle();
+        let ghost_range = (self.bundle.video_segment_resize_mode == VideoSegmentResizeMode::Ghost)
+            .then_some(ghost_range);
+        self.animate_video_timeline_resize(
+            from_ranges,
+            from_zoom_ranges,
+            ghost_range,
+            None,
+            animation_view_start_secs,
+            animation_view_duration_secs,
+            target_view_start_secs,
+            target_view_duration_secs,
+            cx,
+        );
     }
 
-    fn finish_video_segment_drag(&mut self, cx: &mut Context<Self>) {
-        if self.video_segment_drag.take().is_none() {
+    fn animate_video_timeline_resize(
+        &mut self,
+        from_ranges: Vec<(u64, f64, f64)>,
+        from_zoom_ranges: Vec<(u64, f64, f64)>,
+        ghost_range: Option<(u64, VideoSegmentEdge, f64, f64)>,
+        playback_range: Option<(f32, f32)>,
+        view_start_secs: f64,
+        view_duration_secs: f64,
+        target_view_start_secs: f64,
+        target_view_duration_secs: f64,
+        cx: &mut Context<Self>,
+    ) {
+        self.video_timeline_resize_generation += 1;
+        let generation = self.video_timeline_resize_generation;
+        self.video_timeline_resize_animation = Some(VideoTimelineResizeAnimation {
+            from_ranges,
+            from_zoom_ranges,
+            ghost_range,
+            playback_range,
+            view_start_secs,
+            view_duration_secs,
+            target_view_start_secs,
+            target_view_duration_secs,
+            generation,
+        });
+        cx.notify();
+
+        if cx.reduce_motion() {
+            self.timeline_view_start_secs = target_view_start_secs;
+            self.timeline_view_duration_secs = target_view_duration_secs;
+            self.video_timeline_resize_animation = None;
+            cx.notify();
             return;
         }
-        self.timeline_view_duration_secs = self
-            .timeline_view_duration_secs
-            .min(self.duration_secs)
-            .max(0.0);
-        self.timeline_view_start_secs = self
-            .timeline_view_start_secs
-            .min((self.duration_secs - self.timeline_view_duration_secs).max(0.0));
-        self.save_bundle();
-        cx.notify();
+        cx.spawn(async move |editor, cx| {
+            let started_at = Instant::now();
+            loop {
+                cx.background_executor().timer(PLAYBACK_TICK_INTERVAL).await;
+                let elapsed = started_at.elapsed().as_secs_f64();
+                let progress = (elapsed / TIMELINE_RESIZE_DURATION.as_secs_f64()).clamp(0.0, 1.0);
+                let eased = 1.0 - (1.0 - progress).powi(5);
+                let keep_animating = editor
+                    .update(cx, |editor, cx| {
+                        if editor.video_timeline_resize_generation != generation {
+                            return false;
+                        }
+                        editor.timeline_view_start_secs =
+                            view_start_secs + (target_view_start_secs - view_start_secs) * eased;
+                        editor.timeline_view_duration_secs = view_duration_secs
+                            + (target_view_duration_secs - view_duration_secs) * eased;
+                        if progress >= 1.0 {
+                            editor.video_timeline_resize_animation = None;
+                        }
+                        cx.notify();
+                        progress < 1.0
+                    })
+                    .unwrap_or(false);
+                if !keep_animating {
+                    break;
+                }
+            }
+        })
+        .detach();
     }
 
     fn can_delete_video_segment(&self) -> bool {
@@ -919,13 +1078,14 @@ impl BundleEditor {
             removed_duration,
         );
         self.duration_secs = video_timeline_duration(&self.bundle);
+        let timeline_extent_secs = timeline_extent_secs(self.duration_secs);
         self.timeline_view_duration_secs = self
             .timeline_view_duration_secs
-            .min(self.duration_secs)
+            .min(timeline_extent_secs)
             .max(0.0);
         self.timeline_view_start_secs = self
             .timeline_view_start_secs
-            .min((self.duration_secs - self.timeline_view_duration_secs).max(0.0));
+            .min((timeline_extent_secs - self.timeline_view_duration_secs).max(0.0));
         self.current_time_secs = timeline_start.min(self.duration_secs);
         self.cursor_time_secs = None;
         if self.duration_secs == 0.0 {
@@ -958,6 +1118,33 @@ impl BundleEditor {
 
     fn activate_video_cut(&mut self, right_id: u64, cx: &mut Context<Self>) {
         let old_duration = self.duration_secs;
+        let old_timeline_extent_secs = timeline_extent_secs(old_duration);
+        let mut timeline_start_secs = 0.0;
+        let from_ranges = self
+            .bundle
+            .video_segments
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .map(|segment| {
+                let start_secs = timeline_start_secs;
+                timeline_start_secs += segment.duration_secs();
+                (segment.id, start_secs, timeline_start_secs)
+            })
+            .collect();
+        let from_zoom_ranges = self
+            .bundle
+            .zoom_segments
+            .iter()
+            .map(|segment| (segment.id, segment.start_secs, segment.end_secs))
+            .collect();
+        let animation_view_start_secs = self.timeline_view_start_secs;
+        let animation_view_duration_secs = self.timeline_view_duration_secs;
+        let from_playback_fraction = timeline_time_fraction(
+            self.current_time_secs,
+            animation_view_start_secs,
+            animation_view_duration_secs,
+        );
         let Some(edit) = self
             .bundle
             .video_segments
@@ -967,7 +1154,8 @@ impl BundleEditor {
             return;
         };
 
-        if edit.inserted_duration_secs > 0.0 {
+        let should_animate = edit.inserted_duration_secs > 0.0;
+        if should_animate {
             ripple_insert_ranges(
                 &mut self.bundle.zoom_segments,
                 edit.timeline_start_secs,
@@ -982,22 +1170,154 @@ impl BundleEditor {
         }
 
         self.duration_secs = video_timeline_duration(&self.bundle);
-        if (self.timeline_view_start_secs <= f64::EPSILON
-            && self.timeline_view_duration_secs >= old_duration - f64::EPSILON)
-            || self.timeline_view_duration_secs > self.duration_secs
+        let timeline_extent_secs = timeline_extent_secs(self.duration_secs);
+        let (target_view_start_secs, target_view_duration_secs) = if (self.timeline_view_start_secs
+            <= f64::EPSILON
+            && self.timeline_view_duration_secs >= old_timeline_extent_secs - f64::EPSILON)
+            || self.timeline_view_duration_secs > timeline_extent_secs
         {
-            self.timeline_view_start_secs = 0.0;
-            self.timeline_view_duration_secs = self.duration_secs;
+            (0.0, timeline_extent_secs)
         } else {
-            self.timeline_view_start_secs = self
-                .timeline_view_start_secs
-                .min((self.duration_secs - self.timeline_view_duration_secs).max(0.0));
+            (
+                self.timeline_view_start_secs
+                    .min((timeline_extent_secs - self.timeline_view_duration_secs).max(0.0)),
+                self.timeline_view_duration_secs,
+            )
+        };
+        self.cursor_time_secs = None;
+        self.save_bundle();
+        self.request_preview();
+        self.request_zoom_target();
+        if should_animate {
+            let playback_range = from_playback_fraction.zip(timeline_time_fraction(
+                self.current_time_secs,
+                target_view_start_secs,
+                target_view_duration_secs,
+            ));
+            self.animate_video_timeline_resize(
+                from_ranges,
+                from_zoom_ranges,
+                None,
+                playback_range,
+                animation_view_start_secs,
+                animation_view_duration_secs,
+                target_view_start_secs,
+                target_view_duration_secs,
+                cx,
+            );
+        } else {
+            self.video_timeline_resize_generation += 1;
+            self.video_timeline_resize_animation = None;
+            self.timeline_view_start_secs = target_view_start_secs;
+            self.timeline_view_duration_secs = target_view_duration_secs;
+            cx.notify();
+        }
+    }
+
+    fn activate_video_segment_edge(
+        &mut self,
+        id: u64,
+        edge: VideoSegmentEdge,
+        cx: &mut Context<Self>,
+    ) {
+        let old_duration = self.duration_secs;
+        let old_timeline_extent_secs = timeline_extent_secs(old_duration);
+        let mut timeline_start_secs = 0.0;
+        let from_ranges = self
+            .bundle
+            .video_segments
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .map(|segment| {
+                let start_secs = timeline_start_secs;
+                timeline_start_secs += segment.duration_secs();
+                (segment.id, start_secs, timeline_start_secs)
+            })
+            .collect();
+        let from_zoom_ranges = self
+            .bundle
+            .zoom_segments
+            .iter()
+            .map(|segment| (segment.id, segment.start_secs, segment.end_secs))
+            .collect();
+        let animation_view_start_secs = self.timeline_view_start_secs;
+        let animation_view_duration_secs = self.timeline_view_duration_secs;
+        let from_playback_fraction = timeline_time_fraction(
+            self.current_time_secs,
+            animation_view_start_secs,
+            animation_view_duration_secs,
+        );
+        let Some(segments) = self.bundle.video_segments.as_mut() else {
+            return;
+        };
+        let Some(index) = segments.iter().position(|segment| segment.id == id) else {
+            return;
+        };
+        let timeline_start_secs = segments
+            .iter()
+            .take(index)
+            .map(VideoSegment::duration_secs)
+            .sum::<f64>();
+        let segment = &mut segments[index];
+        let (inserted_at_secs, inserted_duration_secs) = match edge {
+            VideoSegmentEdge::Start => {
+                let inserted_duration_secs = segment.source_start_secs.max(0.0);
+                if inserted_duration_secs <= f64::EPSILON {
+                    return;
+                }
+                segment.source_start_secs = 0.0;
+                (timeline_start_secs, inserted_duration_secs)
+            }
+            VideoSegmentEdge::End => {
+                let inserted_at_secs = timeline_start_secs + segment.duration_secs();
+                let inserted_duration_secs =
+                    (self.source_duration_secs - segment.source_end_secs).max(0.0);
+                if inserted_duration_secs <= f64::EPSILON {
+                    return;
+                }
+                segment.source_end_secs = self.source_duration_secs;
+                (inserted_at_secs, inserted_duration_secs)
+            }
+        };
+
+        ripple_insert_ranges(
+            &mut self.bundle.zoom_segments,
+            inserted_at_secs,
+            inserted_duration_secs,
+        );
+        if self.current_time_secs >= inserted_at_secs {
+            self.current_time_secs += inserted_duration_secs;
+        }
+        self.duration_secs = video_timeline_duration(&self.bundle);
+        let mut target_view_start_secs = self.timeline_view_start_secs;
+        let mut target_view_duration_secs = self.timeline_view_duration_secs;
+        if self.timeline_view_start_secs <= f64::EPSILON
+            && self.timeline_view_duration_secs >= old_timeline_extent_secs - f64::EPSILON
+        {
+            target_view_start_secs = 0.0;
+            target_view_duration_secs = timeline_extent_secs(self.duration_secs);
         }
         self.cursor_time_secs = None;
         self.save_bundle();
         self.request_preview();
         self.request_zoom_target();
-        cx.notify();
+        let playback_range = from_playback_fraction.zip(timeline_time_fraction(
+            self.current_time_secs,
+            target_view_start_secs,
+            target_view_duration_secs,
+        ));
+        self.animate_video_timeline_resize(
+            from_ranges,
+            from_zoom_ranges,
+            None,
+            playback_range,
+            animation_view_start_secs,
+            animation_view_duration_secs,
+            target_view_start_secs,
+            target_view_duration_secs,
+            cx,
+        );
     }
 
     fn add_zoom(&mut self, start_secs: f64, end_secs: f64, cx: &mut Context<Self>) {
@@ -1069,6 +1389,8 @@ impl BundleEditor {
             pointer_start_x: event.position.x,
             original_start_secs: start_secs,
             original_end_secs: end_secs,
+            draft_start_secs: start_secs,
+            draft_end_secs: end_secs,
             minimum_start_secs,
             maximum_end_secs,
         });
@@ -1119,29 +1441,61 @@ impl BundleEditor {
             ZoomSegmentDragKind::Resize(ZoomSegmentEdge::Start) => Some(start_secs),
             ZoomSegmentDragKind::Resize(ZoomSegmentEdge::End) => Some(end_secs),
         };
-        let Some(segment) = self
-            .bundle
-            .zoom_segments
-            .iter_mut()
-            .find(|segment| segment.id == drag.id)
-        else {
-            self.zoom_segment_drag = None;
-            return true;
-        };
-        let segment_changed = segment.start_secs != start_secs || segment.end_secs != end_secs;
-        let start_changed = segment.start_secs != start_secs;
-        if segment_changed {
-            segment.start_secs = start_secs;
-            segment.end_secs = end_secs;
+        let start_changed = drag.original_start_secs != start_secs;
+        match drag.kind {
+            ZoomSegmentDragKind::Move => {
+                let Some(segment) = self
+                    .bundle
+                    .zoom_segments
+                    .iter_mut()
+                    .find(|segment| segment.id == drag.id)
+                else {
+                    self.zoom_segment_drag = None;
+                    return true;
+                };
+                segment.start_secs = start_secs;
+                segment.end_secs = end_secs;
+            }
+            ZoomSegmentDragKind::Resize(_) => {
+                if let Some(drag) = self.zoom_segment_drag.as_mut() {
+                    drag.draft_start_secs = start_secs;
+                    drag.draft_end_secs = end_secs;
+                }
+            }
         }
         if let Some(time_secs) = playback_time_secs {
             self.set_playback_time(time_secs);
         }
-        if start_changed {
+        if start_changed && matches!(drag.kind, ZoomSegmentDragKind::Move) {
             self.request_zoom_target();
         }
         cx.notify();
         true
+    }
+
+    fn finish_zoom_segment_drag(&mut self, cx: &mut Context<Self>) {
+        let Some(drag) = self.zoom_segment_drag.take() else {
+            return;
+        };
+        if matches!(drag.kind, ZoomSegmentDragKind::Resize(_))
+            && (drag.draft_start_secs != drag.original_start_secs
+                || drag.draft_end_secs != drag.original_end_secs)
+        {
+            let Some(segment) = self
+                .bundle
+                .zoom_segments
+                .iter_mut()
+                .find(|segment| segment.id == drag.id)
+            else {
+                return;
+            };
+            segment.start_secs = drag.draft_start_secs;
+            segment.end_secs = drag.draft_end_secs;
+            self.request_preview();
+            self.request_zoom_target();
+        }
+        self.save_bundle();
+        cx.notify();
     }
 
     fn set_zoom_amount(&mut self, amount: f32, cx: &mut Context<Self>) {
@@ -1274,13 +1628,15 @@ impl BundleEditor {
         let (start_secs, duration_secs) = zoomed_timeline_view(
             self.timeline_view_start_secs,
             self.timeline_view_duration_secs,
-            self.duration_secs,
+            timeline_extent_secs(self.duration_secs),
             focal_fraction,
             event.delta,
         );
         if start_secs != self.timeline_view_start_secs
             || duration_secs != self.timeline_view_duration_secs
         {
+            self.video_timeline_resize_generation += 1;
+            self.video_timeline_resize_animation = None;
             self.timeline_view_start_secs = start_secs;
             self.timeline_view_duration_secs = duration_secs;
             self.cursor_time_secs = Some(start_secs + focal_fraction * duration_secs);
@@ -1304,10 +1660,12 @@ impl BundleEditor {
         let start_secs = panned_timeline_view(
             self.timeline_view_start_secs,
             self.timeline_view_duration_secs,
-            self.duration_secs,
+            timeline_extent_secs(self.duration_secs),
             f64::from(delta.x / bounds.size.width),
         );
         if start_secs != self.timeline_view_start_secs {
+            self.video_timeline_resize_generation += 1;
+            self.video_timeline_resize_animation = None;
             self.timeline_view_start_secs = start_secs;
             self.cursor_time_secs = self.timeline_time_at(event.position.x);
             self.request_preview();
@@ -1385,6 +1743,7 @@ impl BundleEditor {
             SliderKind::Radius => self.radius_slider_bounds.get(),
             SliderKind::Shadow => self.shadow_slider_bounds.get(),
             SliderKind::ZoomAmount => self.zoom_amount_slider_bounds.get(),
+            SliderKind::TimelineZoom => self.timeline_zoom_slider_bounds.get(),
         };
         if bounds.size.width <= Pixels::ZERO {
             return;
@@ -1396,6 +1755,20 @@ impl BundleEditor {
             SliderKind::Shadow => self.shadow = (fraction * 50.0).round(),
             SliderKind::ZoomAmount => {
                 self.set_zoom_amount(1.0 + (fraction * 40.0).round() / 10.0, cx);
+                return;
+            }
+            SliderKind::TimelineZoom => {
+                let timeline_duration_secs = timeline_extent_secs(self.duration_secs);
+                let zoom = 1.0 + f64::from(fraction) * 9.0;
+                let view_duration_secs = timeline_duration_secs / zoom;
+                let view_center_secs =
+                    self.timeline_view_start_secs + self.timeline_view_duration_secs * 0.5;
+                self.timeline_view_duration_secs = view_duration_secs;
+                self.timeline_view_start_secs = (view_center_secs - view_duration_secs * 0.5)
+                    .clamp(0.0, timeline_duration_secs - view_duration_secs);
+                self.video_timeline_resize_generation += 1;
+                self.video_timeline_resize_animation = None;
+                cx.notify();
                 return;
             }
         }
@@ -1754,6 +2127,101 @@ impl BundleEditor {
             )
     }
 
+    fn timeline_zoom_slider(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let measured_bounds = Rc::clone(&self.timeline_zoom_slider_bounds);
+        let timeline_duration_secs = timeline_extent_secs(self.duration_secs);
+        let zoom = if self.timeline_view_duration_secs > 0.0 {
+            (timeline_duration_secs / self.timeline_view_duration_secs).clamp(1.0, 10.0)
+        } else {
+            1.0
+        };
+        let fraction = ((zoom - 1.0) / 9.0) as f32;
+        let timeline_width = f64::from(self.timeline_bounds.get().size.width);
+        let density_label = if timeline_width > 0.0 {
+            let seconds_per_hundred_pixels =
+                self.timeline_view_duration_secs / timeline_width * 100.0;
+            if seconds_per_hundred_pixels >= 10.0 {
+                format!("{seconds_per_hundred_pixels:.0}s")
+            } else if seconds_per_hundred_pixels >= 1.0 {
+                format!("{seconds_per_hundred_pixels:.1}s")
+            } else {
+                format!("{seconds_per_hundred_pixels:.2}s")
+            }
+        } else {
+            "--s".to_owned()
+        };
+
+        div()
+            .flex()
+            .items_center()
+            .gap_2()
+            .child(
+                div()
+                    .id("timeline-zoom-slider")
+                    .w(px(96.0))
+                    .h(px(18.0))
+                    .relative()
+                    .cursor_pointer()
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|editor, event: &MouseDownEvent, _, cx| {
+                            editor.active_slider = Some(SliderKind::TimelineZoom);
+                            editor.set_slider_value(SliderKind::TimelineZoom, event.position.x, cx);
+                        }),
+                    )
+                    .child(
+                        canvas(
+                            move |bounds, _, _| {
+                                measured_bounds.set(bounds);
+                                bounds
+                            },
+                            |_, _, _, _| {},
+                        )
+                        .absolute()
+                        .size_full(),
+                    )
+                    .child(
+                        div()
+                            .absolute()
+                            .left_0()
+                            .right_0()
+                            .top(px(7.0))
+                            .h(px(4.0))
+                            .rounded_full()
+                            .bg(rgb(theme::CONTROL_BACKGROUND)),
+                    )
+                    .child(
+                        div()
+                            .absolute()
+                            .left_0()
+                            .top(px(7.0))
+                            .w(relative(fraction))
+                            .h(px(4.0))
+                            .rounded_full()
+                            .bg(rgb(theme::TEXT_MUTED)),
+                    )
+                    .child(
+                        div()
+                            .absolute()
+                            .left(relative(fraction))
+                            .top(px(3.0))
+                            .ml(px(-6.0))
+                            .size(px(12.0))
+                            .rounded_full()
+                            .bg(rgb(theme::TEXT))
+                            .border_1()
+                            .border_color(rgb(theme::APP_BACKGROUND)),
+                    ),
+            )
+            .child(
+                div()
+                    .w(px(34.0))
+                    .text_xs()
+                    .text_color(rgb(theme::TEXT_MUTED))
+                    .child(density_label),
+            )
+    }
+
     fn zoom_sidebar(&self, cx: &mut Context<Self>) -> Div {
         let segment = self.selected_zoom().expect("selected zoom should exist");
         let target = segment.target;
@@ -2001,6 +2469,59 @@ impl BundleEditor {
             .bg(rgb(theme::PANEL_BACKGROUND))
             .border_l_1()
             .border_color(rgb(theme::BORDER_SUBTLE))
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_5()
+                    .child(
+                        div()
+                            .text_sm()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child("Timeline"),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(rgb(theme::TEXT_MUTED))
+                                    .child("Resize behavior"),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .gap_1()
+                                    .child(self.zoom_value_option(
+                                        "Ghost",
+                                        self.bundle.video_segment_resize_mode
+                                            == VideoSegmentResizeMode::Ghost,
+                                        cx,
+                                        |editor, cx| {
+                                            editor.bundle.video_segment_resize_mode =
+                                                VideoSegmentResizeMode::Ghost;
+                                            editor.save_bundle();
+                                            cx.notify();
+                                        },
+                                    ))
+                                    .child(self.zoom_value_option(
+                                        "Live",
+                                        self.bundle.video_segment_resize_mode
+                                            == VideoSegmentResizeMode::Live,
+                                        cx,
+                                        |editor, cx| {
+                                            editor.bundle.video_segment_resize_mode =
+                                                VideoSegmentResizeMode::Live;
+                                            editor.save_bundle();
+                                            cx.notify();
+                                        },
+                                    )),
+                            ),
+                    ),
+            )
             .child(
                 div()
                     .flex()
@@ -2532,8 +3053,16 @@ impl BundleEditor {
         let rows_bounds_cell = Rc::clone(&self.timeline_rows_bounds);
         let view_start_secs = self.timeline_view_start_secs;
         let view_duration_secs = self.timeline_view_duration_secs;
-        let playback_fraction =
-            timeline_time_fraction(self.current_time_secs, view_start_secs, view_duration_secs);
+        let playback_animation =
+            self.video_timeline_resize_animation
+                .as_ref()
+                .and_then(|animation| {
+                    let (from, to) = animation.playback_range?;
+                    Some((from, to, animation.generation))
+                });
+        let playback_fraction = playback_animation.map(|(_, to, _)| to).or_else(|| {
+            timeline_time_fraction(self.current_time_secs, view_start_secs, view_duration_secs)
+        });
         let preview_fraction = self.cursor_time_secs.and_then(|time_secs| {
             timeline_time_fraction(time_secs, view_start_secs, view_duration_secs)
         });
@@ -2553,46 +3082,295 @@ impl BundleEditor {
         let mut video_track_top = 0.0;
         for (index, input) in self.bundle.inputs.iter().enumerate() {
             let bounds_cell = Rc::clone(&bounds_cell);
+            let uses_ghost_resize = !input_is_camera(input, index)
+                && self.bundle.video_segment_resize_mode == VideoSegmentResizeMode::Ghost;
             let mut video_track = div().h(px(48.0)).flex_1().relative();
             let mut timeline_start = 0.0;
             let mut cuts = Vec::new();
             let mut previous_source_end = None;
+            let mut previous_ghost_end_fraction = None;
             let mut video_segment_layer = div().absolute().size_full().overflow_hidden();
             let video_segments = self.bundle.video_segments.as_deref().unwrap_or_default();
             for (segment_index, segment) in video_segments.iter().enumerate() {
                 let id = segment.id;
                 let segment_duration = segment.duration_secs();
-                if let Some(source_end_secs) = previous_source_end
-                    && let Some(fraction) =
-                        timeline_time_fraction(timeline_start, view_start_secs, view_duration_secs)
+                let segment_drag = self
+                    .video_segment_drag
+                    .as_ref()
+                    .filter(|drag| drag.id == id);
+                let (draft_source_start_secs, draft_source_end_secs) = segment_drag
+                    .map(|drag| (drag.draft_source_start_secs, drag.draft_source_end_secs))
+                    .unwrap_or((segment.source_start_secs, segment.source_end_secs));
+                let draft_duration = draft_source_end_secs - draft_source_start_secs;
+                let (display_start, display_end, next_timeline_start) = video_segment_drag_layout(
+                    self.bundle.video_segment_resize_mode,
+                    segment_drag.map(|drag| drag.edge),
+                    timeline_start,
+                    segment_duration,
+                    draft_duration,
+                );
+                let ghost_indicator = if uses_ghost_resize
+                    && draft_duration != segment_duration
+                    && let Some(drag) = segment_drag
                 {
-                    cuts.push((
-                        id,
-                        fraction,
-                        video_cut_gap_secs(source_end_secs, segment.source_start_secs),
-                    ));
+                    let time_secs = match drag.edge {
+                        VideoSegmentEdge::Start => timeline_start,
+                        VideoSegmentEdge::End => timeline_start + segment_duration,
+                    };
+                    timeline_time_fraction(time_secs, view_start_secs, view_duration_secs)
+                        .map(|fraction| (drag.edge, fraction))
+                } else if uses_ghost_resize
+                    && segment_drag.is_none()
+                    && let Some(animation) = &self.video_timeline_resize_animation
+                    && let Some((ghost_id, edge, ghost_start, ghost_end)) = animation.ghost_range
+                    && ghost_id == id
+                {
+                    let time_secs = match edge {
+                        VideoSegmentEdge::Start => ghost_start,
+                        VideoSegmentEdge::End => ghost_end,
+                    };
+                    timeline_time_fraction(
+                        time_secs,
+                        animation.view_start_secs,
+                        animation.view_duration_secs,
+                    )
+                    .map(|fraction| (edge, fraction))
+                } else {
+                    None
+                };
+                let ghost_start_fraction =
+                    ghost_indicator.and_then(|(edge, fraction)| match edge {
+                        VideoSegmentEdge::Start => Some(fraction),
+                        VideoSegmentEdge::End => None,
+                    });
+                let ghost_end_fraction = ghost_indicator.and_then(|(edge, fraction)| match edge {
+                    VideoSegmentEdge::Start => None,
+                    VideoSegmentEdge::End => Some(fraction),
+                });
+                if let Some(source_end_secs) = previous_source_end {
+                    let ghost_cut_animation = if let Some(from) = previous_ghost_end_fraction
+                        && let Some(animation) = &self.video_timeline_resize_animation
+                        && let Some((_, VideoSegmentEdge::End, _, ghost_end_secs)) =
+                            animation.ghost_range
+                        && timeline_start < ghost_end_secs
+                        && let Some(to) = timeline_time_fraction(
+                            timeline_start,
+                            animation.target_view_start_secs,
+                            animation.target_view_duration_secs,
+                        ) {
+                        Some((from, to, animation.generation))
+                    } else if let Some(from) = ghost_start_fraction
+                        && let Some(animation) = &self.video_timeline_resize_animation
+                        && let Some((ghost_id, VideoSegmentEdge::Start, _, _)) =
+                            animation.ghost_range
+                        && ghost_id == id
+                        && let Some(to) = timeline_time_fraction(
+                            timeline_start,
+                            animation.target_view_start_secs,
+                            animation.target_view_duration_secs,
+                        )
+                    {
+                        Some((from, to, animation.generation))
+                    } else {
+                        None
+                    };
+                    let resize_cut_animation = self
+                        .video_timeline_resize_animation
+                        .as_ref()
+                        .and_then(|animation| {
+                            let (_, from_start_secs, _) = animation
+                                .from_ranges
+                                .iter()
+                                .find(|(animation_id, _, _)| *animation_id == id)?;
+                            Some((
+                                timeline_time_fraction(
+                                    *from_start_secs,
+                                    animation.view_start_secs,
+                                    animation.view_duration_secs,
+                                )?,
+                                timeline_time_fraction(
+                                    timeline_start,
+                                    animation.target_view_start_secs,
+                                    animation.target_view_duration_secs,
+                                )?,
+                                animation.generation,
+                            ))
+                        });
+                    let cut_animation = if previous_ghost_end_fraction.is_some()
+                        || ghost_start_fraction.is_some()
+                    {
+                        ghost_cut_animation
+                    } else {
+                        resize_cut_animation
+                    };
+                    let fraction = cut_animation
+                        .map(|(_, to, _)| to)
+                        .or(previous_ghost_end_fraction)
+                        .or(ghost_start_fraction)
+                        .or_else(|| {
+                            timeline_time_fraction(
+                                timeline_start,
+                                view_start_secs,
+                                view_duration_secs,
+                            )
+                        });
+                    if let Some(fraction) = fraction {
+                        cuts.push((
+                            VideoCropIndicatorAction::Cut(id),
+                            VideoCropIndicatorAlignment::Center,
+                            fraction,
+                            video_cut_gap_secs(source_end_secs, draft_source_start_secs),
+                            cut_animation,
+                        ));
+                    }
                 }
                 let visible_range = timeline_segment_range_fraction(
-                    timeline_start,
-                    timeline_start + segment_duration,
+                    display_start,
+                    display_end,
                     view_start_secs,
                     view_duration_secs,
                 );
+                let segment_animation =
+                    self.video_timeline_resize_animation
+                        .as_ref()
+                        .and_then(|animation| {
+                            let (_, from_start_secs, from_end_secs) = animation
+                                .from_ranges
+                                .iter()
+                                .find(|(animation_id, _, _)| *animation_id == id)?;
+                            Some((*from_start_secs, *from_end_secs, animation))
+                        });
+                if segment_index == 0
+                    && draft_source_start_secs > f64::EPSILON
+                    && let Some(fraction) = ghost_start_fraction.or_else(|| {
+                        timeline_time_fraction(display_start, view_start_secs, view_duration_secs)
+                    })
+                {
+                    let ghost_crop_animation = if let Some(from) = ghost_start_fraction
+                        && let Some(animation) = &self.video_timeline_resize_animation
+                        && let Some((ghost_id, VideoSegmentEdge::Start, _, _)) =
+                            animation.ghost_range
+                        && ghost_id == id
+                        && let Some(to) = timeline_time_fraction(
+                            display_start,
+                            animation.target_view_start_secs,
+                            animation.target_view_duration_secs,
+                        ) {
+                        Some((from, to, animation.generation))
+                    } else {
+                        None
+                    };
+                    let resize_crop_animation =
+                        segment_animation.and_then(|(from_start_secs, _, animation)| {
+                            Some((
+                                timeline_time_fraction(
+                                    from_start_secs,
+                                    animation.view_start_secs,
+                                    animation.view_duration_secs,
+                                )?,
+                                timeline_time_fraction(
+                                    display_start,
+                                    animation.target_view_start_secs,
+                                    animation.target_view_duration_secs,
+                                )?,
+                                animation.generation,
+                            ))
+                        });
+                    let crop_animation = if ghost_start_fraction.is_some() {
+                        ghost_crop_animation
+                    } else {
+                        resize_crop_animation
+                    };
+                    let fraction = crop_animation
+                        .map(|(_, to, _)| to)
+                        .or(ghost_start_fraction)
+                        .unwrap_or(fraction);
+                    cuts.push((
+                        VideoCropIndicatorAction::SegmentEdge(id, VideoSegmentEdge::Start),
+                        VideoCropIndicatorAlignment::Start,
+                        fraction,
+                        draft_source_start_secs,
+                        crop_animation,
+                    ));
+                }
+                if segment_index + 1 == video_segments.len()
+                    && self.source_duration_secs - draft_source_end_secs > f64::EPSILON
+                {
+                    let ghost_crop_animation = if segment_drag.is_none()
+                        && let Some(from) = ghost_end_fraction
+                        && let Some(animation) = &self.video_timeline_resize_animation
+                        && let Some((ghost_id, VideoSegmentEdge::End, _, ghost_end_secs)) =
+                            animation.ghost_range
+                        && ghost_id == id
+                        && display_end < ghost_end_secs
+                        && let Some(to) = timeline_time_fraction(
+                            display_end,
+                            animation.target_view_start_secs,
+                            animation.target_view_duration_secs,
+                        ) {
+                        Some((from, to, animation.generation))
+                    } else {
+                        None
+                    };
+                    let crop_animation = ghost_crop_animation.or_else(|| {
+                        segment_animation.and_then(|(_, from_end_secs, animation)| {
+                            Some((
+                                timeline_time_fraction(
+                                    from_end_secs,
+                                    animation.view_start_secs,
+                                    animation.view_duration_secs,
+                                )?,
+                                timeline_time_fraction(
+                                    display_end,
+                                    animation.target_view_start_secs,
+                                    animation.target_view_duration_secs,
+                                )?,
+                                animation.generation,
+                            ))
+                        })
+                    });
+                    let crop_animation =
+                        if ghost_end_fraction.is_some() && ghost_crop_animation.is_none() {
+                            None
+                        } else {
+                            crop_animation
+                        };
+                    let fraction = crop_animation
+                        .map(|(_, to, _)| to)
+                        .or(ghost_end_fraction)
+                        .or_else(|| {
+                            timeline_time_fraction(display_end, view_start_secs, view_duration_secs)
+                        });
+                    if let Some(fraction) = fraction {
+                        cuts.push((
+                            VideoCropIndicatorAction::SegmentEdge(id, VideoSegmentEdge::End),
+                            VideoCropIndicatorAlignment::End,
+                            fraction,
+                            (self.source_duration_secs - draft_source_end_secs).max(0.0),
+                            crop_animation,
+                        ));
+                    }
+                }
                 let segment_selected = self.selected_video_segment == Some(id);
                 let media = media_name(input.media.as_path());
-                if let Some((start, width)) = visible_range {
-                    let label_start = (-start).max(0.0) / width;
+                if uses_ghost_resize
+                    && segment_drag.is_some()
+                    && draft_duration != segment_duration
+                    && let Some((start, width)) = timeline_segment_range_fraction(
+                        timeline_start,
+                        timeline_start + segment_duration,
+                        view_start_secs,
+                        view_duration_secs,
+                    )
+                {
                     video_segment_layer = video_segment_layer.child(
                         div()
-                            .id(format!("video-segment-{index}-{id}"))
                             .absolute()
                             .left(relative(start))
                             .w(relative(width))
                             .top_0()
                             .bottom_0()
                             .min_w(px(2.0))
-                            .when(self.cut_mode, |segment| segment.cursor_crosshair())
-                            .when(!self.cut_mode, |segment| segment.cursor_pointer())
                             .child(
                                 div()
                                     .absolute()
@@ -2605,92 +3383,244 @@ impl BundleEditor {
                                     .top_0()
                                     .bottom_0()
                                     .min_w(px(1.0))
-                                    .overflow_hidden()
                                     .rounded_lg()
                                     .border_1()
-                                    .border_color(rgb(if segment_selected {
-                                        theme::SELECTION
-                                    } else {
-                                        theme::BORDER
-                                    }))
-                                    .bg(rgb(if segment_selected {
-                                        theme::SELECTION_FILL
-                                    } else {
-                                        0x0029_313d
-                                    }))
-                                    .text_sm()
-                                    .child(
-                                        div()
-                                            .absolute()
-                                            .left(relative(label_start))
-                                            .top_0()
-                                            .bottom_0()
-                                            .px_3()
-                                            .flex()
-                                            .items_center()
-                                            .child(media),
-                                    ),
-                            )
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(move |editor, event: &MouseDownEvent, _, cx| {
-                                    editor.selected_input = index;
-                                    if let Some(time_secs) =
-                                        editor.timeline_time_at(event.position.x)
-                                    {
-                                        editor.activate_video_segment(id, time_secs, cx);
-                                    }
-                                    cx.stop_propagation();
-                                }),
-                            )
-                            .child(
-                                div()
-                                    .id(format!("video-segment-start-{index}-{id}"))
-                                    .absolute()
-                                    .left_0()
-                                    .top_0()
-                                    .bottom_0()
-                                    .w(px(8.0))
-                                    .cursor_e_resize()
-                                    .on_mouse_down(
-                                        MouseButton::Left,
-                                        cx.listener(move |editor, event, _, cx| {
-                                            editor.begin_video_segment_drag(
-                                                id,
-                                                VideoSegmentEdge::Start,
-                                                event,
-                                                cx,
-                                            );
-                                            cx.stop_propagation();
-                                        }),
-                                    ),
-                            )
-                            .child(
-                                div()
-                                    .id(format!("video-segment-end-{index}-{id}"))
-                                    .absolute()
-                                    .right_0()
-                                    .top_0()
-                                    .bottom_0()
-                                    .w(px(8.0))
-                                    .cursor_w_resize()
-                                    .on_mouse_down(
-                                        MouseButton::Left,
-                                        cx.listener(move |editor, event, _, cx| {
-                                            editor.begin_video_segment_drag(
-                                                id,
-                                                VideoSegmentEdge::End,
-                                                event,
-                                                cx,
-                                            );
-                                            cx.stop_propagation();
-                                        }),
-                                    ),
+                                    .border_color(rgba(0xffff_ff70))
+                                    .bg(rgba(0xffff_ff18)),
                             ),
                     );
                 }
-                timeline_start += segment_duration;
-                previous_source_end = Some(segment.source_end_secs);
+                if uses_ghost_resize
+                    && segment_drag.is_none()
+                    && let Some(animation) = &self.video_timeline_resize_animation
+                    && let Some(ghost_range) = animation.ghost_range
+                    && ghost_range.0 == id
+                    && let Some((start, width)) = timeline_segment_range_fraction(
+                        ghost_range.2,
+                        ghost_range.3,
+                        animation.view_start_secs,
+                        animation.view_duration_secs,
+                    )
+                {
+                    video_segment_layer = video_segment_layer.child(
+                        div()
+                            .absolute()
+                            .left(relative(start))
+                            .w(relative(width))
+                            .top_0()
+                            .bottom_0()
+                            .min_w(px(2.0))
+                            .child(
+                                div()
+                                    .absolute()
+                                    .left(px(if segment_index > 0 { 2.0 } else { 0.0 }))
+                                    .right(px(if segment_index + 1 < video_segments.len() {
+                                        2.0
+                                    } else {
+                                        0.0
+                                    }))
+                                    .top_0()
+                                    .bottom_0()
+                                    .min_w(px(1.0))
+                                    .rounded_lg()
+                                    .border_1()
+                                    .border_color(rgba(0xffff_ff70))
+                                    .bg(rgba(0xffff_ff18)),
+                            )
+                            .with_animation(
+                                format!("video-segment-ghost-{}-{}", id, animation.generation),
+                                Animation::new(TIMELINE_RESIZE_DURATION)
+                                    .with_easing(gpui::ease_out_quint()),
+                                |ghost, delta| ghost.opacity(1.0 - delta),
+                            ),
+                    );
+                }
+                if let Some((start, width)) = visible_range {
+                    let label_start = (-start).max(0.0) / width;
+                    let hover_group = format!("video-segment-hover-{index}-{id}");
+                    let segment_element = div()
+                        .id(format!("video-segment-{index}-{id}"))
+                        .group(hover_group.clone())
+                        .absolute()
+                        .left(relative(start))
+                        .w(relative(width))
+                        .top_0()
+                        .bottom_0()
+                        .min_w(px(2.0))
+                        .when(
+                            self.cut_mode
+                                && segment_duration >= MIN_VIDEO_SEGMENT_DURATION_SECS * 2.0,
+                            |segment| segment.cursor_crosshair(),
+                        )
+                        .when(
+                            self.cut_mode
+                                && segment_duration < MIN_VIDEO_SEGMENT_DURATION_SECS * 2.0,
+                            |segment| segment.cursor_not_allowed(),
+                        )
+                        .when(!self.cut_mode, |segment| segment.cursor_pointer())
+                        .child(
+                            div()
+                                .absolute()
+                                .left(px(if segment_index > 0 { 2.0 } else { 0.0 }))
+                                .right(px(if segment_index + 1 < video_segments.len() {
+                                    2.0
+                                } else {
+                                    0.0
+                                }))
+                                .top_0()
+                                .bottom_0()
+                                .min_w(px(1.0))
+                                .overflow_hidden()
+                                .rounded_lg()
+                                .border_1()
+                                .border_color(rgb(if segment_selected {
+                                    theme::SELECTION
+                                } else {
+                                    theme::BORDER
+                                }))
+                                .bg(rgb(if segment_selected {
+                                    theme::SELECTION_FILL
+                                } else {
+                                    0x0029_313d
+                                }))
+                                .text_sm()
+                                .child(
+                                    div()
+                                        .absolute()
+                                        .left(relative(label_start))
+                                        .top_0()
+                                        .bottom_0()
+                                        .px_3()
+                                        .flex()
+                                        .items_center()
+                                        .child(media),
+                                ),
+                        )
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |editor, event: &MouseDownEvent, _, cx| {
+                                editor.selected_input = index;
+                                if let Some(time_secs) = editor.timeline_time_at(event.position.x) {
+                                    editor.activate_video_segment(id, time_secs, cx);
+                                }
+                                cx.stop_propagation();
+                            }),
+                        )
+                        .child(
+                            div()
+                                .id(format!("video-segment-start-{index}-{id}"))
+                                .absolute()
+                                .left_0()
+                                .top_0()
+                                .bottom_0()
+                                .w(px(12.0))
+                                .cursor_e_resize()
+                                .child(
+                                    div()
+                                        .absolute()
+                                        .left(px(if segment_index > 0 { 8.0 } else { 6.0 }))
+                                        .top(px(6.0))
+                                        .bottom(px(6.0))
+                                        .w(px(4.0))
+                                        .rounded_full()
+                                        .bg(rgba(0xffff_ff80))
+                                        .invisible()
+                                        .group_hover(hover_group.clone(), |handle| {
+                                            handle.visible()
+                                        }),
+                                )
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(move |editor, event, _, cx| {
+                                        editor.begin_video_segment_drag(
+                                            id,
+                                            VideoSegmentEdge::Start,
+                                            event,
+                                            cx,
+                                        );
+                                        cx.stop_propagation();
+                                    }),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .id(format!("video-segment-end-{index}-{id}"))
+                                .absolute()
+                                .right_0()
+                                .top_0()
+                                .bottom_0()
+                                .w(px(12.0))
+                                .cursor_w_resize()
+                                .child(
+                                    div()
+                                        .absolute()
+                                        .right(px(if segment_index + 1 < video_segments.len() {
+                                            8.0
+                                        } else {
+                                            6.0
+                                        }))
+                                        .top(px(6.0))
+                                        .bottom(px(6.0))
+                                        .w(px(4.0))
+                                        .rounded_full()
+                                        .bg(rgba(0xffff_ff80))
+                                        .invisible()
+                                        .group_hover(hover_group, |handle| handle.visible()),
+                                )
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(move |editor, event, _, cx| {
+                                        editor.begin_video_segment_drag(
+                                            id,
+                                            VideoSegmentEdge::End,
+                                            event,
+                                            cx,
+                                        );
+                                        cx.stop_propagation();
+                                    }),
+                                ),
+                        );
+                    let segment_element = if segment_drag.is_none()
+                        && let Some(animation) = &self.video_timeline_resize_animation
+                        && let Some((_, from_start_secs, from_end_secs)) = animation
+                            .from_ranges
+                            .iter()
+                            .find(|(animation_id, _, _)| *animation_id == id)
+                        && let Some((from_start, from_width)) = timeline_segment_range_fraction(
+                            *from_start_secs,
+                            *from_end_secs,
+                            animation.view_start_secs,
+                            animation.view_duration_secs,
+                        )
+                        && let Some((to_start, to_width)) = timeline_segment_range_fraction(
+                            display_start,
+                            display_end,
+                            animation.target_view_start_secs,
+                            animation.target_view_duration_secs,
+                        ) {
+                        let generation = animation.generation;
+                        segment_element
+                            .with_animation(
+                                format!("video-segment-resize-{index}-{id}-{generation}"),
+                                Animation::new(TIMELINE_RESIZE_DURATION)
+                                    .with_easing(gpui::ease_out_quint()),
+                                move |segment, delta| {
+                                    segment
+                                        .left(relative(
+                                            from_start + (to_start - from_start) * delta,
+                                        ))
+                                        .w(relative(from_width + (to_width - from_width) * delta))
+                                },
+                            )
+                            .into_any_element()
+                    } else {
+                        segment_element.into_any_element()
+                    };
+                    video_segment_layer = video_segment_layer.child(segment_element);
+                }
+                timeline_start = next_timeline_start;
+                previous_source_end = Some(draft_source_end_secs);
+                previous_ghost_end_fraction = ghost_end_fraction;
             }
             video_track = video_track.child(video_segment_layer);
             video_track = video_track.child(
@@ -2704,47 +3634,91 @@ impl BundleEditor {
                 .absolute()
                 .size_full(),
             );
-            for (right_id, fraction, gap_secs) in cuts {
-                video_track = video_track.child(
-                    div()
-                        .absolute()
-                        .left(relative(fraction))
-                        .top(px(-2.0))
-                        .bottom_0()
-                        .w(px(1.0))
-                        .bg(rgb(ACCENT)),
-                );
-                cut_bubbles = cut_bubbles.child(
-                    div()
-                        .absolute()
-                        .left(relative(fraction))
-                        .top(px(video_track_top - 18.0))
-                        .w(px(1.0))
-                        .child(
-                            div()
-                                .id(format!("video-cut-{index}-{right_id}"))
-                                .absolute()
-                                .top_0()
-                                .left(px(-16.0))
-                                .min_w(px(33.0))
-                                .h(px(16.0))
-                                .px_1()
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .rounded_full()
-                                .bg(rgb(ACCENT))
-                                .hover(|bubble| bubble.bg(rgb(theme::SELECTION)))
-                                .cursor_pointer()
-                                .text_xs()
-                                .text_color(rgb(theme::APP_BACKGROUND))
-                                .on_click(cx.listener(move |editor, _, _, cx| {
-                                    editor.activate_video_cut(right_id, cx);
-                                    cx.stop_propagation();
-                                }))
-                                .child(cut_gap_label(gap_secs)),
+            for (action, alignment, fraction, gap_secs, cut_animation) in cuts {
+                let indicator_id = match action {
+                    VideoCropIndicatorAction::SegmentEdge(id, VideoSegmentEdge::Start) => {
+                        format!("video-crop-start-{index}-{id}")
+                    }
+                    VideoCropIndicatorAction::SegmentEdge(id, VideoSegmentEdge::End) => {
+                        format!("video-crop-end-{index}-{id}")
+                    }
+                    VideoCropIndicatorAction::Cut(id) => format!("video-cut-{index}-{id}"),
+                };
+                let cut_line = div()
+                    .absolute()
+                    .left(relative(fraction))
+                    .top(px(-2.0))
+                    .bottom_0()
+                    .w(px(1.0))
+                    .bg(rgb(ACCENT));
+                let bubble = div()
+                    .id(indicator_id)
+                    .absolute()
+                    .top_0()
+                    .min_w(px(33.0))
+                    .h(px(16.0))
+                    .px_1()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .bg(rgb(ACCENT))
+                    .hover(|bubble| bubble.bg(rgb(theme::SELECTION)))
+                    .cursor_pointer()
+                    .text_xs()
+                    .text_color(rgb(theme::APP_BACKGROUND))
+                    .on_click(cx.listener(move |editor, _, _, cx| {
+                        match action {
+                            VideoCropIndicatorAction::SegmentEdge(id, edge) => {
+                                editor.activate_video_segment_edge(id, edge, cx);
+                            }
+                            VideoCropIndicatorAction::Cut(right_id) => {
+                                editor.activate_video_cut(right_id, cx);
+                            }
+                        }
+                        cx.stop_propagation();
+                    }))
+                    .child(cut_gap_label(gap_secs));
+                let bubble = match alignment {
+                    VideoCropIndicatorAlignment::Start => bubble.left_0().rounded_r_full(),
+                    VideoCropIndicatorAlignment::Center => bubble.left(px(-16.0)).rounded_full(),
+                    VideoCropIndicatorAlignment::End => bubble.right_0().rounded_l_full(),
+                };
+                let cut_bubble = div()
+                    .absolute()
+                    .left(relative(fraction))
+                    .top(px(video_track_top - 18.0))
+                    .w(px(1.0))
+                    .child(bubble);
+                if let Some((from, to, generation)) = cut_animation {
+                    let animation_id = match action {
+                        VideoCropIndicatorAction::SegmentEdge(id, VideoSegmentEdge::Start) => {
+                            format!("start-{id}")
+                        }
+                        VideoCropIndicatorAction::SegmentEdge(id, VideoSegmentEdge::End) => {
+                            format!("end-{id}")
+                        }
+                        VideoCropIndicatorAction::Cut(id) => format!("cut-{id}"),
+                    };
+                    video_track = video_track.child(
+                        cut_line.with_animation(
+                            format!("video-crop-line-{index}-{animation_id}-{generation}"),
+                            Animation::new(TIMELINE_RESIZE_DURATION)
+                                .with_easing(gpui::ease_out_quint()),
+                            move |cut, delta| cut.left(relative(from + (to - from) * delta)),
                         ),
-                );
+                    );
+                    cut_bubbles = cut_bubbles.child(
+                        cut_bubble.with_animation(
+                            format!("video-crop-bubble-{index}-{animation_id}-{generation}"),
+                            Animation::new(TIMELINE_RESIZE_DURATION)
+                                .with_easing(gpui::ease_out_quint()),
+                            move |cut, delta| cut.left(relative(from + (to - from) * delta)),
+                        ),
+                    );
+                } else {
+                    video_track = video_track.child(cut_line);
+                    cut_bubbles = cut_bubbles.child(cut_bubble);
+                }
             }
             tracks = tracks.child(
                 div()
@@ -2774,114 +3748,179 @@ impl BundleEditor {
         let mut zoom_segments = div().h(px(48.0)).flex_1().relative().overflow_hidden();
         for segment in &self.bundle.zoom_segments {
             let id = segment.id;
+            let resize_drag = self.zoom_segment_drag.filter(|drag| {
+                drag.id == id && matches!(drag.kind, ZoomSegmentDragKind::Resize(_))
+            });
+            let (segment_start_secs, segment_end_secs) = resize_drag
+                .map(|drag| (drag.draft_start_secs, drag.draft_end_secs))
+                .unwrap_or((segment.start_secs, segment.end_secs));
             let visible_range = timeline_segment_range_fraction(
-                segment.start_secs,
-                segment.end_secs,
+                segment_start_secs,
+                segment_end_secs,
                 view_start_secs,
                 view_duration_secs,
             );
             let selected = self.selected_zoom == Some(id);
             if let Some((start, width)) = visible_range {
                 let label_start = (-start).max(0.0) / width;
-                zoom_segments = zoom_segments.child(
-                    div()
-                        .id(("zoom-segment", id))
-                        .absolute()
-                        .left(relative(start))
-                        .w(relative(width))
-                        .top(px(3.0))
-                        .bottom(px(3.0))
-                        .min_w(px(12.0))
-                        .cursor_move()
-                        .child(
-                            div()
-                                .absolute()
-                                .top_0()
-                                .right_0()
-                                .bottom_0()
-                                .left_0()
-                                .rounded_lg()
-                                .overflow_hidden()
-                                .bg(rgba(if selected { 0xff4f_58cc } else { 0xff4f_5870 }))
-                                .border_1()
-                                .border_color(rgb(if selected {
-                                    theme::SELECTION
-                                } else {
-                                    theme::BORDER_SUBTLE
-                                }))
-                                .child(
-                                    div()
-                                        .absolute()
-                                        .left(relative(label_start))
-                                        .top_0()
-                                        .bottom_0()
-                                        .px_2()
-                                        .flex()
-                                        .items_center()
-                                        .text_xs()
-                                        .child(format!("{}x", segment.amount as u32)),
-                                ),
+                let hover_group = format!("zoom-segment-hover-{id}");
+                let segment_element = div()
+                    .id(("zoom-segment", id))
+                    .group(hover_group.clone())
+                    .absolute()
+                    .left(relative(start))
+                    .w(relative(width))
+                    .top(px(3.0))
+                    .bottom(px(3.0))
+                    .min_w(px(12.0))
+                    .cursor_move()
+                    .child(
+                        div()
+                            .absolute()
+                            .top_0()
+                            .right_0()
+                            .bottom_0()
+                            .left_0()
+                            .rounded_lg()
+                            .overflow_hidden()
+                            .bg(rgba(if selected { 0xff4f_58cc } else { 0xff4f_5870 }))
+                            .border_1()
+                            .border_color(rgb(if selected {
+                                theme::SELECTION
+                            } else {
+                                theme::BORDER_SUBTLE
+                            }))
+                            .child(
+                                div()
+                                    .absolute()
+                                    .left(relative(label_start))
+                                    .top_0()
+                                    .bottom_0()
+                                    .px_2()
+                                    .flex()
+                                    .items_center()
+                                    .text_xs()
+                                    .child(format!("{}x", segment.amount as u32)),
+                            ),
+                    )
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |editor, event: &MouseDownEvent, _, cx| {
+                            editor.begin_zoom_segment_drag(
+                                id,
+                                ZoomSegmentDragKind::Move,
+                                event,
+                                cx,
+                            );
+                            if let Some(time_secs) = editor.timeline_time_at(event.position.x) {
+                                editor.set_playback_time(time_secs);
+                            }
+                            cx.stop_propagation();
+                        }),
+                    )
+                    .child(
+                        div()
+                            .id(("zoom-segment-start", id))
+                            .absolute()
+                            .left_0()
+                            .top_0()
+                            .bottom_0()
+                            .w(px(12.0))
+                            .cursor_e_resize()
+                            .child(
+                                div()
+                                    .absolute()
+                                    .left(px(6.0))
+                                    .top(px(6.0))
+                                    .bottom(px(6.0))
+                                    .w(px(4.0))
+                                    .rounded_full()
+                                    .bg(rgba(0xffff_ff80))
+                                    .invisible()
+                                    .group_hover(hover_group.clone(), |handle| handle.visible()),
+                            )
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |editor, event, _, cx| {
+                                    editor.begin_zoom_segment_drag(
+                                        id,
+                                        ZoomSegmentDragKind::Resize(ZoomSegmentEdge::Start),
+                                        event,
+                                        cx,
+                                    );
+                                    cx.stop_propagation();
+                                }),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .id(("zoom-segment-end", id))
+                            .absolute()
+                            .right_0()
+                            .top_0()
+                            .bottom_0()
+                            .w(px(12.0))
+                            .cursor_w_resize()
+                            .child(
+                                div()
+                                    .absolute()
+                                    .right(px(6.0))
+                                    .top(px(6.0))
+                                    .bottom(px(6.0))
+                                    .w(px(4.0))
+                                    .rounded_full()
+                                    .bg(rgba(0xffff_ff80))
+                                    .invisible()
+                                    .group_hover(hover_group, |handle| handle.visible()),
+                            )
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |editor, event, _, cx| {
+                                    editor.begin_zoom_segment_drag(
+                                        id,
+                                        ZoomSegmentDragKind::Resize(ZoomSegmentEdge::End),
+                                        event,
+                                        cx,
+                                    );
+                                    cx.stop_propagation();
+                                }),
+                            ),
+                    );
+                let segment_element = if resize_drag.is_none()
+                    && let Some(animation) = &self.video_timeline_resize_animation
+                    && let Some((_, from_start_secs, from_end_secs)) = animation
+                        .from_zoom_ranges
+                        .iter()
+                        .find(|(animation_id, _, _)| *animation_id == id)
+                    && let Some((from_start, from_width)) = timeline_segment_range_fraction(
+                        *from_start_secs,
+                        *from_end_secs,
+                        animation.view_start_secs,
+                        animation.view_duration_secs,
+                    )
+                    && let Some((to_start, to_width)) = timeline_segment_range_fraction(
+                        segment_start_secs,
+                        segment_end_secs,
+                        animation.target_view_start_secs,
+                        animation.target_view_duration_secs,
+                    ) {
+                    let generation = animation.generation;
+                    segment_element
+                        .with_animation(
+                            format!("zoom-segment-resize-{id}-{generation}"),
+                            Animation::new(TIMELINE_RESIZE_DURATION)
+                                .with_easing(gpui::ease_out_quint()),
+                            move |segment, delta| {
+                                segment
+                                    .left(relative(from_start + (to_start - from_start) * delta))
+                                    .w(relative(from_width + (to_width - from_width) * delta))
+                            },
                         )
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(move |editor, event: &MouseDownEvent, _, cx| {
-                                editor.begin_zoom_segment_drag(
-                                    id,
-                                    ZoomSegmentDragKind::Move,
-                                    event,
-                                    cx,
-                                );
-                                if let Some(time_secs) = editor.timeline_time_at(event.position.x) {
-                                    editor.set_playback_time(time_secs);
-                                }
-                                cx.stop_propagation();
-                            }),
-                        )
-                        .child(
-                            div()
-                                .id(("zoom-segment-start", id))
-                                .absolute()
-                                .left_0()
-                                .top_0()
-                                .bottom_0()
-                                .w(px(8.0))
-                                .cursor_e_resize()
-                                .on_mouse_down(
-                                    MouseButton::Left,
-                                    cx.listener(move |editor, event, _, cx| {
-                                        editor.begin_zoom_segment_drag(
-                                            id,
-                                            ZoomSegmentDragKind::Resize(ZoomSegmentEdge::Start),
-                                            event,
-                                            cx,
-                                        );
-                                        cx.stop_propagation();
-                                    }),
-                                ),
-                        )
-                        .child(
-                            div()
-                                .id(("zoom-segment-end", id))
-                                .absolute()
-                                .right_0()
-                                .top_0()
-                                .bottom_0()
-                                .w(px(8.0))
-                                .cursor_w_resize()
-                                .on_mouse_down(
-                                    MouseButton::Left,
-                                    cx.listener(move |editor, event, _, cx| {
-                                        editor.begin_zoom_segment_drag(
-                                            id,
-                                            ZoomSegmentDragKind::Resize(ZoomSegmentEdge::End),
-                                            event,
-                                            cx,
-                                        );
-                                        cx.stop_propagation();
-                                    }),
-                                ),
-                        ),
-                );
+                        .into_any_element()
+                } else {
+                    segment_element.into_any_element()
+                };
+                zoom_segments = zoom_segments.child(segment_element);
             }
         }
         zoom_segments = zoom_segments.child(
@@ -3017,6 +4056,34 @@ impl BundleEditor {
             )
         });
         tracks = tracks.when_some(playback_fraction, |tracks, playback_fraction| {
+            let playhead = div()
+                .absolute()
+                .top(px(-8.0))
+                .bottom_0()
+                .left(relative(playback_fraction))
+                .w(px(2.0))
+                .bg(rgb(ACCENT))
+                .child(
+                    div()
+                        .absolute()
+                        .top(px(-5.0))
+                        .left(px(-4.0))
+                        .size(px(10.0))
+                        .rounded_full()
+                        .bg(rgb(ACCENT)),
+                );
+            let playhead = if let Some((from, to, generation)) = playback_animation {
+                playhead
+                    .with_animation(
+                        format!("playhead-resize-{generation}"),
+                        Animation::new(TIMELINE_RESIZE_DURATION)
+                            .with_easing(gpui::ease_out_quint()),
+                        move |playhead, delta| playhead.left(relative(from + (to - from) * delta)),
+                    )
+                    .into_any_element()
+            } else {
+                playhead.into_any_element()
+            };
             tracks.child(
                 div()
                     .absolute()
@@ -3024,24 +4091,7 @@ impl BundleEditor {
                     .right_0()
                     .top(px(-4.0))
                     .bottom(px(-8.0))
-                    .child(
-                        div()
-                            .absolute()
-                            .top(px(-8.0))
-                            .bottom_0()
-                            .left(relative(playback_fraction))
-                            .w(px(2.0))
-                            .bg(rgb(ACCENT))
-                            .child(
-                                div()
-                                    .absolute()
-                                    .top(px(-5.0))
-                                    .left(px(-4.0))
-                                    .size(px(10.0))
-                                    .rounded_full()
-                                    .bg(rgb(ACCENT)),
-                            ),
-                    ),
+                    .child(playhead),
             )
         });
         tracks = tracks.child(cut_bubbles);
@@ -3126,7 +4176,7 @@ impl BundleEditor {
                                             .text_color(rgb(theme::TEXT))
                                     })
                                     .on_click(cx.listener(|editor, _, _, cx| {
-                                        editor.set_playback_time(editor.current_time_secs - 5.0);
+                                        editor.set_playback_time(0.0);
                                         cx.notify();
                                     }))
                                     .child(
@@ -3177,7 +4227,7 @@ impl BundleEditor {
                                             .text_color(rgb(theme::TEXT))
                                     })
                                     .on_click(cx.listener(|editor, _, _, cx| {
-                                        editor.set_playback_time(editor.current_time_secs + 5.0);
+                                        editor.set_playback_time(editor.duration_secs);
                                         cx.notify();
                                     }))
                                     .child(
@@ -3189,6 +4239,7 @@ impl BundleEditor {
                             )
                             .child(div().w(px(68.0)).child(total_time_label)),
                     )
+                    .child(self.timeline_zoom_slider(cx))
                     .child(
                         div().w(px(80.0)).flex().justify_end().child(
                             div()
@@ -3273,9 +4324,7 @@ impl Render for BundleEditor {
                         editor.save_bundle();
                     }
                     editor.active_slider = None;
-                    if editor.zoom_segment_drag.take().is_some() {
-                        editor.save_bundle();
-                    }
+                    editor.finish_zoom_segment_drag(cx);
                     editor.finish_video_segment_drag(cx);
                     if editor.dragging_zoom_target {
                         editor.save_bundle();
@@ -3290,9 +4339,7 @@ impl Render for BundleEditor {
                         editor.save_bundle();
                     }
                     editor.active_slider = None;
-                    if editor.zoom_segment_drag.take().is_some() {
-                        editor.save_bundle();
-                    }
+                    editor.finish_zoom_segment_drag(cx);
                     editor.finish_video_segment_drag(cx);
                     if editor.dragging_zoom_target {
                         editor.save_bundle();
@@ -3412,6 +4459,11 @@ fn video_timeline_duration(bundle: &BlipBundle) -> f64 {
         .sum()
 }
 
+fn can_split_video_segment(duration_secs: f64, offset_secs: f64) -> bool {
+    offset_secs >= MIN_VIDEO_SEGMENT_DURATION_SECS
+        && duration_secs - offset_secs >= MIN_VIDEO_SEGMENT_DURATION_SECS
+}
+
 #[derive(Debug, PartialEq)]
 struct VideoCutEdit {
     timeline_start_secs: f64,
@@ -3466,6 +4518,52 @@ fn cut_gap_label(gap_secs: f64) -> String {
 
 fn video_cut_gap_secs(left_source_end_secs: f64, right_source_start_secs: f64) -> f64 {
     right_source_start_secs - left_source_end_secs
+}
+
+fn video_segment_drag_layout(
+    resize_mode: VideoSegmentResizeMode,
+    edge: Option<VideoSegmentEdge>,
+    timeline_start_secs: f64,
+    original_duration_secs: f64,
+    draft_duration_secs: f64,
+) -> (f64, f64, f64) {
+    if edge.is_none() {
+        return (
+            timeline_start_secs,
+            timeline_start_secs + original_duration_secs,
+            timeline_start_secs + original_duration_secs,
+        );
+    }
+
+    if resize_mode == VideoSegmentResizeMode::Live {
+        return (
+            timeline_start_secs,
+            timeline_start_secs + draft_duration_secs,
+            timeline_start_secs + draft_duration_secs,
+        );
+    }
+
+    let (display_start_secs, display_end_secs) = match edge {
+        Some(VideoSegmentEdge::Start) if draft_duration_secs < original_duration_secs => (
+            timeline_start_secs + original_duration_secs - draft_duration_secs,
+            timeline_start_secs + original_duration_secs,
+        ),
+        _ => (
+            timeline_start_secs,
+            timeline_start_secs + draft_duration_secs,
+        ),
+    };
+    let next_timeline_start_secs = timeline_start_secs
+        + if draft_duration_secs > original_duration_secs {
+            draft_duration_secs
+        } else {
+            original_duration_secs
+        };
+    (
+        display_start_secs,
+        display_end_secs,
+        next_timeline_start_secs,
+    )
 }
 
 fn resize_video_segment_range(
@@ -4304,6 +5402,10 @@ fn zoomed_timeline_view(
     (start_secs, duration_secs)
 }
 
+fn timeline_extent_secs(duration_secs: f64) -> f64 {
+    duration_secs.max(0.0) + TIMELINE_EXPANSION_SPACE_SECS
+}
+
 fn panned_timeline_view(
     view_start_secs: f64,
     view_duration_secs: f64,
@@ -4512,15 +5614,18 @@ fn camera_transform(
 
 #[cfg(test)]
 mod tests {
-    use crate::bundle::{BlipBundle, VideoSegment, ZoomSegment, ZoomTransitionSpeed};
+    use crate::bundle::{
+        BlipBundle, VideoSegment, VideoSegmentResizeMode, ZoomSegment, ZoomTransitionSpeed,
+    };
 
     use super::{
-        VideoSegmentEdge, ZoomSegmentEdge, cubic_bezier_ease, cut_gap_label, edit_video_cut,
-        map_output_transform_to_item, panned_timeline_view, playback_position,
-        resize_video_segment_range, resize_zoom_segment_range, ripple_delete_ranges,
-        ripple_insert_ranges, source_time_at, timeline_range_fraction, timeline_ruler_interval,
-        timeline_ruler_label, timeline_segment_range_fraction, timeline_time_fraction,
-        timeline_timecode, video_cut_gap_secs, zoom_segment_range_at, zoom_transform_at,
+        VideoSegmentEdge, ZoomSegmentEdge, can_split_video_segment, cubic_bezier_ease,
+        cut_gap_label, edit_video_cut, map_output_transform_to_item, panned_timeline_view,
+        playback_position, resize_video_segment_range, resize_zoom_segment_range,
+        ripple_delete_ranges, ripple_insert_ranges, source_time_at, timeline_extent_secs,
+        timeline_range_fraction, timeline_ruler_interval, timeline_ruler_label,
+        timeline_segment_range_fraction, timeline_time_fraction, timeline_timecode,
+        video_cut_gap_secs, video_segment_drag_layout, zoom_segment_range_at, zoom_transform_at,
         zoomed_timeline_view,
     };
 
@@ -4556,6 +5661,39 @@ mod tests {
         assert_eq!(panned_timeline_view(20.0, 40.0, 100.0, -0.25), 30.0);
         assert_eq!(panned_timeline_view(20.0, 40.0, 100.0, 1.0), 0.0);
         assert_eq!(panned_timeline_view(50.0, 40.0, 100.0, -1.0), 60.0);
+    }
+
+    #[test]
+    fn timeline_extent_includes_space_for_expansion() {
+        assert_eq!(timeline_extent_secs(10.0), 15.0);
+    }
+
+    #[test]
+    fn live_video_resize_reflows_the_timeline_during_the_drag() {
+        assert_eq!(
+            video_segment_drag_layout(
+                VideoSegmentResizeMode::Live,
+                Some(VideoSegmentEdge::Start),
+                2.0,
+                4.0,
+                3.0,
+            ),
+            (2.0, 5.0, 5.0)
+        );
+    }
+
+    #[test]
+    fn ghost_video_resize_preserves_the_original_space_during_the_drag() {
+        assert_eq!(
+            video_segment_drag_layout(
+                VideoSegmentResizeMode::Ghost,
+                Some(VideoSegmentEdge::Start),
+                2.0,
+                4.0,
+                3.0,
+            ),
+            (3.0, 6.0, 6.0)
+        );
     }
 
     #[test]
@@ -4696,6 +5834,18 @@ mod tests {
         assert_eq!(merge.removed_id, Some(2));
         assert_eq!(segments.len(), 1);
         assert_eq!(segments[0].source_end_secs, 7.0);
+    }
+
+    #[test]
+    fn video_cuts_require_at_least_one_second_on_each_side() {
+        assert!(!can_split_video_segment(1.999, 1.0));
+        assert!(can_split_video_segment(2.0, 1.0));
+        assert!(!can_split_video_segment(2.0, 0.999));
+        assert!(!can_split_video_segment(2.0, 1.001));
+        assert!(can_split_video_segment(3.0, 1.0));
+        assert!(can_split_video_segment(3.0, 2.0));
+        assert!(!can_split_video_segment(3.0, 0.999));
+        assert!(!can_split_video_segment(3.0, 2.001));
     }
 
     #[test]

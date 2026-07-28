@@ -5,13 +5,18 @@ use std::time::{Duration, Instant};
 
 use async_channel::Sender;
 use blip_avfoundation::{HlsWriter, Mp4Writer, WriterError};
-use blip_sck::{CaptureFilter, Capturer, PixelFormat, ShareableContent, StreamConfig, VideoFrame};
+use blip_sck::{
+    CaptureColorSpace, CaptureFilter, Capturer, PixelFormat, ShareableContent, StreamConfig,
+    VideoFrame,
+};
 
 use crate::profiles::RecordingFormat;
 
 const CAPTURE_TIMEOUT: Duration = Duration::from_secs(5);
 const FRAME_QUEUE_DEPTH: usize = 8;
 const MAX_CONCURRENT_HLS_UPLOADS: usize = 3;
+const MIN_MP4_BITRATE: f64 = 2_500_000.0;
+const MAX_MP4_BITRATE: f64 = 8_000_000.0;
 
 #[derive(Clone, Copy)]
 pub(crate) enum CaptureSpec {
@@ -204,7 +209,8 @@ fn record(
         .with_fps(60)
         .with_cursor(true)
         .with_queue_depth(8)
-        .with_pixel_format(PixelFormat::Bgra);
+        .with_pixel_format(PixelFormat::Bgra)
+        .with_color_space(CaptureColorSpace::Srgb);
     if let Some((x, y, width, height)) = source_rect {
         config = config.with_source_rect(x, y, width, height);
     }
@@ -286,14 +292,15 @@ fn capture_filter(
         .ok_or_else(|| "the selected display is no longer available".to_owned())?;
     let process_id = i32::try_from(std::process::id())
         .map_err(|_| "process ID exceeds ScreenCaptureKit's range".to_owned())?;
-    let own_windows = content.windows().into_iter().filter(|window| {
+    let capture_ui_windows = content.windows().into_iter().filter(|window| {
         window
             .application()
             .is_some_and(|application| application.process_id() == process_id)
+            && window.layer() != 0
     });
     Ok((
         CaptureFilter::display(display)
-            .excluding_windows(own_windows)
+            .excluding_windows(capture_ui_windows)
             .build(),
         source_rect,
     ))
@@ -353,7 +360,25 @@ fn write_frames(
                             )?
                         })
                     } else {
-                        Writer::Mp4(Mp4Writer::new(output, frame.width(), frame.height(), 60)?)
+                        let writer = if format == RecordingFormat::Mp4 {
+                            Mp4Writer::new_with_bitrate_preserving_color(
+                                output,
+                                frame.width(),
+                                frame.height(),
+                                60,
+                                mp4_bitrate(frame.width(), frame.height(), 60),
+                                frame.image_buffer(),
+                            )?
+                        } else {
+                            Mp4Writer::new_preserving_color(
+                                output,
+                                frame.width(),
+                                frame.height(),
+                                60,
+                                frame.image_buffer(),
+                            )?
+                        };
+                        Writer::Mp4(writer)
                     }),
                 };
                 if is_first {
@@ -403,6 +428,14 @@ fn write_frames(
         "Video writer finalized successfully"
     );
     Ok(())
+}
+
+fn mp4_bitrate(width: usize, height: usize, fps: u32) -> usize {
+    let pixel_ratio = width as f64 * height as f64 / (1920.0 * 1080.0);
+    let fps_ratio = f64::from(fps.min(60)) / 30.0;
+    (1_500_000.0 + pixel_ratio * 1_500_000.0 + fps_ratio * 500_000.0)
+        .clamp(MIN_MP4_BITRATE, MAX_MP4_BITRATE)
+        .round() as usize
 }
 
 type HlsUploadWorker = thread::JoinHandle<Result<Option<String>, String>>;
@@ -476,7 +509,23 @@ async fn receive_hls_upload_result(
 
 #[cfg(test)]
 mod tests {
-    use super::display_relative_intersection;
+    use super::{MAX_MP4_BITRATE, MIN_MP4_BITRATE, display_relative_intersection, mp4_bitrate};
+
+    #[test]
+    fn scales_mp4_bitrate_with_resolution_and_frame_rate() {
+        let hd_60 = mp4_bitrate(1920, 1080, 60);
+
+        assert_eq!(hd_60, 4_000_000);
+        assert!(mp4_bitrate(1280, 720, 30) < hd_60);
+        assert!(mp4_bitrate(1920, 1080, 30) < hd_60);
+        assert!(mp4_bitrate(3840, 2160, 60) > hd_60);
+    }
+
+    #[test]
+    fn bounds_mp4_bitrate() {
+        assert_eq!(mp4_bitrate(320, 240, 1), MIN_MP4_BITRATE as usize);
+        assert_eq!(mp4_bitrate(7680, 4320, 120), MAX_MP4_BITRATE as usize);
+    }
 
     #[test]
     fn translates_window_bounds_to_display_coordinates() {

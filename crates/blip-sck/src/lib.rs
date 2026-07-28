@@ -12,7 +12,7 @@ mod target;
 mod video_frame;
 
 pub use capture::{Capturer, CapturerBuilder};
-pub use config::{PixelFormat, StreamConfig, StreamConfigBuilder};
+pub use config::{CaptureColorSpace, PixelFormat, StreamConfig, StreamConfigBuilder};
 pub use content::ShareableContent;
 pub use filter::{ApplicationFilterBuilder, CaptureFilter, DisplayFilterBuilder};
 pub use permission::{has_permission, request_permission};

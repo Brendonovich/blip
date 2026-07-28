@@ -14,7 +14,7 @@ block2 = "0.6.2"
 dispatch2 = "0.3.0"
 objc2 = "0.6.2"
 objc2-core-foundation = "0.3.2"
-objc2-core-graphics = { version = "0.3.2", features = ["CGDirectDisplay"] }
+objc2-core-graphics = { version = "0.3.2", features = ["CGColorSpace", "CGDirectDisplay"] }
 objc2-core-media = { version = "0.3.2", features = ["CMSampleBuffer", "objc2-core-video"] }
 objc2-core-video.workspace = true
 objc2-foundation = "0.3.2"
