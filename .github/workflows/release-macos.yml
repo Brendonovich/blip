@@ -3,15 +3,15 @@ name: Release macOS
 on:
   workflow_dispatch:
     inputs:
-      tag:
-        description: Release tag (for example, v0.1.0)
+      bump:
+        description: Version bump
         required: true
-        type: string
-      prerelease:
-        description: Mark as a prerelease
-        required: true
-        default: false
-        type: boolean
+        default: patch
+        type: choice
+        options:
+          - patch
+          - minor
+          - major
 
 permissions:
   contents: write
@@ -31,6 +31,43 @@ jobs:
 
       - name: Cache Rust build
         uses: Swatinem/rust-cache@v2
+
+      - name: Compute release version
+        env:
+          BUMP: ${{ inputs.bump }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          current_version="$(cargo pkgid -p blip-capture | perl -ne 'print $1 if /[\@#]([^\@#]+)$/')"
+          studio_version="$(cargo pkgid -p blip-studio | perl -ne 'print $1 if /[\@#]([^\@#]+)$/')"
+          if [[ "$studio_version" != "$current_version" ]]; then
+            echo "Capture and Studio versions must match for a combined release" >&2
+            exit 1
+          fi
+
+          latest_version="$(gh api --paginate "repos/$GITHUB_REPOSITORY/tags?per_page=100" \
+            --jq '.[].name | select(test("^v[0-9]+\\.[0-9]+\\.[0-9]+$")) | ltrimstr("v")' \
+            | sort -t. -k1,1n -k2,2n -k3,3n | tail -n 1)"
+          if [[ -z "$latest_version" ]]; then
+            base_version="$current_version"
+          else
+            base_version="$(printf '%s\n%s\n' "$current_version" "$latest_version" \
+              | sort -t. -k1,1n -k2,2n -k3,3n | tail -n 1)"
+          fi
+
+          IFS=. read -r major minor patch <<< "$base_version"
+          case "$BUMP" in
+            major) version="$((major + 1)).0.0" ;;
+            minor) version="$major.$((minor + 1)).0" ;;
+            patch) version="$major.$minor.$((patch + 1))" ;;
+          esac
+
+          VERSION="$version" perl -pi -e 's/^version = "[^"]+"/version = "$ENV{VERSION}"/' \
+            apps/blip-capture/Cargo.toml apps/blip-studio/Cargo.toml
+          cargo metadata --no-deps --format-version 1 >/dev/null
+
+          echo "RELEASE_VERSION=$version" >> "$GITHUB_ENV"
+          echo "RELEASE_TAG=v$version" >> "$GITHUB_ENV"
+          echo "Release version: $version ($BUMP bump)"
 
       - name: Set up Apple signing
         uses: ./.github/actions/setup-apple-signing
@@ -55,7 +92,6 @@ jobs:
 
       - name: Generate update feeds
         env:
-          RELEASE_TAG: ${{ inputs.tag }}
           BLIP_BUILD_NUMBER: ${{ github.run_number }}
           SPARKLE_PRIVATE_KEY: ${{ secrets.SPARKLE_PRIVATE_KEY }}
         run: |
@@ -69,8 +105,8 @@ jobs:
             echo "Capture and Studio versions must match for a combined release" >&2
             exit 1
           fi
-          if [[ "$RELEASE_TAG" != "v$version" ]]; then
-            echo "Release tag must match the app version: v$version" >&2
+          if [[ "$version" != "$RELEASE_VERSION" ]]; then
+            echo "Built app version does not match computed release version: $RELEASE_VERSION" >&2
             exit 1
           fi
           capture_signature="$(printf '%s' "$SPARKLE_PRIVATE_KEY" | target/sparkle-2.9.4/bin/sign_update --ed-key-file - -p target/release/bundle/dmg/Blip-Capture.dmg)"
@@ -91,13 +127,8 @@ jobs:
       - name: Create GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
-          RELEASE_TAG: ${{ inputs.tag }}
-          PRERELEASE: ${{ inputs.prerelease }}
         run: |
           args=(--target "$GITHUB_SHA" --generate-notes --title "$RELEASE_TAG")
-          if [[ "$PRERELEASE" == "true" ]]; then
-            args+=(--prerelease)
-          fi
           gh release create "$RELEASE_TAG" \
             target/release/bundle/dmg/Blip-Capture.dmg \
             target/release/bundle/dmg/Blip-Studio.dmg \
