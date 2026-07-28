@@ -86,7 +86,7 @@ rm -rf "$app" "$bundle_dir/Blip Studio.dSYM"
 mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
 cp "$binary" "$app/Contents/MacOS/blip-studio"
 cp "$script_dir/Info.plist" "$app/Contents/Info.plist"
-"$workspace/apps/embed-sparkle.sh" "$app" "$target_dir"
+"$workspace/apps/embed-sparkle.sh" "$app" "$target_dir" "$identity"
 
 if [[ "$identity" != "-" ]]; then
     if [[ -z "${SPARKLE_PUBLIC_KEY:-}" ]]; then
