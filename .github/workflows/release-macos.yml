@@ -63,7 +63,7 @@ jobs:
 
           VERSION="$version" perl -pi -e 's/^version = "[^"]+"/version = "$ENV{VERSION}"/' \
             apps/blip-capture/Cargo.toml apps/blip-studio/Cargo.toml
-          cargo metadata --no-deps --format-version 1 >/dev/null
+          cargo metadata --format-version 1 >/dev/null
 
           echo "RELEASE_VERSION=$version" >> "$GITHUB_ENV"
           echo "RELEASE_TAG=v$version" >> "$GITHUB_ENV"
