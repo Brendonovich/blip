@@ -1,34 +1,38 @@
 # Blip
 
-Blip is a little Rust workspace for experimenting with native macOS screen
-capture, recording, compositing, and streaming. The main apps are:
+Blip contains macOS capture, recording, compositing, streaming, and hosting
+projects.
 
 ## Blip Capture
 
-The simple, everyday recorder. Pick a display, window, or region, hit record,
-and save the result to a folder or the clipboard. See
-[`apps/blip-capture`](apps/blip-capture) for macOS build instructions.
+Blip Capture records a display, window, or region with an optional camera
+preview, then saves, edits, or uploads the recording. It uses ScreenCaptureKit
+and AVFoundation for capture and encoding, WGPU for composition, and GPUI for
+the interface. See [`apps/blip-capture`](apps/blip-capture) for build and remote
+recording instructions.
 
 ## Blip Server
 
-The optional private recording backend. It uses Effect v4 with per-user
-S3-compatible storage. Deploy the [Node/SQLite app](apps/blip-server) or the
-[Alchemy Cloudflare/D1 app](apps/blip-server-cloudflare); both share
-[`packages/blip-server-app`](packages/blip-server-app), with contracts in
-[`packages/blip-server-domain`](packages/blip-server-domain).
+Blip Server accepts recordings, stores them in each user's S3-compatible
+bucket, and serves private playback links. A shared SolidStart and Effect
+application runs as either a [Node process with SQLite](apps/blip-server) or a
+[Cloudflare Worker with D1](apps/blip-server-cloudflare), with authentication
+provided by Better Auth.
 
 ## Blip Studio
 
-The more ambitious one: a real-time scene compositor for captured screens and
-cameras, with an interactive preview and RTMP streaming. It can also run
-headlessly from a JSON scene. See [`apps/blip-studio`](apps/blip-studio) for
-macOS build and distribution notes.
+Blip Studio combines screen, window, camera, and graphic sources into a scene
+and streams it over RTMP. It uses ScreenCaptureKit and AVFoundation for inputs,
+WGPU for composition, FFmpeg for streaming, and GPUI for interactive control;
+it can also run a JSON scene without the interface. See
+[`apps/blip-studio`](apps/blip-studio) for build and distribution instructions.
 
 ## Blip CLI
 
-The useful low-level tool for poking at the capture stack. It lists available
-displays and windows, streams frames for inspection, and records directly to
-MP4. Run `cargo run -p blip-cli -- --help` to see the commands.
+Blip CLI lists and inspects capture targets, streams frames for diagnostics,
+and records displays or windows to MP4. It calls the shared ScreenCaptureKit
+and AVFoundation crates without a graphical interface. Run
+`cargo run -p blip-cli -- --help` to see the commands.
 
-The shared capture plumbing lives in `crates/`, while `gpui/` contains the UI
-framework used by the desktop apps.
+Shared capture, media, compositor, and updater code lives in `crates/`. The
+desktop interfaces use the GPUI source in `gpui/`.

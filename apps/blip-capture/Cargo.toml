@@ -23,7 +23,7 @@ gpui.workspace = true
 gpui_platform.workspace = true
 image.workspace = true
 objc2.workspace = true
-objc2-app-kit = { workspace = true, features = ["NSApplication", "NSCell", "NSMenu", "NSMenuItem", "NSResponder", "NSRunningApplication", "NSScreen", "libc", "objc2-core-graphics"] }
+objc2-app-kit = { workspace = true, features = ["NSApplication", "NSButton", "NSCell", "NSControl", "NSMenu", "NSMenuItem", "NSResponder", "NSRunningApplication", "NSScreen", "NSStatusBar", "NSStatusBarButton", "NSStatusItem", "NSView", "libc", "objc2-core-graphics"] }
 objc2-foundation.workspace = true
 raw-window-handle.workspace = true
 reqwest.workspace = true

@@ -8,7 +8,7 @@ use std::rc::Rc;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-use blip_avfoundation::{CameraDevice, list_video_devices};
+use blip_avfoundation::{CameraDevice, list_video_devices, request_camera_access};
 use blip_sck::{CaptureError, Display, ShareableContent, Window as CaptureWindow};
 use chrono::Local;
 use clap::Parser;
@@ -32,8 +32,9 @@ use objc2::{
 };
 use objc2_app_kit::{
     NSApplication, NSApplicationActivationOptions, NSApplicationActivationPolicy,
-    NSControlStateValueOn, NSMenu, NSMenuItem, NSRunningApplication, NSScreen, NSView,
-    NSWindowAnimationBehavior, NSWindowCollectionBehavior, NSWindowStyleMask,
+    NSControlStateValueOn, NSMenu, NSMenuItem, NSRunningApplication, NSScreen, NSStatusBar,
+    NSStatusItem, NSVariableStatusItemLength, NSView, NSWindowAnimationBehavior,
+    NSWindowCollectionBehavior, NSWindowStyleMask,
 };
 use objc2_foundation::{NSObject, NSObjectProtocol, NSPoint, NSRect, NSSize, NSString};
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
@@ -75,7 +76,9 @@ const ACCENT: u32 = 0x00ff_4f58;
 const OVERLAY_BLACK: u32 = 0x0000_0060;
 const OVERLAY_BLUE_TINT: u32 = 0x184d_8280;
 const CAPTURE_TIMEOUT: Duration = Duration::from_secs(5);
+const CAMERA_PERMISSION_TIMEOUT: Duration = Duration::from_secs(30);
 const WINDOW_POLL_INTERVAL: Duration = Duration::from_millis(250);
+const CAMERA_WINDOW_AUTOSAVE_NAME: &str = "Camera Preview";
 
 actions!(
     blip_capture,
@@ -234,6 +237,55 @@ impl DestinationMenuHandler {
         // SAFETY: The object has fully initialized ivars and NSObject permits `init`.
         unsafe { msg_send![super(this), init] }
     }
+}
+
+#[derive(Clone, Copy)]
+enum MenuBarAction {
+    NewRecording,
+    CheckForUpdates,
+    Quit,
+}
+
+struct MenuBarHandlerIvars {
+    sender: async_channel::Sender<MenuBarAction>,
+}
+
+define_class!(
+    #[unsafe(super(NSObject))]
+    #[ivars = MenuBarHandlerIvars]
+    struct MenuBarHandler;
+
+    unsafe impl NSObjectProtocol for MenuBarHandler {}
+
+    impl MenuBarHandler {
+        #[unsafe(method(newRecording:))]
+        fn new_recording(&self, _: &NSMenuItem) {
+            self.ivars().sender.try_send(MenuBarAction::NewRecording).ok();
+        }
+
+        #[unsafe(method(checkForUpdates:))]
+        fn check_for_updates(&self, _: &NSMenuItem) {
+            self.ivars().sender.try_send(MenuBarAction::CheckForUpdates).ok();
+        }
+
+        #[unsafe(method(quit:))]
+        fn quit(&self, _: &NSMenuItem) {
+            self.ivars().sender.try_send(MenuBarAction::Quit).ok();
+        }
+    }
+);
+
+impl MenuBarHandler {
+    fn new(sender: async_channel::Sender<MenuBarAction>) -> Retained<Self> {
+        let this = Self::alloc().set_ivars(MenuBarHandlerIvars { sender });
+        // SAFETY: The object has fully initialized ivars and NSObject permits `init`.
+        unsafe { msg_send![super(this), init] }
+    }
+}
+
+struct MenuBarItem {
+    _item: Retained<NSStatusItem>,
+    _handler: Retained<MenuBarHandler>,
 }
 
 struct SelectionState {
@@ -2670,6 +2722,9 @@ fn configure_camera_window(window: &Window) -> Option<u32> {
     // SAFETY: GPUI's AppKit handle points to the live NSView owned by this main-thread window.
     let view = unsafe { handle.ns_view.cast::<NSView>().as_ref() };
     let window = view.window()?;
+    let autosave_name = NSString::from_str(CAMERA_WINDOW_AUTOSAVE_NAME);
+    window.setFrameUsingName(&autosave_name);
+    window.setFrameAutosaveName(&autosave_name);
     window.setStyleMask(NSWindowStyleMask::NonactivatingPanel);
     window.setHasShadow(false);
     window.setAnimationBehavior(NSWindowAnimationBehavior::None);
@@ -3432,6 +3487,42 @@ fn import_profile_urls(cx: &mut App, urls: Vec<String>) {
     }
 }
 
+fn create_menu_bar_item(sender: async_channel::Sender<MenuBarAction>) -> Option<MenuBarItem> {
+    let main_thread = MainThreadMarker::new()?;
+    let item = NSStatusBar::systemStatusBar().statusItemWithLength(NSVariableStatusItemLength);
+    item.button(main_thread)?
+        .setTitle(&NSString::from_str("Blip"));
+
+    let menu = NSMenu::new(main_thread);
+    let handler = MenuBarHandler::new(sender);
+    let empty = NSString::from_str("");
+    let add_action = |title: &str, action| {
+        // SAFETY: `handler` implements each supplied selector with the NSMenuItem signature.
+        let menu_item = unsafe {
+            NSMenuItem::initWithTitle_action_keyEquivalent(
+                NSMenuItem::alloc(main_thread),
+                &NSString::from_str(title),
+                Some(action),
+                &empty,
+            )
+        };
+        // SAFETY: `MenuBarItem` retains the handler for as long as the status item is visible.
+        unsafe { menu_item.setTarget(Some(&handler)) };
+        menu.addItem(&menu_item);
+    };
+    add_action("New Recording", sel!(newRecording:));
+    menu.addItem(&NSMenuItem::separatorItem(main_thread));
+    add_action("Check for Updates…", sel!(checkForUpdates:));
+    menu.addItem(&NSMenuItem::separatorItem(main_thread));
+    add_action("Quit Blip Capture", sel!(quit:));
+    item.setMenu(Some(&menu));
+
+    Some(MenuBarItem {
+        _item: item,
+        _handler: handler,
+    })
+}
+
 fn run_app(open_path: Option<PathBuf>) {
     let (profile_sender, profile_receiver) = async_channel::unbounded();
     let app = application().with_assets(assets::CaptureAssets);
@@ -3440,6 +3531,13 @@ fn run_app(open_path: Option<PathBuf>) {
     });
     app.run(move |cx| {
         blip_updater::start();
+        cx.background_executor()
+            .spawn(async {
+                if let Err(error) = request_camera_access(CAMERA_PERMISSION_TIMEOUT) {
+                    eprintln!("blip-capture: failed to request camera permission: {error}");
+                }
+            })
+            .detach();
         cx.bind_keys([
             KeyBinding::new("cmd-w", CloseWindow, None),
             KeyBinding::new("cmd-q", CloseAllWindows, None),
@@ -3462,6 +3560,8 @@ fn run_app(open_path: Option<PathBuf>) {
         let visible = Rc::new(Cell::new(false));
         let escape_hotkey = Rc::new(Cell::new(ptr::null_mut()));
         let target_cache = Rc::new(RefCell::new(None));
+        let (menu_bar_sender, menu_bar_receiver) = async_channel::unbounded();
+        let menu_bar_item = create_menu_bar_item(menu_bar_sender);
         let (hotkey_sender, hotkey_receiver) = async_channel::unbounded();
         if let Err(status) = register_reopen_hotkey(hotkey_sender) {
             eprintln!("blip-capture: failed to register Cmd-Shift-8 ({status})");
@@ -3469,6 +3569,27 @@ fn run_app(open_path: Option<PathBuf>) {
         let hotkey_visible = Rc::clone(&visible);
         let hotkey_escape = Rc::clone(&escape_hotkey);
         let hotkey_target_cache = Rc::clone(&target_cache);
+        let menu_bar_visible = Rc::clone(&visible);
+        let menu_bar_escape = Rc::clone(&escape_hotkey);
+        let menu_bar_target_cache = Rc::clone(&target_cache);
+        cx.spawn(async move |cx| {
+            let _menu_bar_item = menu_bar_item;
+            while let Ok(action) = menu_bar_receiver.recv().await {
+                match action {
+                    MenuBarAction::NewRecording => {
+                        let visible = Rc::clone(&menu_bar_visible);
+                        let escape_hotkey = Rc::clone(&menu_bar_escape);
+                        let target_cache = Rc::clone(&menu_bar_target_cache);
+                        cx.update(|cx| {
+                            open_capture(cx, &visible, &escape_hotkey, &target_cache);
+                        });
+                    }
+                    MenuBarAction::CheckForUpdates => blip_updater::check_for_updates(),
+                    MenuBarAction::Quit => cx.update(|cx| cx.quit()),
+                }
+            }
+        })
+        .detach();
         cx.spawn(async move |cx| {
             while let Ok(action) = hotkey_receiver.recv().await {
                 match action {

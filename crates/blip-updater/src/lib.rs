@@ -1,13 +1,30 @@
 use std::ffi::CString;
 use std::ptr;
+use std::sync::atomic::{AtomicPtr, Ordering};
 
 use objc2::msg_send;
 use objc2::runtime::{AnyClass, AnyObject};
+
+static UPDATER_CONTROLLER: AtomicPtr<AnyObject> = AtomicPtr::new(ptr::null_mut());
 
 /// Starts Sparkle's scheduled update checks when running from a packaged app.
 pub fn start() {
     if let Err(error) = start_inner() {
         eprintln!("blip-updater: {error}");
+    }
+}
+
+/// Opens Sparkle's update UI when running from a packaged app.
+pub fn check_for_updates() {
+    let controller = UPDATER_CONTROLLER.load(Ordering::Relaxed);
+    if controller.is_null() {
+        return;
+    }
+
+    // SAFETY: `start_inner` stores a process-lifetime Sparkle controller, and callers invoke this
+    // from the application's main thread.
+    unsafe {
+        let _: () = msg_send![controller, checkForUpdates: ptr::null_mut::<AnyObject>()];
     }
 }
 
@@ -44,6 +61,7 @@ fn start_inner() -> Result<(), String> {
         if controller.is_null() {
             return Err("failed to initialize Sparkle updater".to_owned());
         }
+        UPDATER_CONTROLLER.store(controller, Ordering::Relaxed);
     }
 
     Ok(())
