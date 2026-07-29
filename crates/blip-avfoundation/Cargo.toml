@@ -7,6 +7,7 @@ edition.workspace = true
 workspace = true
 
 [dependencies]
+blip-media-time.workspace = true
 block2.workspace = true
 core-foundation.workspace = true
 core-video.workspace = true

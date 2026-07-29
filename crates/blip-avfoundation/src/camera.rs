@@ -3,6 +3,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, mpsc};
 use std::time::Duration;
 
+use blip_media_time::FrameTimestamp;
 use block2::RcBlock;
 use dispatch2::{DispatchQueue, DispatchRetained};
 use objc2::rc::Retained;
@@ -18,7 +19,10 @@ use objc2_av_foundation::{
     AVCaptureVideoDataOutput, AVCaptureVideoDataOutputSampleBufferDelegate, AVMediaTypeVideo,
 };
 use objc2_core_foundation::{CFRetained, Type as _};
-use objc2_core_media::{CMSampleBuffer, CMTime, CMVideoFormatDescriptionGetDimensions};
+use objc2_core_media::{
+    CMClock, CMSampleBuffer, CMSyncConvertTime, CMTime, CMTimeFlags,
+    CMVideoFormatDescriptionGetDimensions,
+};
 use objc2_core_video::{
     CVImageBuffer, CVPixelBufferGetHeight, CVPixelBufferGetWidth, kCVPixelFormatType_32BGRA,
     kCVPixelFormatType_420YpCbCr8BiPlanarFullRange,
@@ -59,6 +63,7 @@ impl CameraDevice {
 pub struct CameraFrame {
     sample_buffer: CFRetained<CMSampleBuffer>,
     image_buffer: CFRetained<CVImageBuffer>,
+    timestamp: Option<FrameTimestamp>,
 }
 
 // SAFETY: Captured sample and image buffers are immutable while retained, and CoreMedia and
@@ -66,12 +71,13 @@ pub struct CameraFrame {
 unsafe impl Send for CameraFrame {}
 
 impl CameraFrame {
-    fn new(sample_buffer: &CMSampleBuffer) -> Option<Self> {
+    fn new(sample_buffer: &CMSampleBuffer, timestamp: Option<FrameTimestamp>) -> Option<Self> {
         // SAFETY: AVFoundation provides a valid sample for the duration of the delegate callback.
         let image_buffer = unsafe { sample_buffer.image_buffer() }?;
         Some(Self {
             sample_buffer: sample_buffer.retain(),
             image_buffer,
+            timestamp,
         })
     }
 
@@ -101,10 +107,17 @@ impl CameraFrame {
         let seconds = unsafe { self.sample_buffer.presentation_time_stamp().seconds() };
         Duration::try_from_secs_f64(seconds).ok()
     }
+
+    /// Returns the frame PTS mapped into the platform's shared monotonic clock domain.
+    #[must_use]
+    pub const fn timestamp(&self) -> Option<FrameTimestamp> {
+        self.timestamp
+    }
 }
 
 struct OutputIvars {
     callbacks: Mutex<Callbacks>,
+    synchronization_clock: Option<Retained<CMClock>>,
 }
 
 struct Callbacks {
@@ -127,7 +140,12 @@ define_class!(
             sample_buffer: &CMSampleBuffer,
             _connection: &AVCaptureConnection,
         ) {
-            let Some(frame) = CameraFrame::new(sample_buffer) else {
+            let timestamp = self
+                .ivars()
+                .synchronization_clock
+                .as_deref()
+                .and_then(|clock| normalized_frame_timestamp(clock, sample_buffer));
+            let Some(frame) = CameraFrame::new(sample_buffer, timestamp) else {
                 return;
             };
             let _ = catch_unwind(AssertUnwindSafe(|| {
@@ -156,13 +174,38 @@ define_class!(
 );
 
 impl CameraOutput {
-    fn new(callbacks: Callbacks) -> Retained<Self> {
+    fn new(
+        callbacks: Callbacks,
+        synchronization_clock: Option<Retained<CMClock>>,
+    ) -> Retained<Self> {
         let this = Self::alloc().set_ivars(OutputIvars {
             callbacks: Mutex::new(callbacks),
+            synchronization_clock,
         });
         // SAFETY: `this` is allocated with fully initialized ivars and NSObject permits `init`.
         unsafe { msg_send![super(this), init] }
     }
+}
+
+fn normalized_frame_timestamp(
+    source_clock: &CMClock,
+    sample_buffer: &CMSampleBuffer,
+) -> Option<FrameTimestamp> {
+    // SAFETY: Core Media returns its process-wide retained host clock singleton.
+    let host_clock = unsafe { CMClock::host_time_clock() };
+    // SAFETY: The retained sample buffer has immutable timing metadata.
+    let pts = unsafe { sample_buffer.presentation_time_stamp() };
+    // SAFETY: Both arguments are retained CMClock instances with valid Core Media types.
+    let host_pts = unsafe { CMSyncConvertTime(pts, source_clock, &host_clock) };
+    if !host_pts.flags.contains(CMTimeFlags::Valid)
+        || host_pts
+            .flags
+            .intersects(CMTimeFlags::ImpliedValueFlagsMask)
+        || host_pts.epoch != 0
+    {
+        return None;
+    }
+    FrameTimestamp::from_ratio(host_pts.value, host_pts.timescale)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -281,10 +324,6 @@ impl CameraCapturer {
         // SAFETY: Both objects are initialized before being configured and retained by the capturer.
         let (session, output) =
             unsafe { (AVCaptureSession::new(), AVCaptureVideoDataOutput::new()) };
-        let delegate = CameraOutput::new(Callbacks {
-            frame: callback,
-            dropped: drop_callback,
-        });
         let queue = DispatchQueue::new("dev.brendonovich.blip.camera", None);
         let selected_format = select_format(&raw_device, fps);
 
@@ -332,13 +371,22 @@ impl CameraCapturer {
             let values: [&AnyObject; 1] = [&*value];
             let settings = NSDictionary::from_slices(&[&*key], &values);
             output.setVideoSettings(Some(&settings));
-            let protocol =
-                ProtocolObject::<dyn AVCaptureVideoDataOutputSampleBufferDelegate>::from_ref(
-                    &*delegate,
-                );
-            output.setSampleBufferDelegate_queue(Some(protocol), Some(&queue));
             session.commitConfiguration();
         }
+        // SAFETY: The configured session owns the synchronization clock for all output PTS values.
+        let synchronization_clock = unsafe { session.synchronizationClock() };
+        let delegate = CameraOutput::new(
+            Callbacks {
+                frame: callback,
+                dropped: drop_callback,
+            },
+            synchronization_clock,
+        );
+        let protocol = ProtocolObject::<dyn AVCaptureVideoDataOutputSampleBufferDelegate>::from_ref(
+            &*delegate,
+        );
+        // SAFETY: The capturer retains the delegate and serial callback queue for the output lifetime.
+        unsafe { output.setSampleBufferDelegate_queue(Some(protocol), Some(&queue)) };
 
         Ok(Self {
             session,

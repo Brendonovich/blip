@@ -11,6 +11,7 @@ anyhow.workspace = true
 async-channel.workspace = true
 blip-avfoundation.workspace = true
 blip-compositor.workspace = true
+blip-media-time.workspace = true
 blip-sck.workspace = true
 blip-updater.workspace = true
 chrono.workspace = true
@@ -23,7 +24,7 @@ gpui.workspace = true
 gpui_platform.workspace = true
 image.workspace = true
 objc2.workspace = true
-objc2-app-kit = { workspace = true, features = ["NSApplication", "NSButton", "NSCell", "NSControl", "NSMenu", "NSMenuItem", "NSResponder", "NSRunningApplication", "NSScreen", "NSStatusBar", "NSStatusBarButton", "NSStatusItem", "NSView", "libc", "objc2-core-graphics"] }
+objc2-app-kit = { workspace = true, features = ["NSApplication", "NSButton", "NSCell", "NSControl", "NSImage", "NSMenu", "NSMenuItem", "NSResponder", "NSRunningApplication", "NSScreen", "NSStatusBar", "NSStatusBarButton", "NSStatusItem", "NSView", "libc", "objc2-core-graphics"] }
 objc2-foundation.workspace = true
 raw-window-handle.workspace = true
 reqwest.workspace = true

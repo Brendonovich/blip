@@ -745,6 +745,7 @@ dependencies = [
 name = "blip-avfoundation"
 version = "0.1.0"
 dependencies = [
+ "blip-media-time",
  "block2 0.6.2",
  "core-foundation 0.10.0",
  "core-video",
@@ -768,6 +769,7 @@ dependencies = [
  "async-channel",
  "blip-avfoundation",
  "blip-compositor",
+ "blip-media-time",
  "blip-sck",
  "blip-updater",
  "chrono",
@@ -821,9 +823,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "blip-media-time"
+version = "0.1.0"
+
+[[package]]
 name = "blip-sck"
 version = "0.1.0"
 dependencies = [
+ "blip-media-time",
  "block2 0.6.2",
  "dispatch2",
  "objc2 0.6.4",

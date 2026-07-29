@@ -35,6 +35,7 @@ bitflags = "2.6.0"
 blip-sck = { path = "crates/blip-sck" }
 blip-avfoundation = { path = "crates/blip-avfoundation" }
 blip-compositor = { path = "crates/blip-compositor" }
+blip-media-time = { path = "crates/blip-media-time" }
 blip-updater = { path = "crates/blip-updater" }
 bytemuck = { version = "1", features = ["derive"] }
 block = "0.1"
@@ -95,7 +96,7 @@ objc = "0.2"
 objc2 = "0.6"
 objc2-app-kit = { version = "0.3.2", default-features = false, features = ["NSButton", "NSControl", "NSGraphics", "NSResponder", "NSView", "NSWindow", "objc2-core-foundation"] }
 objc2-av-foundation = { version = "0.3.2", default-features = false, features = ["std", "AVAsset", "AVAssetReader", "AVAssetReaderOutput", "AVAssetSegmentReport", "AVAssetTrack", "AVAssetWriter", "AVAssetWriterInput", "AVAsynchronousKeyValueLoading", "AVCaptureDevice", "AVCaptureInput", "AVCaptureOutputBase", "AVCaptureSession", "AVCaptureVideoDataOutput", "AVMediaFormat", "AVSampleCursor", "AVVideoSettings", "block2", "dispatch2", "objc2-core-foundation", "objc2-core-media", "objc2-core-video", "objc2-uniform-type-identifiers"] }
-objc2-core-media = { version = "0.3.2", features = ["CMFormatDescription", "CMSampleBuffer", "CMTime", "CMTimeRange"] }
+objc2-core-media = { version = "0.3.2", features = ["CMFormatDescription", "CMSampleBuffer", "CMSync", "CMTime", "CMTimeRange"] }
 objc2-foundation = { version = "=0.3.2", default-features = false, features = ["NSArray", "NSAttributedString", "NSBundle", "NSCoder", "NSData", "NSDate", "NSDictionary", "NSEnumerator", "NSError", "NSGeometry", "NSNotification", "NSNull", "NSObjCRuntime", "NSObject", "NSProcessInfo", "NSRange", "NSRunLoop", "NSSet", "NSString", "NSURL", "NSUndoManager", "NSValue", "objc2-core-foundation", "std"] }
 objc2-user-notifications = "0.3"
 objc2-uniform-type-identifiers = { version = "0.3.2", features = ["UTCoreTypes", "UTType"] }

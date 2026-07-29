@@ -28,7 +28,10 @@ use gpui::{
 
 use crate::{
     assets::{PAUSE, PLAY, PLAYBACK_BACK, PLAYBACK_FORWARD},
-    bundle::{BlipBundle, VideoSegment, VideoSegmentResizeMode, ZoomSegment, ZoomTransitionSpeed},
+    bundle::{
+        BlipBundle, CameraCrop, CameraLayout, CameraPosition, VideoSegment, VideoSegmentResizeMode,
+        ZoomSegment, ZoomTransitionSpeed,
+    },
     theme,
 };
 
@@ -38,7 +41,7 @@ const SIDEBAR_WIDTH: Pixels = px(280.0);
 const PREVIEW_LOADING_DURATION: Duration = Duration::from_millis(1_400);
 const PREVIEW_FADE_DURATION: Duration = Duration::from_millis(240);
 const TIMELINE_RESIZE_DURATION: Duration = Duration::from_millis(180);
-const PLAYBACK_TICK_INTERVAL: Duration = Duration::from_millis(16);
+const ANIMATION_TICK_INTERVAL: Duration = Duration::from_millis(16);
 const MIN_VIDEO_SEGMENT_DURATION_SECS: f64 = 1.0;
 const TIMELINE_EXPANSION_SPACE_SECS: f64 = 5.0;
 const BUNDLED_BACKGROUNDS: [(&str, &[u8], &[u8]); 15] = [
@@ -187,7 +190,7 @@ struct ExportJob {
     fps: u32,
     duration_secs: f64,
     bundle: BlipBundle,
-    decoder_inputs: Vec<(PathBuf, bool)>,
+    decoder_inputs: Vec<(PathBuf, bool, f64)>,
     wallpaper: Option<PathBuf>,
     background_type: BackgroundType,
     padding: f32,
@@ -201,6 +204,10 @@ enum SliderKind {
     Padding,
     Radius,
     Shadow,
+    CameraSize,
+    CameraPadding,
+    CameraZoomReduction,
+    CameraShadow,
     ZoomAmount,
     TimelineZoom,
 }
@@ -280,6 +287,8 @@ struct VideoTimelineResizeAnimation {
 
 #[derive(Clone, Copy)]
 struct PreviewRequest {
+    playback_generation: u64,
+    timeline_time_secs: f64,
     time_secs: f64,
     background_type: BackgroundType,
     background_preset: usize,
@@ -288,9 +297,22 @@ struct PreviewRequest {
     shadow: f32,
     corner_style: CornerStyle,
     zoom: blip_compositor::OutputTransform,
+    camera_layout: CameraLayout,
 }
 
 struct PreviewFrame(core_video::pixel_buffer::CVPixelBuffer);
+
+struct PreviewResult {
+    playback_generation: u64,
+    timeline_time_secs: f64,
+    frame: PreviewFrame,
+}
+
+struct ContentFrame {
+    screen: core_video::pixel_buffer::CVPixelBuffer,
+    camera: Option<core_video::pixel_buffer::CVPixelBuffer>,
+    dimensions: (usize, usize),
+}
 
 // CVPixelBuffers have thread-safe Core Foundation ownership and are immutable after composition.
 unsafe impl Send for PreviewFrame {}
@@ -306,7 +328,8 @@ pub(crate) struct BundleEditor {
     preview_requests: async_channel::Sender<PreviewRequest>,
     zoom_target_requests: async_channel::Sender<f64>,
     duration_secs: f64,
-    source_duration_secs: f64,
+    source_start_secs: f64,
+    source_end_secs: f64,
     timeline_fps: u32,
     timeline_view_start_secs: f64,
     timeline_view_duration_secs: f64,
@@ -317,6 +340,7 @@ pub(crate) struct BundleEditor {
     cursor_time_secs: Option<f64>,
     zoom_hover_range: Option<(f64, f64)>,
     current_frame: Option<core_video::pixel_buffer::CVPixelBuffer>,
+    last_playback_preview_time_secs: Option<f64>,
     current_screen_frame: Option<core_video::pixel_buffer::CVPixelBuffer>,
     timeline_bounds: Rc<Cell<Bounds<Pixels>>>,
     timeline_rows_bounds: Rc<Cell<Bounds<Pixels>>>,
@@ -331,6 +355,10 @@ pub(crate) struct BundleEditor {
     padding_slider_bounds: Rc<Cell<Bounds<Pixels>>>,
     radius_slider_bounds: Rc<Cell<Bounds<Pixels>>>,
     shadow_slider_bounds: Rc<Cell<Bounds<Pixels>>>,
+    camera_size_slider_bounds: Rc<Cell<Bounds<Pixels>>>,
+    camera_padding_slider_bounds: Rc<Cell<Bounds<Pixels>>>,
+    camera_zoom_reduction_slider_bounds: Rc<Cell<Bounds<Pixels>>>,
+    camera_shadow_slider_bounds: Rc<Cell<Bounds<Pixels>>>,
     zoom_amount_slider_bounds: Rc<Cell<Bounds<Pixels>>>,
     timeline_zoom_slider_bounds: Rc<Cell<Bounds<Pixels>>>,
     active_slider: Option<SliderKind>,
@@ -359,19 +387,20 @@ impl BundleEditor {
             "Opening bundle editor"
         );
         let mut decoder_inputs = Vec::new();
-        let mut max_duration = 0.0;
+        let mut source_ranges = Vec::new();
         let mut timeline_fps = None;
         for (index, input) in bundle.inputs.iter().enumerate() {
             let media_path = path.join(&input.media);
             match blip_avfoundation::VideoDecoder::open(&media_path) {
                 Ok(decoder) => {
                     let dur = decoder.duration().as_secs_f64();
-                    timeline_fps
-                        .get_or_insert_with(|| decoder.nominal_fps().round().max(1.0) as u32);
-                    if dur > max_duration {
-                        max_duration = dur;
-                    }
-                    decoder_inputs.push((media_path, input_is_camera(input, index)));
+                    timeline_fps = include_timeline_fps(timeline_fps, decoder.nominal_fps());
+                    source_ranges.push((input.start_offset_secs, input.start_offset_secs + dur));
+                    decoder_inputs.push((
+                        media_path,
+                        input_is_camera(input, index),
+                        input.start_offset_secs,
+                    ));
                 }
                 Err(error) => {
                     tracing::error!(
@@ -386,16 +415,20 @@ impl BundleEditor {
                 }
             }
         }
+        let (source_start_secs, source_end_secs) =
+            shared_source_range(source_ranges).unwrap_or((0.0, 0.0));
         if bundle.video_segments.is_none() {
-            bundle.video_segments = Some(if max_duration > 0.0 {
+            bundle.video_segments = Some(if source_end_secs > source_start_secs {
                 vec![VideoSegment {
                     id: 1,
-                    source_start_secs: 0.0,
-                    source_end_secs: max_duration,
+                    source_start_secs,
+                    source_end_secs,
                 }]
             } else {
                 Vec::new()
             });
+        } else {
+            clamp_video_timeline_to_source_range(&mut bundle, source_start_secs, source_end_secs);
         }
         let timeline_duration = video_timeline_duration(&bundle);
         let background_images = bundled_backgrounds();
@@ -405,8 +438,8 @@ impl BundleEditor {
             .collect();
         let screen_input = decoder_inputs
             .iter()
-            .find(|(_, is_camera)| !*is_camera)
-            .map(|(path, _)| path.clone());
+            .find(|(_, is_camera, _)| !*is_camera)
+            .map(|(path, _, _)| path.clone());
         let (preview_requests, preview_request_receiver) = async_channel::bounded(1);
         let (preview_results, preview_result_receiver) = async_channel::unbounded();
         let (zoom_target_requests, zoom_target_request_receiver) = async_channel::bounded(1);
@@ -453,10 +486,22 @@ impl BundleEditor {
                 let editor = cx.new(|cx| {
                     let editor_entity: gpui::WeakEntity<Self> = cx.weak_entity();
                     cx.spawn(async move |_, cx| {
-                        while let Ok(frame) = preview_result_receiver.recv().await {
+                        while let Ok(result) = preview_result_receiver.recv().await {
                             if editor_entity
                                 .update(cx, |editor, cx| {
-                                    editor.current_frame = Some(frame.0);
+                                    if result.playback_generation != editor.playback_generation
+                                        || (editor.is_playing
+                                            && editor.last_playback_preview_time_secs.is_some_and(
+                                                |time_secs| result.timeline_time_secs < time_secs,
+                                            ))
+                                    {
+                                        return;
+                                    }
+                                    if editor.is_playing {
+                                        editor.last_playback_preview_time_secs =
+                                            Some(result.timeline_time_secs);
+                                    }
+                                    editor.current_frame = Some(result.frame.0);
                                     cx.notify();
                                 })
                                 .is_err()
@@ -499,7 +544,8 @@ impl BundleEditor {
                         preview_requests,
                         zoom_target_requests,
                         duration_secs: timeline_duration,
-                        source_duration_secs: max_duration,
+                        source_start_secs,
+                        source_end_secs,
                         timeline_fps: timeline_fps.unwrap_or(60),
                         timeline_view_start_secs: 0.0,
                         timeline_view_duration_secs: timeline_extent_secs(timeline_duration),
@@ -510,6 +556,7 @@ impl BundleEditor {
                         cursor_time_secs: None,
                         zoom_hover_range: None,
                         current_frame: None,
+                        last_playback_preview_time_secs: None,
                         current_screen_frame: None,
                         timeline_bounds: Rc::new(Cell::new(Bounds::default())),
                         timeline_rows_bounds: Rc::new(Cell::new(Bounds::default())),
@@ -524,6 +571,10 @@ impl BundleEditor {
                         padding_slider_bounds: Rc::new(Cell::new(Bounds::default())),
                         radius_slider_bounds: Rc::new(Cell::new(Bounds::default())),
                         shadow_slider_bounds: Rc::new(Cell::new(Bounds::default())),
+                        camera_size_slider_bounds: Rc::new(Cell::new(Bounds::default())),
+                        camera_padding_slider_bounds: Rc::new(Cell::new(Bounds::default())),
+                        camera_zoom_reduction_slider_bounds: Rc::new(Cell::new(Bounds::default())),
+                        camera_shadow_slider_bounds: Rc::new(Cell::new(Bounds::default())),
                         zoom_amount_slider_bounds: Rc::new(Cell::new(Bounds::default())),
                         timeline_zoom_slider_bounds: Rc::new(Cell::new(Bounds::default())),
                         active_slider: None,
@@ -670,7 +721,13 @@ impl BundleEditor {
             .inputs
             .iter()
             .enumerate()
-            .map(|(index, input)| (self.path.join(&input.media), input_is_camera(input, index)))
+            .map(|(index, input)| {
+                (
+                    self.path.join(&input.media),
+                    input_is_camera(input, index),
+                    input.start_offset_secs,
+                )
+            })
             .collect();
         let job = ExportJob {
             output: output.clone(),
@@ -825,11 +882,11 @@ impl BundleEditor {
                 .checked_sub(1)
                 .and_then(|index| segments.get(index))
                 .map(|segment| segment.source_end_secs)
-                .unwrap_or(0.0),
+                .unwrap_or(self.source_start_secs),
             maximum_source_end_secs: segments
                 .get(index + 1)
                 .map(|segment| segment.source_start_secs)
-                .unwrap_or(self.source_duration_secs),
+                .unwrap_or(self.source_end_secs),
             original_zoom_segments: self.bundle.zoom_segments.clone(),
         });
         self.video_timeline_resize_generation += 1;
@@ -1011,7 +1068,9 @@ impl BundleEditor {
         cx.spawn(async move |editor, cx| {
             let started_at = Instant::now();
             loop {
-                cx.background_executor().timer(PLAYBACK_TICK_INTERVAL).await;
+                cx.background_executor()
+                    .timer(ANIMATION_TICK_INTERVAL)
+                    .await;
                 let elapsed = started_at.elapsed().as_secs_f64();
                 let progress = (elapsed / TIMELINE_RESIZE_DURATION.as_secs_f64()).clamp(0.0, 1.0);
                 let eased = 1.0 - (1.0 - progress).powi(5);
@@ -1262,21 +1321,22 @@ impl BundleEditor {
         let segment = &mut segments[index];
         let (inserted_at_secs, inserted_duration_secs) = match edge {
             VideoSegmentEdge::Start => {
-                let inserted_duration_secs = segment.source_start_secs.max(0.0);
+                let inserted_duration_secs =
+                    (segment.source_start_secs - self.source_start_secs).max(0.0);
                 if inserted_duration_secs <= f64::EPSILON {
                     return;
                 }
-                segment.source_start_secs = 0.0;
+                segment.source_start_secs = self.source_start_secs;
                 (timeline_start_secs, inserted_duration_secs)
             }
             VideoSegmentEdge::End => {
                 let inserted_at_secs = timeline_start_secs + segment.duration_secs();
                 let inserted_duration_secs =
-                    (self.source_duration_secs - segment.source_end_secs).max(0.0);
+                    (self.source_end_secs - segment.source_end_secs).max(0.0);
                 if inserted_duration_secs <= f64::EPSILON {
                     return;
                 }
-                segment.source_end_secs = self.source_duration_secs;
+                segment.source_end_secs = self.source_end_secs;
                 (inserted_at_secs, inserted_duration_secs)
             }
         };
@@ -1545,9 +1605,10 @@ impl BundleEditor {
         self.is_playing = false;
         self.playback_started_at = None;
         self.playback_generation = self.playback_generation.wrapping_add(1);
+        self.last_playback_preview_time_secs = None;
     }
 
-    fn toggle_playback(&mut self, cx: &mut Context<Self>) {
+    fn toggle_playback(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.is_playing {
             self.stop_playback();
             cx.notify();
@@ -1566,42 +1627,41 @@ impl BundleEditor {
         self.zoom_hover_range = None;
         self.is_playing = true;
         self.playback_generation = self.playback_generation.wrapping_add(1);
+        self.last_playback_preview_time_secs = None;
         let generation = self.playback_generation;
         self.playback_started_at = Some((Instant::now(), self.current_time_secs));
         self.request_preview();
         cx.notify();
+        self.schedule_playback_frame(generation, window, cx);
+    }
 
-        cx.spawn(async move |editor, cx| {
-            loop {
-                cx.background_executor().timer(PLAYBACK_TICK_INTERVAL).await;
-                let keep_playing = editor
-                    .update(cx, |editor, cx| {
-                        if !editor.is_playing || editor.playback_generation != generation {
-                            return false;
-                        }
-                        let Some((started_at, start_time_secs)) = editor.playback_started_at else {
-                            return false;
-                        };
-                        let (time_secs, finished) = playback_position(
-                            start_time_secs,
-                            started_at.elapsed().as_secs_f64(),
-                            editor.duration_secs,
-                        );
-                        editor.current_time_secs = time_secs;
-                        editor.request_preview();
-                        if finished {
-                            editor.stop_playback();
-                        }
-                        cx.notify();
-                        !finished
-                    })
-                    .unwrap_or(false);
-                if !keep_playing {
-                    break;
-                }
+    fn schedule_playback_frame(
+        &mut self,
+        generation: u64,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        cx.on_next_frame(window, move |editor, window, cx| {
+            if !editor.is_playing || editor.playback_generation != generation {
+                return;
             }
-        })
-        .detach();
+            let Some((started_at, start_time_secs)) = editor.playback_started_at else {
+                return;
+            };
+            let (time_secs, finished) = playback_position(
+                start_time_secs,
+                started_at.elapsed().as_secs_f64(),
+                editor.duration_secs,
+            );
+            editor.current_time_secs = time_secs;
+            editor.request_preview();
+            if finished {
+                editor.stop_playback();
+            } else {
+                editor.schedule_playback_frame(generation, window, cx);
+            }
+            cx.notify();
+        });
     }
 
     fn timeline_time_at(&self, x: Pixels) -> Option<f64> {
@@ -1718,6 +1778,8 @@ impl BundleEditor {
             return;
         };
         let _ = self.preview_requests.force_send(PreviewRequest {
+            playback_generation: self.playback_generation,
+            timeline_time_secs: time_secs,
             time_secs: source_time_secs,
             background_type: self.background_type,
             background_preset: self.background_preset,
@@ -1726,6 +1788,7 @@ impl BundleEditor {
             shadow: self.shadow,
             corner_style: self.corner_style,
             zoom: zoom_transform_at(&self.bundle.zoom_segments, time_secs),
+            camera_layout: self.bundle.camera_layout,
         });
     }
 
@@ -1742,6 +1805,10 @@ impl BundleEditor {
             SliderKind::Padding => self.padding_slider_bounds.get(),
             SliderKind::Radius => self.radius_slider_bounds.get(),
             SliderKind::Shadow => self.shadow_slider_bounds.get(),
+            SliderKind::CameraSize => self.camera_size_slider_bounds.get(),
+            SliderKind::CameraPadding => self.camera_padding_slider_bounds.get(),
+            SliderKind::CameraZoomReduction => self.camera_zoom_reduction_slider_bounds.get(),
+            SliderKind::CameraShadow => self.camera_shadow_slider_bounds.get(),
             SliderKind::ZoomAmount => self.zoom_amount_slider_bounds.get(),
             SliderKind::TimelineZoom => self.timeline_zoom_slider_bounds.get(),
         };
@@ -1753,6 +1820,16 @@ impl BundleEditor {
             SliderKind::Padding => self.background_padding = (fraction * 50.0).round(),
             SliderKind::Radius => self.border_radius = (fraction * 50.0).round(),
             SliderKind::Shadow => self.shadow = (fraction * 50.0).round(),
+            SliderKind::CameraSize => self.bundle.camera_layout.size = (fraction * 50.0).round(),
+            SliderKind::CameraPadding => {
+                self.bundle.camera_layout.edge_padding = (fraction * 50.0).round();
+            }
+            SliderKind::CameraZoomReduction => {
+                self.bundle.camera_layout.zoom_size_reduction = (fraction * 50.0).round();
+            }
+            SliderKind::CameraShadow => {
+                self.bundle.camera_layout.shadow = (fraction * 50.0).round();
+            }
             SliderKind::ZoomAmount => {
                 self.set_zoom_amount(1.0 + (fraction * 40.0).round() / 10.0, cx);
                 return;
@@ -2046,6 +2123,44 @@ impl BundleEditor {
             .on_click(cx.listener(move |editor, _, _, cx| on_click(editor, cx)))
             .child(label)
             .into_any_element()
+    }
+
+    fn camera_position_option(
+        &self,
+        label: &'static str,
+        value: CameraPosition,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        self.zoom_value_option(
+            label,
+            self.bundle.camera_layout.position == value,
+            cx,
+            move |editor, cx| {
+                editor.bundle.camera_layout.position = value;
+                editor.save_bundle();
+                editor.request_preview();
+                cx.notify();
+            },
+        )
+    }
+
+    fn camera_crop_option(
+        &self,
+        label: &'static str,
+        value: CameraCrop,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        self.zoom_value_option(
+            label,
+            self.bundle.camera_layout.crop == value,
+            cx,
+            move |editor, cx| {
+                editor.bundle.camera_layout.crop = value;
+                editor.save_bundle();
+                editor.request_preview();
+                cx.notify();
+            },
+        )
     }
 
     fn zoom_amount_slider(&self, amount: f32, cx: &mut Context<Self>) -> impl IntoElement {
@@ -2451,21 +2566,29 @@ impl BundleEditor {
             )
     }
 
-    fn sidebar(&self, cx: &mut Context<Self>) -> Div {
+    fn sidebar(&self, cx: &mut Context<Self>) -> AnyElement {
         if self.selected_zoom().is_some() {
-            return self.zoom_sidebar(cx);
+            return self.zoom_sidebar(cx).into_any_element();
         }
         if self.selected_video_segment().is_some() {
-            return self.video_segment_sidebar(cx);
+            return self.video_segment_sidebar(cx).into_any_element();
         }
+        let has_camera = self
+            .bundle
+            .inputs
+            .iter()
+            .enumerate()
+            .any(|(index, input)| input_is_camera(input, index));
         div()
+            .id("editor-sidebar")
             .w(SIDEBAR_WIDTH)
             .h_full()
             .flex_none()
             .p_4()
             .flex()
             .flex_col()
-            .gap_8()
+            .gap_5()
+            .overflow_y_scroll()
             .bg(rgb(theme::PANEL_BACKGROUND))
             .border_l_1()
             .border_color(rgb(theme::BORDER_SUBTLE))
@@ -2629,6 +2752,123 @@ impl BundleEditor {
                             ),
                     ),
             )
+            .when(has_camera, |sidebar| {
+                sidebar.child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap_5()
+                        .child(
+                            div()
+                                .text_sm()
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .child("Camera"),
+                        )
+                        .child(self.percentage_slider(
+                            "Size",
+                            self.bundle.camera_layout.size,
+                            SliderKind::CameraSize,
+                            Rc::clone(&self.camera_size_slider_bounds),
+                            cx,
+                        ))
+                        .child(self.percentage_slider(
+                            "Edge padding",
+                            self.bundle.camera_layout.edge_padding,
+                            SliderKind::CameraPadding,
+                            Rc::clone(&self.camera_padding_slider_bounds),
+                            cx,
+                        ))
+                        .child(self.percentage_slider(
+                            "Zoom reduction",
+                            self.bundle.camera_layout.zoom_size_reduction,
+                            SliderKind::CameraZoomReduction,
+                            Rc::clone(&self.camera_zoom_reduction_slider_bounds),
+                            cx,
+                        ))
+                        .child(self.percentage_slider(
+                            "Shadow",
+                            self.bundle.camera_layout.shadow,
+                            SliderKind::CameraShadow,
+                            Rc::clone(&self.camera_shadow_slider_bounds),
+                            cx,
+                        ))
+                        .child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .gap_2()
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(rgb(theme::TEXT_MUTED))
+                                        .child("Crop"),
+                                )
+                                .child(
+                                    div()
+                                        .flex()
+                                        .gap_1()
+                                        .child(self.camera_crop_option(
+                                            "Circle",
+                                            CameraCrop::Circle,
+                                            cx,
+                                        ))
+                                        .child(self.camera_crop_option(
+                                            "Squircle",
+                                            CameraCrop::Squircle,
+                                            cx,
+                                        )),
+                                )
+                                .child(div().flex().child(self.camera_crop_option(
+                                    "Squirectangle",
+                                    CameraCrop::Squirectangle,
+                                    cx,
+                                ))),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .gap_2()
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(rgb(theme::TEXT_MUTED))
+                                        .child("Position"),
+                                )
+                                .child(
+                                    div()
+                                        .flex()
+                                        .gap_1()
+                                        .child(self.camera_position_option(
+                                            "Top left",
+                                            CameraPosition::TopLeft,
+                                            cx,
+                                        ))
+                                        .child(self.camera_position_option(
+                                            "Top right",
+                                            CameraPosition::TopRight,
+                                            cx,
+                                        )),
+                                )
+                                .child(
+                                    div()
+                                        .flex()
+                                        .gap_1()
+                                        .child(self.camera_position_option(
+                                            "Bottom left",
+                                            CameraPosition::BottomLeft,
+                                            cx,
+                                        ))
+                                        .child(self.camera_position_option(
+                                            "Bottom right",
+                                            CameraPosition::BottomRight,
+                                            cx,
+                                        )),
+                                ),
+                        ),
+                )
+            })
+            .into_any_element()
     }
 
     fn export_option(
@@ -3079,11 +3319,18 @@ impl BundleEditor {
             .size_full(),
         );
         let mut cut_bubbles = div().absolute().left(px(92.0)).right_0().top_0().bottom_0();
-        let mut video_track_top = 0.0;
-        for (index, input) in self.bundle.inputs.iter().enumerate() {
+        let video_track_top = 0.0;
+        let video_track_name = self
+            .bundle
+            .inputs
+            .iter()
+            .map(|input| input.name.as_str())
+            .collect::<Vec<_>>()
+            .join(" + ");
+        if let Some((index, _)) = self.bundle.inputs.iter().enumerate().next() {
             let bounds_cell = Rc::clone(&bounds_cell);
-            let uses_ghost_resize = !input_is_camera(input, index)
-                && self.bundle.video_segment_resize_mode == VideoSegmentResizeMode::Ghost;
+            let uses_ghost_resize =
+                self.bundle.video_segment_resize_mode == VideoSegmentResizeMode::Ghost;
             let mut video_track = div().h(px(48.0)).flex_1().relative();
             let mut timeline_start = 0.0;
             let mut cuts = Vec::new();
@@ -3241,7 +3488,7 @@ impl BundleEditor {
                             Some((*from_start_secs, *from_end_secs, animation))
                         });
                 if segment_index == 0
-                    && draft_source_start_secs > f64::EPSILON
+                    && draft_source_start_secs - self.source_start_secs > f64::EPSILON
                     && let Some(fraction) = ghost_start_fraction.or_else(|| {
                         timeline_time_fraction(display_start, view_start_secs, view_duration_secs)
                     })
@@ -3289,12 +3536,12 @@ impl BundleEditor {
                         VideoCropIndicatorAction::SegmentEdge(id, VideoSegmentEdge::Start),
                         VideoCropIndicatorAlignment::Start,
                         fraction,
-                        draft_source_start_secs,
+                        (draft_source_start_secs - self.source_start_secs).max(0.0),
                         crop_animation,
                     ));
                 }
                 if segment_index + 1 == video_segments.len()
-                    && self.source_duration_secs - draft_source_end_secs > f64::EPSILON
+                    && self.source_end_secs - draft_source_end_secs > f64::EPSILON
                 {
                     let ghost_crop_animation = if segment_drag.is_none()
                         && let Some(from) = ghost_end_fraction
@@ -3346,13 +3593,13 @@ impl BundleEditor {
                             VideoCropIndicatorAction::SegmentEdge(id, VideoSegmentEdge::End),
                             VideoCropIndicatorAlignment::End,
                             fraction,
-                            (self.source_duration_secs - draft_source_end_secs).max(0.0),
+                            (self.source_end_secs - draft_source_end_secs).max(0.0),
                             crop_animation,
                         ));
                     }
                 }
                 let segment_selected = self.selected_video_segment == Some(id);
-                let media = media_name(input.media.as_path());
+                let media = video_track_name.clone();
                 if uses_ghost_resize
                     && segment_drag.is_some()
                     && draft_duration != segment_duration
@@ -3738,11 +3985,10 @@ impl BundleEditor {
                             .on_click(cx.listener(move |editor, _, _, cx| {
                                 editor.select_input(index, cx);
                             }))
-                            .child(input.name.clone()),
+                            .child(video_track_name),
                     )
                     .child(video_track),
             );
-            video_track_top += 56.0;
         }
         let zoom_track_bounds = Rc::clone(&bounds_cell);
         let mut zoom_segments = div().h(px(48.0)).flex_1().relative().overflow_hidden();
@@ -4200,8 +4446,8 @@ impl BundleEditor {
                                     .cursor_pointer()
                                     .text_color(rgb(theme::TEXT))
                                     .hover(|button| button.bg(rgb(theme::CONTROL_HOVER)))
-                                    .on_click(cx.listener(|editor, _, _, cx| {
-                                        editor.toggle_playback(cx);
+                                    .on_click(cx.listener(|editor, _, window, cx| {
+                                        editor.toggle_playback(window, cx);
                                     }))
                                     .child(
                                         svg()
@@ -4292,9 +4538,11 @@ impl Render for BundleEditor {
             .on_action(cx.listener(|editor, _: &crate::ToggleCutMode, _, cx| {
                 editor.toggle_cut_mode(cx);
             }))
-            .on_action(cx.listener(|editor, _: &crate::TogglePlayback, _, cx| {
-                editor.toggle_playback(cx);
-            }))
+            .on_action(
+                cx.listener(|editor, _: &crate::TogglePlayback, window, cx| {
+                    editor.toggle_playback(window, cx);
+                }),
+            )
             .on_action(cx.listener(|editor, _: &crate::DeleteSelected, _, cx| {
                 editor.delete_selected(cx);
             }))
@@ -4320,7 +4568,16 @@ impl Render for BundleEditor {
             .on_mouse_up(
                 MouseButton::Left,
                 cx.listener(|editor, _, _, cx| {
-                    if editor.active_slider == Some(SliderKind::ZoomAmount) {
+                    if editor.active_slider.is_some_and(|slider| {
+                        matches!(
+                            slider,
+                            SliderKind::ZoomAmount
+                                | SliderKind::CameraSize
+                                | SliderKind::CameraPadding
+                                | SliderKind::CameraZoomReduction
+                                | SliderKind::CameraShadow
+                        )
+                    }) {
                         editor.save_bundle();
                     }
                     editor.active_slider = None;
@@ -4335,7 +4592,16 @@ impl Render for BundleEditor {
             .on_mouse_up_out(
                 MouseButton::Left,
                 cx.listener(|editor, _, _, cx| {
-                    if editor.active_slider == Some(SliderKind::ZoomAmount) {
+                    if editor.active_slider.is_some_and(|slider| {
+                        matches!(
+                            slider,
+                            SliderKind::ZoomAmount
+                                | SliderKind::CameraSize
+                                | SliderKind::CameraPadding
+                                | SliderKind::CameraZoomReduction
+                                | SliderKind::CameraShadow
+                        )
+                    }) {
                         editor.save_bundle();
                     }
                     editor.active_slider = None;
@@ -4627,6 +4893,64 @@ fn source_time_at(bundle: &BlipBundle, timeline_time_secs: f64) -> Option<f64> {
     None
 }
 
+fn shared_source_range(ranges: impl IntoIterator<Item = (f64, f64)>) -> Option<(f64, f64)> {
+    let mut ranges = ranges.into_iter();
+    let (mut shared_start, mut shared_end) = ranges.next()?;
+    for (start, end) in ranges {
+        shared_start = shared_start.max(start);
+        shared_end = shared_end.min(end);
+    }
+    (shared_end > shared_start).then_some((shared_start, shared_end))
+}
+
+fn clamp_video_timeline_to_source_range(
+    bundle: &mut BlipBundle,
+    source_start_secs: f64,
+    source_end_secs: f64,
+) {
+    let Some(segments) = bundle.video_segments.take() else {
+        return;
+    };
+    let mut timeline_start_secs = 0.0;
+    let mut deletions = Vec::new();
+    let mut clipped_segments = Vec::with_capacity(segments.len());
+
+    for mut segment in segments {
+        let original_start_secs = segment.source_start_secs;
+        let original_end_secs = segment.source_end_secs;
+        let original_duration_secs = segment.duration_secs();
+        let clipped_start_secs = original_start_secs.max(source_start_secs);
+        let clipped_end_secs = original_end_secs.min(source_end_secs);
+
+        if clipped_end_secs > clipped_start_secs {
+            if clipped_start_secs > original_start_secs {
+                deletions.push((
+                    timeline_start_secs,
+                    clipped_start_secs - original_start_secs,
+                ));
+            }
+            if clipped_end_secs < original_end_secs {
+                deletions.push((
+                    timeline_start_secs + clipped_end_secs - original_start_secs,
+                    original_end_secs - clipped_end_secs,
+                ));
+            }
+            segment.source_start_secs = clipped_start_secs;
+            segment.source_end_secs = clipped_end_secs;
+            clipped_segments.push(segment);
+        } else if original_duration_secs > 0.0 {
+            deletions.push((timeline_start_secs, original_duration_secs));
+        }
+        timeline_start_secs += original_duration_secs;
+    }
+
+    deletions.sort_by(|left, right| right.0.total_cmp(&left.0));
+    for (start_secs, duration_secs) in deletions {
+        ripple_delete_ranges(&mut bundle.zoom_segments, start_secs, duration_secs);
+    }
+    bundle.video_segments = Some(clipped_segments);
+}
+
 fn ripple_delete_ranges(segments: &mut Vec<ZoomSegment>, start_secs: f64, duration_secs: f64) {
     let end_secs = start_secs + duration_secs;
     let map_time = |time_secs: f64| {
@@ -4657,16 +4981,16 @@ fn ripple_insert_ranges(segments: &mut [ZoomSegment], start_secs: f64, duration_
 }
 
 fn preview_worker(
-    decoder_inputs: Vec<(PathBuf, bool)>,
+    decoder_inputs: Vec<(PathBuf, bool, f64)>,
     background_paths: Vec<PathBuf>,
     requests: async_channel::Receiver<PreviewRequest>,
-    results: async_channel::Sender<PreviewFrame>,
+    results: async_channel::Sender<PreviewResult>,
 ) {
     let mut decoders = decoder_inputs
         .into_iter()
-        .filter_map(
-            |(path, is_camera)| match blip_avfoundation::VideoDecoder::open(&path) {
-                Ok(decoder) => Some((decoder, is_camera)),
+        .filter_map(|(path, is_camera, start_offset_secs)| {
+            match blip_avfoundation::VideoDecoder::open(&path) {
+                Ok(decoder) => Some((decoder, is_camera, start_offset_secs)),
                 Err(error) => {
                     eprintln!(
                         "blip-capture: failed to open video decoder for {}: {error}",
@@ -4674,8 +4998,8 @@ fn preview_worker(
                     );
                     None
                 }
-            },
-        )
+            }
+        })
         .collect::<Vec<_>>();
     let background_count = background_paths.len();
     let (wallpaper_requests, wallpaper_request_receiver) = async_channel::unbounded();
@@ -4731,16 +5055,11 @@ fn preview_worker(
 
         if content_frame_cache
             .as_ref()
-            .is_none_or(|(time_secs, _, _, _)| *time_secs != request.time_secs)
+            .is_none_or(|(time_secs, _)| *time_secs != request.time_secs)
         {
             match render_content_frame(&mut decoders, &mut compositor, request.time_secs) {
-                Ok((content_frame, canvas_width, canvas_height)) => {
-                    content_frame_cache = Some((
-                        request.time_secs,
-                        content_frame,
-                        canvas_width,
-                        canvas_height,
-                    ));
+                Ok(content_frame) => {
+                    content_frame_cache = Some((request.time_secs, content_frame));
                 }
                 Err(error) => {
                     eprintln!("blip-capture: {error}");
@@ -4748,11 +5067,11 @@ fn preview_worker(
                 }
             }
         }
-        let Some((_, content_frame, canvas_width, canvas_height)) = &content_frame_cache else {
+        let Some((_, content_frame)) = &content_frame_cache else {
             continue;
         };
 
-        let output_width = (*canvas_width).max(2) & !1;
+        let output_width = content_frame.dimensions.0.max(2) & !1;
         let output_height = (((output_width as f64 * 9.0 / 16.0).round() as usize).max(2) + 1) & !1;
         if wallpaper_pending {
             while background_frames[request.background_preset].is_none()
@@ -4773,8 +5092,10 @@ fn preview_worker(
             .and_then(Option::as_ref);
         match render_output_frame(
             &mut output_compositor,
-            content_frame,
-            (*canvas_width, *canvas_height),
+            &mut compositor,
+            &content_frame.screen,
+            content_frame.camera.as_ref(),
+            content_frame.dimensions,
             (output_width, output_height),
             wallpaper,
             request.background_type,
@@ -4783,9 +5104,17 @@ fn preview_worker(
             request.shadow,
             request.corner_style,
             request.zoom,
+            request.camera_layout,
         ) {
             Ok(frame) => {
-                if results.send_blocking(PreviewFrame(frame)).is_err() {
+                if results
+                    .send_blocking(PreviewResult {
+                        playback_generation: request.playback_generation,
+                        timeline_time_secs: request.timeline_time_secs,
+                        frame: PreviewFrame(frame),
+                    })
+                    .is_err()
+                {
                     break;
                 }
             }
@@ -4795,55 +5124,72 @@ fn preview_worker(
 }
 
 fn render_content_frame(
-    decoders: &mut [(blip_avfoundation::VideoDecoder, bool)],
+    decoders: &mut [(blip_avfoundation::VideoDecoder, bool, f64)],
     compositor: &mut blip_compositor::FrameCompositor,
     time_secs: f64,
-) -> Result<(core_video::pixel_buffer::CVPixelBuffer, usize, usize), String> {
+) -> Result<ContentFrame, String> {
     let mut active_frames = Vec::new();
-    for (decoder, is_camera) in decoders {
-        if let Ok(pixel_buffer) = decoder.frame_at(time_secs) {
+    for (decoder, is_camera, start_offset_secs) in decoders {
+        if let Some(input_time_secs) = aligned_input_time(time_secs, *start_offset_secs)
+            && let Ok(pixel_buffer) = decoder.frame_at(input_time_secs)
+        {
             active_frames.push((pixel_buffer, decoder.width(), decoder.height(), *is_camera));
         }
     }
     if active_frames.is_empty() {
         return Err(format!("no frames decoded at {time_secs}s"));
     }
-    active_frames.sort_by_key(|(_, _, _, is_camera)| if *is_camera { 1 } else { 0 });
     let (canvas_width, canvas_height) = active_frames
         .iter()
         .find(|(_, _, _, is_camera)| !*is_camera)
         .or_else(|| active_frames.first())
         .map(|(_, width, height, _)| (*width, *height))
         .unwrap_or((1920, 1080));
-    let mut sources = Vec::with_capacity(active_frames.len());
-    let mut items = Vec::with_capacity(active_frames.len());
-    for (index, (pixel_buffer, width, height, is_camera)) in active_frames.iter().enumerate() {
+    let has_screen = active_frames.iter().any(|(_, _, _, is_camera)| !*is_camera);
+    let camera = has_screen
+        .then(|| {
+            active_frames
+                .iter()
+                .rev()
+                .find(|(_, _, _, is_camera)| *is_camera)
+                .map(|(pixel_buffer, _, _, _)| pixel_buffer.clone())
+        })
+        .flatten();
+    let screen_frames = active_frames
+        .iter()
+        .filter(|(_, _, _, is_camera)| !has_screen || !*is_camera);
+    let mut sources = Vec::new();
+    let mut items = Vec::new();
+    for (pixel_buffer, _, _, _) in screen_frames {
         sources.push(blip_compositor::CompositorSource {
             pixel_buffer,
             content_rect: None,
         });
-        let transform = if *is_camera {
-            camera_transform(
-                (*width as f64, *height as f64),
-                (canvas_width as f64, canvas_height as f64),
-            )
-        } else {
-            blip_compositor::ItemTransform::new([0.5, 0.5], [1.0, 1.0])
-        };
         items.push(blip_compositor::CompositorItem {
-            content: blip_compositor::CompositorItemContent::Source(index),
-            transform,
+            content: blip_compositor::CompositorItemContent::Source(sources.len() - 1),
+            transform: blip_compositor::ItemTransform::new([0.5, 0.5], [1.0, 1.0]),
         });
     }
     compositor
         .render(&sources, &items, (canvas_width, canvas_height))
-        .map(|frame| (frame, canvas_width, canvas_height))
+        .map(|screen| ContentFrame {
+            screen,
+            camera,
+            dimensions: (canvas_width, canvas_height),
+        })
         .map_err(|error| format!("error composing content frame: {error}"))
+}
+
+fn aligned_input_time(timeline_time_secs: f64, start_offset_secs: f64) -> Option<f64> {
+    let input_time_secs = timeline_time_secs - start_offset_secs;
+    (input_time_secs >= 0.0).then_some(input_time_secs)
 }
 
 fn render_output_frame(
     compositor: &mut blip_compositor::FrameCompositor,
+    overlay_compositor: &mut blip_compositor::FrameCompositor,
     content_frame: &core_video::pixel_buffer::CVPixelBuffer,
+    camera_frame: Option<&core_video::pixel_buffer::CVPixelBuffer>,
     canvas_dimensions: (usize, usize),
     output_dimensions: (usize, usize),
     wallpaper: Option<&core_video::pixel_buffer::CVPixelBuffer>,
@@ -4853,6 +5199,7 @@ fn render_output_frame(
     shadow: f32,
     corner_style: CornerStyle,
     zoom: blip_compositor::OutputTransform,
+    camera_layout: CameraLayout,
 ) -> Result<core_video::pixel_buffer::CVPixelBuffer, String> {
     let (canvas_width, canvas_height) = canvas_dimensions;
     let (output_width, output_height) = output_dimensions;
@@ -4911,14 +5258,49 @@ fn render_output_frame(
             transform: content_transform,
         },
     ];
-    compositor
+    let output = compositor
         .render_with_output_transform(
             &output_sources,
             &output_items,
             output_dimensions,
             map_output_transform_to_item(zoom, content_transform),
         )
-        .map_err(|error| format!("error composing output frame: {error}"))
+        .map_err(|error| format!("error composing output frame: {error}"))?;
+    let Some(camera_frame) = camera_frame else {
+        return Ok(output);
+    };
+    let (camera_content_rect, camera_dimensions) = camera_crop_rect(
+        (camera_frame.get_width(), camera_frame.get_height()),
+        camera_layout.crop,
+    );
+    let sources = [
+        blip_compositor::CompositorSource {
+            pixel_buffer: &output,
+            content_rect: None,
+        },
+        blip_compositor::CompositorSource {
+            pixel_buffer: camera_frame,
+            content_rect: Some(camera_content_rect),
+        },
+    ];
+    let items = [
+        blip_compositor::CompositorItem {
+            content: blip_compositor::CompositorItemContent::Source(0),
+            transform: blip_compositor::ItemTransform::new([0.5, 0.5], [1.0, 1.0]),
+        },
+        blip_compositor::CompositorItem {
+            content: blip_compositor::CompositorItemContent::Source(1),
+            transform: camera_transform(
+                camera_dimensions,
+                (output_width as f64, output_height as f64),
+                camera_layout,
+                zoom.scale,
+            ),
+        },
+    ];
+    overlay_compositor
+        .render(&sources, &items, output_dimensions)
+        .map_err(|error| format!("error composing camera overlay: {error}"))
 }
 
 fn export_worker(job: ExportJob, events: async_channel::Sender<ExportEvent>) {
@@ -4937,9 +5319,9 @@ fn render_export(
     let mut decoders = job
         .decoder_inputs
         .into_iter()
-        .map(|(path, is_camera)| {
+        .map(|(path, is_camera, start_offset_secs)| {
             blip_avfoundation::VideoDecoder::open(&path)
-                .map(|decoder| (decoder, is_camera))
+                .map(|decoder| (decoder, is_camera, start_offset_secs))
                 .map_err(|error| format!("Could not open {}: {error}", path.display()))
         })
         .collect::<Result<Vec<_>, _>>()?;
@@ -4962,12 +5344,14 @@ fn render_export(
         let timeline_time_secs = frame_index as f64 / f64::from(job.fps);
         let source_time_secs = source_time_at(&job.bundle, timeline_time_secs)
             .ok_or_else(|| "Could not map the export timeline to source video.".to_owned())?;
-        let (content_frame, width, height) =
+        let content_frame =
             render_content_frame(&mut decoders, &mut content_compositor, source_time_secs)?;
         let output_frame = render_output_frame(
             &mut output_compositor,
-            &content_frame,
-            (width, height),
+            &mut content_compositor,
+            &content_frame.screen,
+            content_frame.camera.as_ref(),
+            content_frame.dimensions,
             job.dimensions,
             wallpaper.as_ref(),
             job.background_type,
@@ -4976,6 +5360,7 @@ fn render_export(
             job.shadow,
             job.corner_style,
             zoom_transform_at(&job.bundle.zoom_segments, timeline_time_secs),
+            job.bundle.camera_layout,
         )?;
         let timestamp = Duration::from_secs_f64(timeline_time_secs);
         while !writer
@@ -5285,17 +5670,14 @@ fn cover_content_rect(
     }
 }
 
-fn media_name(path: &std::path::Path) -> SharedString {
-    path.file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("Recording")
-        .to_owned()
-        .into()
-}
-
 fn playback_position(start_secs: f64, elapsed_secs: f64, duration_secs: f64) -> (f64, bool) {
     let time_secs = (start_secs + elapsed_secs).clamp(0.0, duration_secs);
     (time_secs, time_secs >= duration_secs)
+}
+
+fn include_timeline_fps(current: Option<u32>, nominal_fps: f64) -> Option<u32> {
+    let fps = nominal_fps.round().max(1.0) as u32;
+    Some(current.unwrap_or(fps).max(fps))
 }
 
 fn timeline_time_fraction(
@@ -5599,35 +5981,134 @@ fn map_output_transform_to_item(
 fn camera_transform(
     source_dimensions: (f64, f64),
     canvas_dimensions: (f64, f64),
+    layout: CameraLayout,
+    zoom_scale: f32,
 ) -> blip_compositor::ItemTransform {
-    let size = aspect_fit_size([0.28, 0.28], source_dimensions, canvas_dimensions);
-    let margin_x = 0.03_f32;
-    let margin_y = 0.03_f32;
-    let center_x = 1.0 - margin_x - (size[0] * 0.5);
-    let center_y = 1.0 - margin_y - (size[1] * 0.5);
+    let zoom_progress = (zoom_scale - 1.0).clamp(0.0, 1.0);
+    let reduction = layout.zoom_size_reduction.clamp(0.0, 50.0) / 100.0;
+    let maximum_size = layout.size.clamp(0.0, 50.0) / 100.0 * (1.0 - reduction * zoom_progress);
+    let size = aspect_fit_size(
+        [maximum_size, maximum_size],
+        source_dimensions,
+        canvas_dimensions,
+    );
+    let edge_padding = layout.edge_padding.clamp(0.0, 50.0) / 100.0
+        * canvas_dimensions.0.min(canvas_dimensions.1) as f32;
+    let edge_padding_x = edge_padding / canvas_dimensions.0 as f32;
+    let edge_padding_y = edge_padding / canvas_dimensions.1 as f32;
+    let left = edge_padding_x + size[0] * 0.5;
+    let right = 1.0 - edge_padding_x - size[0] * 0.5;
+    let top = edge_padding_y + size[1] * 0.5;
+    let bottom = 1.0 - edge_padding_y - size[1] * 0.5;
+    let center = match layout.position {
+        CameraPosition::TopLeft => [left, top],
+        CameraPosition::TopRight => [right, top],
+        CameraPosition::BottomLeft => [left, bottom],
+        CameraPosition::BottomRight => [right, bottom],
+    };
     let corner_radius = (f64::from(size[0]) * canvas_dimensions.0)
         .min(f64::from(size[1]) * canvas_dimensions.1)
-        * 0.08;
-    blip_compositor::ItemTransform::new([center_x, center_y], size)
+        * match layout.crop {
+            CameraCrop::Circle => 0.5,
+            CameraCrop::Squircle | CameraCrop::Squirectangle => 32.0 / 180.0,
+        };
+    let shortest_dimension = (f64::from(size[0]) * canvas_dimensions.0)
+        .min(f64::from(size[1]) * canvas_dimensions.1) as f32;
+    let shadow_strength = layout.shadow.clamp(0.0, 50.0) / 50.0;
+    let box_shadow = blip_compositor::BoxShadow::new(
+        [0.0, shortest_dimension * 0.02 * shadow_strength],
+        [0.0, 0.0, 0.0, 0.9 * shadow_strength],
+    )
+    .with_blur_radius(shortest_dimension * 0.02 * shadow_strength)
+    .with_spread_radius(shortest_dimension * -0.001 * shadow_strength);
+    blip_compositor::ItemTransform::new(center, size)
         .with_corner_radius(corner_radius as f32)
+        .with_squircle(layout.crop != CameraCrop::Circle)
+        .with_box_shadow(box_shadow)
+}
+
+fn camera_crop_rect(
+    (source_width, source_height): (usize, usize),
+    crop: CameraCrop,
+) -> (blip_compositor::ContentRect, (f64, f64)) {
+    let (crop_width, crop_height) = match crop {
+        CameraCrop::Circle | CameraCrop::Squircle => {
+            let side = source_width.min(source_height);
+            (side, side)
+        }
+        CameraCrop::Squirectangle if source_width * 9 >= source_height * 16 => {
+            (source_height * 16 / 9, source_height)
+        }
+        CameraCrop::Squirectangle => (source_width, source_width * 9 / 16),
+    };
+    let crop_width = crop_width as f64;
+    let crop_height = crop_height as f64;
+    (
+        blip_compositor::ContentRect {
+            x: (source_width as f64 - crop_width) / 2.0,
+            y: (source_height as f64 - crop_height) / 2.0,
+            width: crop_width,
+            height: crop_height,
+        },
+        (crop_width, crop_height),
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use crate::bundle::{
-        BlipBundle, VideoSegment, VideoSegmentResizeMode, ZoomSegment, ZoomTransitionSpeed,
+        BlipBundle, CameraCrop, CameraLayout, CameraPosition, VideoSegment, VideoSegmentResizeMode,
+        ZoomSegment, ZoomTransitionSpeed,
     };
 
     use super::{
-        VideoSegmentEdge, ZoomSegmentEdge, can_split_video_segment, cubic_bezier_ease,
-        cut_gap_label, edit_video_cut, map_output_transform_to_item, panned_timeline_view,
-        playback_position, resize_video_segment_range, resize_zoom_segment_range,
-        ripple_delete_ranges, ripple_insert_ranges, source_time_at, timeline_extent_secs,
-        timeline_range_fraction, timeline_ruler_interval, timeline_ruler_label,
-        timeline_segment_range_fraction, timeline_time_fraction, timeline_timecode,
-        video_cut_gap_secs, video_segment_drag_layout, zoom_segment_range_at, zoom_transform_at,
-        zoomed_timeline_view,
+        VideoSegmentEdge, ZoomSegmentEdge, aligned_input_time, camera_crop_rect, camera_transform,
+        can_split_video_segment, clamp_video_timeline_to_source_range, cubic_bezier_ease,
+        cut_gap_label, edit_video_cut, include_timeline_fps, map_output_transform_to_item,
+        panned_timeline_view, playback_position, resize_video_segment_range,
+        resize_zoom_segment_range, ripple_delete_ranges, ripple_insert_ranges, shared_source_range,
+        source_time_at, timeline_extent_secs, timeline_range_fraction, timeline_ruler_interval,
+        timeline_ruler_label, timeline_segment_range_fraction, timeline_time_fraction,
+        timeline_timecode, video_cut_gap_secs, video_segment_drag_layout, zoom_segment_range_at,
+        zoom_transform_at, zoomed_timeline_view,
     };
+
+    #[test]
+    fn camera_stays_edge_anchored_and_shrinks_with_zoom() {
+        let layout = CameraLayout {
+            size: 28.0,
+            position: CameraPosition::BottomRight,
+            edge_padding: 3.0,
+            zoom_size_reduction: 50.0,
+            shadow: 20.0,
+            crop: CameraCrop::Squirectangle,
+        };
+        let unzoomed = camera_transform((1920.0, 1080.0), (1920.0, 1080.0), layout, 1.0);
+        let zoomed = camera_transform((1920.0, 1080.0), (1920.0, 1080.0), layout, 2.0);
+
+        assert!((unzoomed.size[0] - 0.28).abs() < 0.0001);
+        assert!((zoomed.size[0] - 0.14).abs() < 0.0001);
+        let unzoomed_right = (1.0 - unzoomed.center[0] - unzoomed.size[0] * 0.5) * 1920.0;
+        let zoomed_right = (1.0 - zoomed.center[0] - zoomed.size[0] * 0.5) * 1920.0;
+        let unzoomed_bottom = (1.0 - unzoomed.center[1] - unzoomed.size[1] * 0.5) * 1080.0;
+        let zoomed_bottom = (1.0 - zoomed.center[1] - zoomed.size[1] * 0.5) * 1080.0;
+        assert!((unzoomed_right - 32.4).abs() < 0.001);
+        assert!((zoomed_right - 32.4).abs() < 0.001);
+        assert!((unzoomed_bottom - 32.4).abs() < 0.001);
+        assert!((zoomed_bottom - 32.4).abs() < 0.001);
+    }
+
+    #[test]
+    fn camera_crop_matches_recording_shapes() {
+        let (square, square_dimensions) = camera_crop_rect((1920, 1080), CameraCrop::Circle);
+        let (wide, wide_dimensions) = camera_crop_rect((1920, 1200), CameraCrop::Squirectangle);
+
+        assert_eq!(square_dimensions, (1080.0, 1080.0));
+        assert_eq!(square.x, 420.0);
+        assert_eq!(square.y, 0.0);
+        assert_eq!(wide_dimensions, (1920.0, 1080.0));
+        assert_eq!(wide.y, 60.0);
+    }
 
     #[test]
     fn playback_position_uses_elapsed_wall_clock_time() {
@@ -5637,6 +6118,60 @@ mod tests {
     #[test]
     fn playback_position_stops_at_the_timeline_end() {
         assert_eq!(playback_position(9.0, 2.0, 10.0), (10.0, true));
+    }
+
+    #[test]
+    fn timeline_uses_the_highest_input_frame_rate() {
+        let fps = include_timeline_fps(None, 30.0);
+        let fps = include_timeline_fps(fps, 60.0);
+        let fps = include_timeline_fps(fps, 24.0);
+
+        assert_eq!(fps, Some(60));
+    }
+
+    #[test]
+    fn aligns_inputs_to_the_screen_timeline() {
+        assert_eq!(aligned_input_time(1.0, 0.25), Some(0.75));
+        assert_eq!(aligned_input_time(0.1, 0.25), None);
+        assert_eq!(aligned_input_time(0.0, -0.125), Some(0.125));
+    }
+
+    #[test]
+    fn source_range_is_shared_by_all_inputs() {
+        assert_eq!(
+            shared_source_range([(0.0, 10.0), (0.25, 9.75)]),
+            Some((0.25, 9.75))
+        );
+        assert_eq!(shared_source_range([(0.0, 1.0), (2.0, 3.0)]), None);
+    }
+
+    #[test]
+    fn existing_timeline_is_clipped_to_the_shared_source_range() {
+        let mut bundle: BlipBundle = serde_json::from_str(
+            r#"{
+                "version": 1,
+                "created_at": "2024-01-01T00:00:00Z",
+                "inputs": [],
+                "zoom_segments": [
+                    {"id": 1, "start_secs": 1.0, "end_secs": 7.0,
+                     "target": [0.5, 0.5], "amount": 2.0, "transition": "medium"}
+                ],
+                "video_segments": [
+                    {"id": 1, "source_start_secs": 0.0, "source_end_secs": 4.0},
+                    {"id": 2, "source_start_secs": 6.0, "source_end_secs": 10.0}
+                ]
+            }"#,
+        )
+        .expect("decode bundle");
+
+        clamp_video_timeline_to_source_range(&mut bundle, 1.0, 9.0);
+
+        let segments = bundle.video_segments.expect("video segments");
+        assert_eq!(segments.len(), 2);
+        assert_eq!(segments[0].source_start_secs, 1.0);
+        assert_eq!(segments[1].source_end_secs, 9.0);
+        assert_eq!(bundle.zoom_segments[0].start_secs, 0.0);
+        assert_eq!(bundle.zoom_segments[0].end_secs, 6.0);
     }
 
     #[test]

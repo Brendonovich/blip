@@ -3,12 +3,13 @@ use std::sync::Mutex;
 use std::sync::mpsc;
 use std::time::Duration;
 
+use blip_media_time::FrameTimestamp;
 use block2::RcBlock;
 use dispatch2::{DispatchQueue, DispatchRetained};
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2::{AnyThread, DefinedClass, define_class, msg_send};
-use objc2_core_media::CMSampleBuffer;
+use objc2_core_media::{CMClock, CMSampleBuffer, CMSyncConvertTime, CMTimeFlags};
 use objc2_foundation::{NSError, NSObject, NSObjectProtocol};
 use objc2_screen_capture_kit::{SCStream, SCStreamDelegate, SCStreamOutput, SCStreamOutputType};
 
@@ -39,7 +40,7 @@ define_class!(
         #[unsafe(method(stream:didOutputSampleBuffer:ofType:))]
         unsafe fn stream_did_output_sample_buffer(
             &self,
-            _stream: &SCStream,
+            stream: &SCStream,
             sample_buffer: &CMSampleBuffer,
             output_type: SCStreamOutputType,
         ) {
@@ -47,7 +48,8 @@ define_class!(
                 return;
             }
 
-            let Some(frame) = VideoFrame::new(sample_buffer) else {
+            let timestamp = normalized_frame_timestamp(stream, sample_buffer);
+            let Some(frame) = VideoFrame::new(sample_buffer, timestamp) else {
                 return;
             };
             let _ = catch_unwind(AssertUnwindSafe(|| {
@@ -82,6 +84,32 @@ impl StreamOutput {
         // SAFETY: `this` is allocated with fully initialized ivars and NSObject permits `init`.
         unsafe { msg_send![super(this), init] }
     }
+}
+
+fn normalized_frame_timestamp(
+    stream: &SCStream,
+    sample_buffer: &CMSampleBuffer,
+) -> Option<FrameTimestamp> {
+    if !objc2::available!(macos = 13.0) {
+        return None;
+    }
+    // SAFETY: The callback's stream is active, and this selector is available on macOS 13+.
+    let source_clock = unsafe { stream.synchronizationClock() }?;
+    // SAFETY: Core Media returns its process-wide retained host clock singleton.
+    let host_clock = unsafe { CMClock::host_time_clock() };
+    // SAFETY: The retained sample buffer has immutable timing metadata.
+    let pts = unsafe { sample_buffer.presentation_time_stamp() };
+    // SAFETY: Both arguments are retained CMClock instances with valid Core Media types.
+    let host_pts = unsafe { CMSyncConvertTime(pts, &source_clock, &host_clock) };
+    if !host_pts.flags.contains(CMTimeFlags::Valid)
+        || host_pts
+            .flags
+            .intersects(CMTimeFlags::ImpliedValueFlagsMask)
+        || host_pts.epoch != 0
+    {
+        return None;
+    }
+    FrameTimestamp::from_ratio(host_pts.value, host_pts.timescale)
 }
 
 pub struct Capturer {

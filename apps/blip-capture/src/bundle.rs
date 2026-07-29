@@ -19,6 +19,8 @@ pub(crate) struct BlipBundle {
     pub(crate) video_segments: Option<Vec<VideoSegment>>,
     #[serde(default, skip_serializing)]
     pub(crate) video_segment_resize_mode: VideoSegmentResizeMode,
+    #[serde(default, skip_serializing)]
+    pub(crate) camera_layout: CameraLayout,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -29,6 +31,8 @@ struct ProjectConfig {
     video_segments: Option<Vec<VideoSegment>>,
     #[serde(default)]
     video_segment_resize_mode: VideoSegmentResizeMode,
+    #[serde(default)]
+    camera_layout: CameraLayout,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -36,6 +40,8 @@ pub(crate) struct BundleInput {
     pub(crate) id: String,
     pub(crate) name: String,
     pub(crate) media: PathBuf,
+    #[serde(default)]
+    pub(crate) start_offset_secs: f64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -51,6 +57,72 @@ pub(crate) enum VideoSegmentResizeMode {
     #[default]
     Ghost,
     Live,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum CameraPosition {
+    TopLeft,
+    TopRight,
+    BottomLeft,
+    #[default]
+    BottomRight,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum CameraCrop {
+    Circle,
+    Squircle,
+    #[default]
+    Squirectangle,
+}
+
+impl CameraCrop {
+    pub(crate) const fn from_atomic(value: u8) -> Self {
+        match value {
+            0 => Self::Circle,
+            1 => Self::Squircle,
+            _ => Self::Squirectangle,
+        }
+    }
+
+    pub(crate) const fn atomic_value(self) -> u8 {
+        match self {
+            Self::Circle => 0,
+            Self::Squircle => 1,
+            Self::Squirectangle => 2,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub(crate) struct CameraLayout {
+    pub(crate) size: f32,
+    pub(crate) position: CameraPosition,
+    pub(crate) edge_padding: f32,
+    pub(crate) zoom_size_reduction: f32,
+    #[serde(default = "default_camera_shadow")]
+    pub(crate) shadow: f32,
+    #[serde(default)]
+    pub(crate) crop: CameraCrop,
+}
+
+const fn default_camera_shadow() -> f32 {
+    20.0
+}
+
+impl Default for CameraLayout {
+    fn default() -> Self {
+        Self {
+            size: 28.0,
+            position: CameraPosition::BottomRight,
+            edge_padding: 3.0,
+            zoom_size_reduction: 15.0,
+            shadow: 20.0,
+            crop: CameraCrop::Squirectangle,
+        }
+    }
 }
 
 impl VideoSegment {
@@ -88,24 +160,35 @@ pub(crate) struct ZoomSegment {
 }
 
 impl BlipBundle {
-    pub(crate) fn create(path: &Path) -> Result<Self, String> {
+    pub(crate) fn create(path: &Path, include_camera: bool) -> Result<Self, String> {
         fs::create_dir(path).map_err(|error| format!("failed to create Blip Bundle: {error}"))?;
         let inputs_dir = path.join("inputs");
         if let Err(error) = fs::create_dir(&inputs_dir) {
             fs::remove_dir_all(path).ok();
             return Err(format!("failed to create bundle inputs folder: {error}"));
         }
+        let mut inputs = vec![BundleInput {
+            id: "screen".into(),
+            name: "Screen".into(),
+            media: PathBuf::from("inputs/screen.mp4"),
+            start_offset_secs: 0.0,
+        }];
+        if include_camera {
+            inputs.push(BundleInput {
+                id: "camera".into(),
+                name: "Camera".into(),
+                media: PathBuf::from("inputs/camera.mp4"),
+                start_offset_secs: 0.0,
+            });
+        }
         let bundle = Self {
             version: BUNDLE_VERSION,
             created_at: Local::now(),
-            inputs: vec![BundleInput {
-                id: "screen".into(),
-                name: "Screen".into(),
-                media: PathBuf::from("inputs/screen.mp4"),
-            }],
+            inputs,
             zoom_segments: Vec::new(),
             video_segments: None,
             video_segment_resize_mode: VideoSegmentResizeMode::default(),
+            camera_layout: CameraLayout::default(),
         };
         if let Err(error) = bundle.save_manifest(path) {
             fs::remove_dir_all(path).ok();
@@ -126,6 +209,7 @@ impl BlipBundle {
                 bundle.zoom_segments = config.zoom_segments;
                 bundle.video_segments = config.video_segments;
                 bundle.video_segment_resize_mode = config.video_segment_resize_mode;
+                bundle.camera_layout = config.camera_layout;
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(format!("failed to read project config: {error}")),
@@ -140,6 +224,28 @@ impl BlipBundle {
             .ok_or_else(|| "Blip Bundle has no recording inputs".into())
     }
 
+    pub(crate) fn input_media_path(&self, bundle_path: &Path, id: &str) -> Option<PathBuf> {
+        self.inputs
+            .iter()
+            .find(|input| input.id == id)
+            .map(|input| bundle_path.join(&input.media))
+    }
+
+    pub(crate) fn set_input_start_offset(
+        &mut self,
+        bundle_path: &Path,
+        id: &str,
+        start_offset_secs: f64,
+    ) -> Result<(), String> {
+        let input = self
+            .inputs
+            .iter_mut()
+            .find(|input| input.id == id)
+            .ok_or_else(|| format!("Blip Bundle has no {id} input"))?;
+        input.start_offset_secs = start_offset_secs;
+        self.save_manifest(bundle_path)
+    }
+
     fn save_manifest(&self, path: &Path) -> Result<(), String> {
         let contents = serde_json::to_string_pretty(self)
             .map_err(|error| format!("failed to encode Blip Bundle: {error}"))?;
@@ -152,6 +258,7 @@ impl BlipBundle {
             zoom_segments: self.zoom_segments.clone(),
             video_segments: self.video_segments.clone(),
             video_segment_resize_mode: self.video_segment_resize_mode,
+            camera_layout: self.camera_layout,
         };
         let contents = serde_json::to_string_pretty(&config)
             .map_err(|error| format!("failed to encode project config: {error}"))?;
@@ -164,7 +271,9 @@ impl BlipBundle {
 mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use super::{BlipBundle, VideoSegment, VideoSegmentResizeMode};
+    use super::{
+        BlipBundle, CameraCrop, CameraLayout, CameraPosition, VideoSegment, VideoSegmentResizeMode,
+    };
 
     #[test]
     fn creates_a_manifest_and_separate_screen_input() {
@@ -172,7 +281,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .map_or(0, |duration| duration.as_nanos());
         let path = std::env::temp_dir().join(format!("blip-bundle-test-{suffix}.blip"));
-        let result = BlipBundle::create(&path);
+        let result = BlipBundle::create(&path, false);
         assert!(result.is_ok(), "bundle should be created");
         let Some(bundle) = result.ok() else {
             return;
@@ -196,6 +305,30 @@ mod tests {
             bundle.video_segment_resize_mode,
             VideoSegmentResizeMode::Ghost
         );
+        assert_eq!(bundle.camera_layout, CameraLayout::default());
+
+        std::fs::remove_dir_all(path).ok();
+    }
+
+    #[test]
+    fn creates_camera_input_and_persists_its_alignment() {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |duration| duration.as_nanos());
+        let path = std::env::temp_dir().join(format!("blip-camera-test-{suffix}.blip"));
+        let mut bundle = BlipBundle::create(&path, true).expect("create camera bundle");
+
+        assert_eq!(
+            bundle.input_media_path(&path, "camera"),
+            Some(path.join("inputs/camera.mp4"))
+        );
+        bundle
+            .set_input_start_offset(&path, "camera", -0.125)
+            .expect("save camera alignment");
+
+        let loaded = BlipBundle::load(&path).expect("load camera bundle");
+        assert_eq!(loaded.inputs.len(), 2);
+        assert_eq!(loaded.inputs[1].start_offset_secs, -0.125);
 
         std::fs::remove_dir_all(path).ok();
     }
@@ -205,11 +338,13 @@ mod tests {
         let manifest = r#"{
             "version": 1,
             "created_at": "2026-07-28T12:00:00-07:00",
-            "inputs": []
+            "inputs": [{"id":"screen","name":"Screen","media":"inputs/screen.mp4"}]
         }"#;
         let bundle: BlipBundle = serde_json::from_str(manifest).expect("decode legacy manifest");
         assert!(bundle.zoom_segments.is_empty());
         assert!(bundle.video_segments.is_none());
+        assert_eq!(bundle.inputs[0].start_offset_secs, 0.0);
+        assert_eq!(bundle.camera_layout, CameraLayout::default());
     }
 
     #[test]
@@ -236,7 +371,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .map_or(0, |duration| duration.as_nanos());
         let path = std::env::temp_dir().join(format!("blip-config-test-{suffix}.blip"));
-        let mut bundle = BlipBundle::create(&path).expect("create bundle");
+        let mut bundle = BlipBundle::create(&path, false).expect("create bundle");
         let manifest = std::fs::read(path.join("manifest.json")).expect("read manifest");
         bundle.video_segments = Some(vec![VideoSegment {
             id: 1,
@@ -244,6 +379,14 @@ mod tests {
             source_end_secs: 2.0,
         }]);
         bundle.video_segment_resize_mode = VideoSegmentResizeMode::Live;
+        bundle.camera_layout = CameraLayout {
+            size: 32.0,
+            position: CameraPosition::TopLeft,
+            edge_padding: 5.0,
+            zoom_size_reduction: 20.0,
+            shadow: 25.0,
+            crop: CameraCrop::Circle,
+        };
 
         bundle
             .save_project_config(&path)
@@ -266,6 +409,7 @@ mod tests {
             loaded.video_segment_resize_mode,
             VideoSegmentResizeMode::Live
         );
+        assert_eq!(loaded.camera_layout, bundle.camera_layout);
 
         std::fs::remove_dir_all(path).ok();
     }

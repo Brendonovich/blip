@@ -1,16 +1,22 @@
 use std::path::{Path, PathBuf};
-use std::sync::mpsc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+    mpsc,
+};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use async_channel::Sender;
 use blip_avfoundation::{HlsWriter, Mp4Writer, WriterError};
+use blip_media_time::FrameTimestamp;
 use blip_sck::{
     CaptureColorSpace, CaptureFilter, Capturer, PixelFormat, ShareableContent, StreamConfig,
     VideoFrame,
 };
 
 use crate::profiles::RecordingFormat;
+use crate::{bundle::BlipBundle, camera_preview::CameraRecordingFrame};
 
 const CAPTURE_TIMEOUT: Duration = Duration::from_secs(5);
 const FRAME_QUEUE_DEPTH: usize = 8;
@@ -42,8 +48,31 @@ pub(crate) enum RecordingEvent {
 }
 
 enum WriterMessage {
-    Frame(VideoFrame, Duration),
+    Frame(VideoFrame, FrameTiming),
     Finish,
+}
+
+#[derive(Clone, Copy)]
+struct FrameTiming {
+    normalized: Option<FrameTimestamp>,
+    fallback: Duration,
+}
+
+impl FrameTiming {
+    fn writer_timestamp(self) -> Duration {
+        self.normalized
+            .map_or(self.fallback, FrameTimestamp::duration_since_epoch)
+    }
+
+    fn signed_seconds_since(self, earlier: Self) -> f64 {
+        match (self.normalized, earlier.normalized) {
+            (Some(timestamp), Some(earlier)) => timestamp.signed_seconds_since(earlier),
+            _ if self.fallback >= earlier.fallback => {
+                self.fallback.saturating_sub(earlier.fallback).as_secs_f64()
+            }
+            _ => -earlier.fallback.saturating_sub(self.fallback).as_secs_f64(),
+        }
+    }
 }
 
 enum HlsUploadMessage {
@@ -54,6 +83,12 @@ enum HlsUploadMessage {
 
 type HlsUploadSender = tokio::sync::mpsc::UnboundedSender<HlsUploadMessage>;
 
+pub(crate) struct CameraRecording {
+    pub(crate) frames: mpsc::Receiver<CameraRecordingFrame>,
+    pub(crate) output: PathBuf,
+    pub(crate) bundle_path: PathBuf,
+}
+
 pub(crate) fn spawn(
     spec: CaptureSpec,
     camera_window_id: Option<u32>,
@@ -62,6 +97,7 @@ pub(crate) fn spawn(
     cleanup_on_failure: Option<PathBuf>,
     server_url: Option<String>,
     format: RecordingFormat,
+    camera_recording: Option<CameraRecording>,
     events: Sender<RecordingEvent>,
 ) -> Result<mpsc::Sender<()>, String> {
     let (stop_sender, stop_receiver) = mpsc::channel();
@@ -100,6 +136,7 @@ pub(crate) fn spawn(
                 camera_window_id,
                 &output,
                 format,
+                camera_recording,
                 &stop_receiver,
                 &events,
                 upload_assets,
@@ -202,12 +239,16 @@ fn record(
     camera_window_id: Option<u32>,
     output: &Path,
     format: RecordingFormat,
+    camera_recording: Option<CameraRecording>,
     stop_receiver: &mpsc::Receiver<()>,
     events: &Sender<RecordingEvent>,
     upload_assets: Option<HlsUploadSender>,
 ) -> Result<(), String> {
     let content = ShareableContent::current(CAPTURE_TIMEOUT).map_err(|error| error.to_string())?;
-    let (filter, source_rect) = capture_filter(&content, spec, camera_window_id)?;
+    let embedded_camera_window_id = (format != RecordingFormat::BlipBundle)
+        .then_some(camera_window_id)
+        .flatten();
+    let (filter, source_rect) = capture_filter(&content, spec, embedded_camera_window_id)?;
     let mut config = StreamConfig::builder()
         .with_fps(60)
         .with_cursor(true)
@@ -218,6 +259,21 @@ fn record(
         config = config.with_source_rect(x, y, width, height);
     }
 
+    let recording_start = Instant::now();
+    let camera_stop = Arc::new(AtomicBool::new(false));
+    let camera_writer = camera_recording
+        .map(|camera| {
+            let stop = Arc::clone(&camera_stop);
+            thread::Builder::new()
+                .name("blip-capture-camera-writer".into())
+                .spawn(move || {
+                    let result =
+                        write_camera_frames(&camera.output, &camera.frames, recording_start, &stop);
+                    (result, camera.bundle_path)
+                })
+                .map_err(|error| error.to_string())
+        })
+        .transpose()?;
     let (writer_sender, writer_receiver) = mpsc::sync_channel(FRAME_QUEUE_DEPTH);
     let writer_output = output.to_owned();
     let writer = thread::Builder::new()
@@ -226,12 +282,15 @@ fn record(
         .map_err(|error| error.to_string())?;
     let frame_sender = writer_sender.clone();
     let capture_events = events.clone();
-    let recording_start = Instant::now();
     let capturer = Capturer::builder(filter, config)
         .map_err(|error| error.to_string())?
         .with_timeout(CAPTURE_TIMEOUT)
         .with_video_frame_callback(move |frame| {
-            let _ = frame_sender.try_send(WriterMessage::Frame(frame, recording_start.elapsed()));
+            let timing = FrameTiming {
+                normalized: frame.timestamp(),
+                fallback: recording_start.elapsed(),
+            };
+            let _ = frame_sender.try_send(WriterMessage::Frame(frame, timing));
         })
         .with_stop_callback(move |error| {
             let _ = capture_events.try_send(RecordingEvent::Failed(
@@ -247,14 +306,27 @@ fn record(
     stop_receiver.recv().map_err(|error| error.to_string())?;
     tracing::info!("Screen capture stop requested, stopping capturer");
     capturer.stop().map_err(|error| error.to_string())?;
+    camera_stop.store(true, Ordering::Relaxed);
     tracing::info!("Screen capture stopped, sending finish to video writer");
     writer_sender
         .send(WriterMessage::Finish)
         .map_err(|error| error.to_string())?;
-    writer
+    let screen_first_timestamp = writer
         .join()
         .map_err(|_| "video writer terminated unexpectedly".to_owned())?
         .map_err(|error| error.to_string())?;
+    if let Some(camera_writer) = camera_writer {
+        let (camera_result, bundle_path) = camera_writer
+            .join()
+            .map_err(|_| "camera writer terminated unexpectedly".to_owned())?;
+        let camera_first_timestamp = camera_result.map_err(|error| error.to_string())?;
+        let start_offset_secs = camera_first_timestamp.signed_seconds_since(screen_first_timestamp);
+        BlipBundle::load(&bundle_path)?.set_input_start_offset(
+            &bundle_path,
+            "camera",
+            start_offset_secs,
+        )?;
+    }
     tracing::info!("Video writer thread finished");
     Ok(())
 }
@@ -329,7 +401,7 @@ fn write_frames(
     format: RecordingFormat,
     receiver: &mpsc::Receiver<WriterMessage>,
     upload_assets: Option<HlsUploadSender>,
-) -> Result<(), WriterError> {
+) -> Result<FrameTiming, WriterError> {
     enum Writer {
         Mp4(Mp4Writer),
         Hls(HlsWriter),
@@ -337,9 +409,11 @@ fn write_frames(
 
     let mut writer: Option<Writer> = None;
     let mut frame_count = 0_usize;
+    let mut first_timestamp = None;
     while let Ok(message) = receiver.recv() {
         match message {
-            WriterMessage::Frame(frame, timestamp) => {
+            WriterMessage::Frame(frame, timing) => {
+                let timestamp = timing.writer_timestamp();
                 let is_first = writer.is_none();
                 let writer = match &mut writer {
                     Some(writer) => writer,
@@ -394,25 +468,24 @@ fn write_frames(
                         "First frame received, video writer initialized"
                     );
                 }
-                match writer {
-                    Writer::Mp4(writer) => {
-                        let _ = writer.append(frame.image_buffer(), timestamp)?;
-                    }
-                    Writer::Hls(writer) => {
-                        let _ = writer.append(frame.image_buffer(), timestamp)?;
-                    }
+                let appended = match writer {
+                    Writer::Mp4(writer) => writer.append(frame.image_buffer(), timestamp)?,
+                    Writer::Hls(writer) => writer.append(frame.image_buffer(), timestamp)?,
+                };
+                if appended {
+                    first_timestamp.get_or_insert(timing);
                 }
                 frame_count = frame_count.saturating_add(1);
                 if frame_count.is_multiple_of(60) {
                     tracing::info!(
                         frame_count,
-                        elapsed_secs = timestamp.as_secs_f32(),
+                        elapsed_secs = timing.fallback.as_secs_f32(),
                         "Recording progress"
                     );
                 } else {
                     tracing::trace!(
                         frame_count,
-                        elapsed_ms = timestamp.as_millis(),
+                        elapsed_ms = timing.fallback.as_millis(),
                         "Recorded frame"
                     );
                 }
@@ -432,7 +505,51 @@ fn write_frames(
         total_frames = frame_count,
         "Video writer finalized successfully"
     );
-    Ok(())
+    first_timestamp.ok_or(WriterError::NoFrames)
+}
+
+fn write_camera_frames(
+    output: &Path,
+    receiver: &mpsc::Receiver<CameraRecordingFrame>,
+    recording_start: Instant,
+    stop: &AtomicBool,
+) -> Result<FrameTiming, WriterError> {
+    let mut writer = None;
+    let mut first_timestamp = None;
+    loop {
+        if stop.load(Ordering::Relaxed) {
+            break;
+        }
+        let frame = match receiver.recv_timeout(Duration::from_millis(100)) {
+            Ok(frame) => frame,
+            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        };
+        let Some(fallback) = frame.captured_at.checked_duration_since(recording_start) else {
+            continue;
+        };
+        let timing = FrameTiming {
+            normalized: frame.frame.timestamp(),
+            fallback,
+        };
+        let timestamp = timing.writer_timestamp();
+        let writer = match &mut writer {
+            Some(writer) => writer,
+            None => writer.insert(Mp4Writer::new_preserving_color(
+                output,
+                frame.frame.width(),
+                frame.frame.height(),
+                30,
+                frame.frame.image_buffer(),
+            )?),
+        };
+        if writer.append(frame.frame.image_buffer(), timestamp)? {
+            first_timestamp.get_or_insert(timing);
+        }
+    }
+    let mut writer = writer.ok_or(WriterError::NoFrames)?;
+    writer.finish()?;
+    first_timestamp.ok_or(WriterError::NoFrames)
 }
 
 fn mp4_bitrate(width: usize, height: usize, fps: u32) -> usize {
@@ -514,7 +631,36 @@ async fn receive_hls_upload_result(
 
 #[cfg(test)]
 mod tests {
-    use super::{MAX_MP4_BITRATE, MIN_MP4_BITRATE, display_relative_intersection, mp4_bitrate};
+    use std::time::Duration;
+
+    use blip_media_time::FrameTimestamp;
+
+    use super::{
+        FrameTiming, MAX_MP4_BITRATE, MIN_MP4_BITRATE, display_relative_intersection, mp4_bitrate,
+    };
+
+    #[test]
+    fn aligns_normalized_timestamps_and_falls_back_as_a_pair() {
+        let screen = FrameTiming {
+            normalized: Some(FrameTimestamp::from_duration_since_epoch(
+                Duration::from_secs_f64(10.0),
+            )),
+            fallback: Duration::from_secs_f64(1.0),
+        };
+        let camera = FrameTiming {
+            normalized: Some(FrameTimestamp::from_duration_since_epoch(
+                Duration::from_secs_f64(10.25),
+            )),
+            fallback: Duration::from_secs_f64(1.1),
+        };
+        assert_eq!(camera.signed_seconds_since(screen), 0.25);
+
+        let camera_without_normalized_time = FrameTiming {
+            normalized: None,
+            ..camera
+        };
+        assert!((camera_without_normalized_time.signed_seconds_since(screen) - 0.1).abs() < 1e-9);
+    }
 
     #[test]
     fn scales_mp4_bitrate_with_resolution_and_frame_rate() {

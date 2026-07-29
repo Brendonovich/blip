@@ -1,6 +1,7 @@
 use std::ptr::{self, NonNull};
 use std::slice;
 
+use blip_media_time::FrameTimestamp;
 use objc2_core_foundation::{CFArray, CFDictionary, CFNumber, CFRetained, CGRect, Type};
 use objc2_core_graphics::CGRectMakeWithDictionaryRepresentation;
 use objc2_core_media::CMSampleBuffer;
@@ -20,6 +21,7 @@ use crate::CaptureError;
 pub struct VideoFrame {
     sample_buffer: CFRetained<CMSampleBuffer>,
     image_buffer: CFRetained<CVImageBuffer>,
+    timestamp: Option<FrameTimestamp>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -60,12 +62,16 @@ impl FrameRect {
 unsafe impl Send for VideoFrame {}
 
 impl VideoFrame {
-    pub(crate) fn new(sample_buffer: &CMSampleBuffer) -> Option<Self> {
+    pub(crate) fn new(
+        sample_buffer: &CMSampleBuffer,
+        timestamp: Option<FrameTimestamp>,
+    ) -> Option<Self> {
         // SAFETY: ScreenCaptureKit provides a valid sample for the duration of its callback.
         let image_buffer = unsafe { sample_buffer.image_buffer() }?;
         Some(Self {
             sample_buffer: sample_buffer.retain(),
             image_buffer,
+            timestamp,
         })
     }
 
@@ -87,6 +93,12 @@ impl VideoFrame {
     #[must_use]
     pub fn height(&self) -> usize {
         CVPixelBufferGetHeight(self.image_buffer())
+    }
+
+    /// Returns the frame PTS mapped into the platform's shared monotonic clock domain.
+    #[must_use]
+    pub const fn timestamp(&self) -> Option<FrameTimestamp> {
+        self.timestamp
     }
 
     /// Returns the live content rectangle within this frame's pixel buffer.

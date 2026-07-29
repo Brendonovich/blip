@@ -3,8 +3,9 @@ use std::{
     sync::{
         Arc, Mutex,
         atomic::{AtomicU8, Ordering},
+        mpsc,
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use blip_avfoundation::{CameraCapturer, CameraDevice, CameraFrame};
@@ -24,37 +25,13 @@ use gpui::{
 use crate::{
     CameraMenuAction,
     assets::{CLOSE, CORNER_CIRCLE, CORNER_SQUIRCLE, SHAPE_FRAME},
+    bundle::CameraCrop as PreviewStyle,
     set_camera_window_bounds,
 };
 
 const CONTROL_STRIP_HEIGHT: f32 = 42.0;
 const CORNER_RADIUS: f32 = 32.0;
 const CONTROL_ANIMATION_DURATION: Duration = Duration::from_millis(140);
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum PreviewStyle {
-    Circle,
-    Squircle,
-    Squirectangle,
-}
-
-impl PreviewStyle {
-    fn from_atomic(value: u8) -> Self {
-        match value {
-            0 => Self::Circle,
-            1 => Self::Squircle,
-            _ => Self::Squirectangle,
-        }
-    }
-
-    const fn atomic_value(self) -> u8 {
-        match self {
-            Self::Circle => 0,
-            Self::Squircle => 1,
-            Self::Squirectangle => 2,
-        }
-    }
-}
 
 #[derive(Clone, Copy)]
 enum ResizeCorner {
@@ -81,6 +58,7 @@ pub(crate) struct CameraPreview {
     shared_style: Arc<AtomicU8>,
     processor_sender: async_channel::Sender<CameraPixelBuffer>,
     latest_camera_frame: Arc<Mutex<Option<CameraPixelBuffer>>>,
+    recording_sender: Arc<Mutex<Option<mpsc::SyncSender<CameraRecordingFrame>>>>,
     camera_sender: async_channel::Sender<CameraMenuAction>,
     resize_drag: Option<ResizeDrag>,
     pointer_inside: bool,
@@ -100,6 +78,7 @@ impl CameraPreview {
         let shared_style = Arc::new(AtomicU8::new(PreviewStyle::Squirectangle.atomic_value()));
         let processor_style = Arc::clone(&shared_style);
         let latest_camera_frame = Arc::new(Mutex::new(None));
+        let recording_sender = Arc::new(Mutex::new(None::<mpsc::SyncSender<CameraRecordingFrame>>));
         let processor_error = std::thread::Builder::new()
             .name("camera-preview-compositor".into())
             .spawn(move || {
@@ -109,16 +88,27 @@ impl CameraPreview {
             .map(|error| format!("Failed to start camera compositor: {error}"));
         let capture_sender = processor_sender.clone();
         let capture_latest_frame = Arc::clone(&latest_camera_frame);
+        let capture_recording_sender = Arc::clone(&recording_sender);
         cx.spawn(async move |preview, cx| {
             let started = cx
                 .background_executor()
                 .spawn(async move {
-                    let capturer = CameraCapturer::new(&device, 30, move |frame| {
-                        let frame = CameraPixelBuffer(retain_pixel_buffer(&frame));
+                    let capturer = CameraCapturer::new(&device, 30, move |camera_frame| {
+                        let frame = CameraPixelBuffer(retain_pixel_buffer(&camera_frame));
                         *capture_latest_frame
                             .lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner) =
                             Some(frame.clone());
+                        if let Some(sender) = capture_recording_sender
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .as_ref()
+                        {
+                            let _ = sender.try_send(CameraRecordingFrame {
+                                frame: camera_frame,
+                                captured_at: Instant::now(),
+                            });
+                        }
                         capture_sender.force_send(frame).ok();
                     })?;
                     capturer.start()?;
@@ -166,6 +156,7 @@ impl CameraPreview {
             shared_style,
             processor_sender,
             latest_camera_frame,
+            recording_sender,
             camera_sender,
             resize_drag: None,
             pointer_inside: false,
@@ -173,6 +164,19 @@ impl CameraPreview {
             controls_visible: false,
             controls_transition: 0,
         }
+    }
+
+    pub(crate) fn subscribe_recording_frames(&self) -> mpsc::Receiver<CameraRecordingFrame> {
+        let (sender, receiver) = mpsc::sync_channel(8);
+        *self
+            .recording_sender
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(sender);
+        receiver
+    }
+
+    pub(crate) const fn crop(&self) -> PreviewStyle {
+        self.requested_style
     }
 
     fn cycle_style(&mut self, cx: &mut Context<Self>) {
@@ -551,6 +555,11 @@ struct CameraPixelBuffer(CVPixelBuffer);
 // SAFETY: Captured CVPixelBuffers are immutable while retained and CoreVideo permits them to move
 // between processing queues.
 unsafe impl Send for CameraPixelBuffer {}
+
+pub(crate) struct CameraRecordingFrame {
+    pub(crate) frame: CameraFrame,
+    pub(crate) captured_at: Instant,
+}
 
 fn process_camera_frames(
     receiver: &async_channel::Receiver<CameraPixelBuffer>,

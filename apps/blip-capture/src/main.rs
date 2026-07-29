@@ -22,8 +22,8 @@ use gpui::{
     AnyWindowHandle, App, Bounds, ClipboardEntry, ClipboardItem, Context, CursorStyle, Div, Entity,
     ExternalPaths, FontWeight, IntoElement, KeyBinding, Menu, MenuItem, MouseButton,
     MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, Render, SharedString, Window,
-    WindowBackgroundAppearance, WindowBounds, WindowKind, WindowOptions, actions, div, point,
-    prelude::*, px, rgb, rgba, size,
+    WindowBackgroundAppearance, WindowBounds, WindowHandle, WindowKind, WindowOptions, actions,
+    div, point, prelude::*, px, rgb, rgba, size,
 };
 use gpui_platform::application;
 use objc2::rc::Retained;
@@ -32,8 +32,8 @@ use objc2::{
 };
 use objc2_app_kit::{
     NSApplication, NSApplicationActivationOptions, NSApplicationActivationPolicy,
-    NSControlStateValueOn, NSMenu, NSMenuItem, NSRunningApplication, NSScreen, NSStatusBar,
-    NSStatusItem, NSVariableStatusItemLength, NSView, NSWindowAnimationBehavior,
+    NSControlStateValueOn, NSImage, NSMenu, NSMenuItem, NSRunningApplication, NSScreen,
+    NSStatusBar, NSStatusItem, NSVariableStatusItemLength, NSView, NSWindowAnimationBehavior,
     NSWindowCollectionBehavior, NSWindowStyleMask,
 };
 use objc2_foundation::{NSObject, NSObjectProtocol, NSPoint, NSRect, NSSize, NSString};
@@ -52,7 +52,7 @@ mod recording;
 mod theme;
 mod upload;
 
-use bundle::BlipBundle;
+use bundle::{BlipBundle, CameraCrop};
 use camera_preview::CameraPreview;
 use editor::BundleEditor;
 use numeric_input::{NumericInput, NumericInputEvent};
@@ -60,7 +60,7 @@ use profiles::{
     CompletionAction, RecordingFormat, RecordingProfile, RecordingProfiles, RecordingTarget,
     join_server_url, split_server_url,
 };
-use recording::{CaptureSpec, RecordingEvent};
+use recording::{CameraRecording, CaptureSpec, RecordingEvent};
 
 #[link(name = "CoreGraphics", kind = "framework")]
 unsafe extern "C" {
@@ -335,7 +335,7 @@ struct CaptureApp {
     cameras: Vec<CameraDevice>,
     selected_camera: Option<usize>,
     camera_sender: async_channel::Sender<CameraMenuAction>,
-    camera_window: Option<AnyWindowHandle>,
+    camera_window: Option<WindowHandle<CameraPreview>>,
     camera_window_id: Option<u32>,
     recording_completion_action: CompletionAction,
     open_recording_when_finished: bool,
@@ -647,7 +647,7 @@ impl CaptureApp {
                     .update(cx, |_, window, _| configure_camera_window(window))
                     .ok()
                     .flatten();
-                self.camera_window = Some(preview.into());
+                self.camera_window = Some(preview);
                 self.error = None;
             }
             Err(error) => {
@@ -870,8 +870,23 @@ impl CaptureApp {
             cx.notify();
             return;
         }
+        let camera = (profile.format == RecordingFormat::BlipBundle)
+            .then(|| {
+                self.camera_window.as_ref().and_then(|preview| {
+                    preview
+                        .update(cx, |preview, _, _| {
+                            (preview.subscribe_recording_frames(), preview.crop())
+                        })
+                        .ok()
+                })
+            })
+            .flatten();
         let target_name = self.capture_target_name(spec);
-        let output = match output_destination(&profile, &target_name) {
+        let output = match output_destination(
+            &profile,
+            &target_name,
+            camera.as_ref().map(|(_, crop)| *crop),
+        ) {
             Ok(output) => output,
             Err(error) => {
                 self.error = Some(error);
@@ -879,10 +894,19 @@ impl CaptureApp {
                 return;
             }
         };
+        let camera_frames = camera.map(|(frames, _)| frames);
         let server_url = match &profile.target {
             RecordingTarget::Remote { server_url } => Some(server_url.clone()),
             RecordingTarget::Local { .. } => None,
         };
+        let camera_recording = camera_frames
+            .zip(output.camera_media_path.clone())
+            .zip(output.bundle_path.clone())
+            .map(|((frames, output), bundle_path)| CameraRecording {
+                frames,
+                output,
+                bundle_path,
+            });
         let sender = match recording::spawn(
             spec,
             self.camera_window_id,
@@ -891,6 +915,7 @@ impl CaptureApp {
             output.cleanup_on_failure,
             server_url,
             profile.format,
+            camera_recording,
             self.event_sender.clone(),
         ) {
             Ok(sender) => sender,
@@ -3043,6 +3068,8 @@ fn profile_settings_options(cx: &App) -> WindowOptions {
 
 struct OutputDestination {
     media_path: PathBuf,
+    camera_media_path: Option<PathBuf>,
+    bundle_path: Option<PathBuf>,
     completed_path: PathBuf,
     cleanup_on_failure: Option<PathBuf>,
 }
@@ -3050,6 +3077,7 @@ struct OutputDestination {
 fn output_destination(
     profile: &RecordingProfile,
     target_name: &str,
+    camera_crop: Option<CameraCrop>,
 ) -> Result<OutputDestination, String> {
     let folder = match &profile.target {
         RecordingTarget::Local { folder } => folder.clone(),
@@ -3066,16 +3094,25 @@ fn output_destination(
         let output = unique_output_path(&folder, &filename, "hls");
         return Ok(OutputDestination {
             media_path: output.clone(),
+            camera_media_path: None,
+            bundle_path: None,
             completed_path: output.clone(),
             cleanup_on_failure: Some(output),
         });
     }
     if profile.format == RecordingFormat::BlipBundle {
         let completed_path = unique_output_path(&folder, &filename, "blip");
-        let bundle = BlipBundle::create(&completed_path)?;
+        let mut bundle = BlipBundle::create(&completed_path, camera_crop.is_some())?;
+        if let Some(crop) = camera_crop {
+            bundle.camera_layout.crop = crop;
+            bundle.save_project_config(&completed_path)?;
+        }
         let media_path = bundle.media_path(&completed_path)?;
+        let camera_media_path = bundle.input_media_path(&completed_path, "camera");
         return Ok(OutputDestination {
             media_path,
+            camera_media_path,
+            bundle_path: Some(completed_path.clone()),
             completed_path: completed_path.clone(),
             cleanup_on_failure: Some(completed_path),
         });
@@ -3083,6 +3120,8 @@ fn output_destination(
     let completed_path = unique_output_path(&folder, &filename, "mp4");
     Ok(OutputDestination {
         media_path: completed_path.clone(),
+        camera_media_path: None,
+        bundle_path: None,
         completed_path,
         cleanup_on_failure: None,
     })
@@ -3490,8 +3529,12 @@ fn import_profile_urls(cx: &mut App, urls: Vec<String>) {
 fn create_menu_bar_item(sender: async_channel::Sender<MenuBarAction>) -> Option<MenuBarItem> {
     let main_thread = MainThreadMarker::new()?;
     let item = NSStatusBar::systemStatusBar().statusItemWithLength(NSVariableStatusItemLength);
-    item.button(main_thread)?
-        .setTitle(&NSString::from_str("Blip"));
+    let button = item.button(main_thread)?;
+    let icon = NSImage::imageWithSystemSymbolName_accessibilityDescription(
+        &NSString::from_str("record.circle"),
+        Some(&NSString::from_str("Blip Capture")),
+    )?;
+    button.setImage(Some(&icon));
 
     let menu = NSMenu::new(main_thread);
     let handler = MenuBarHandler::new(sender);
