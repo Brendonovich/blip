@@ -15,7 +15,8 @@ use core_foundation::base::TCFType as _;
 use objc2::rc::Retained;
 use objc2::runtime::AnyObject;
 use objc2_av_foundation::{
-    AVAssetReader, AVAssetReaderTrackOutput, AVAssetTrack, AVMediaTypeVideo, AVURLAsset,
+    AVAssetReader, AVAssetReaderTrackOutput, AVAssetTrack, AVMediaTypeAudio, AVMediaTypeVideo,
+    AVURLAsset,
 };
 use objc2_core_media::{CMTime, CMTimeRange};
 use objc2_core_video::kCVPixelFormatType_32BGRA;
@@ -70,6 +71,8 @@ pub enum DecoderError {
     InvalidPath,
     #[error("no video track found in file")]
     NoVideoTrack,
+    #[error("no audio track found in file")]
+    NoAudioTrack,
     #[error("failed to create AVAssetReader: {0}")]
     CreateReader(String),
     #[error("failed to create AVAssetReaderTrackOutput: {0}")]
@@ -78,6 +81,93 @@ pub enum DecoderError {
     StartReading(String),
     #[error("failed to decode frame at requested time")]
     DecodeFailed,
+    #[error("failed to decode audio: {0}")]
+    DecodeAudio(String),
+}
+
+/// Decodes an asset's first audio track to interleaved 48 kHz stereo Float32 PCM.
+pub fn decode_audio(path: impl AsRef<Path>) -> Result<Vec<f32>, DecoderError> {
+    let path = path.as_ref();
+    let url_str = path.to_str().ok_or(DecoderError::InvalidPath)?;
+    let url = NSURL::fileURLWithPath(&NSString::from_str(url_str));
+    let asset = unsafe { AVURLAsset::URLAssetWithURL_options(&url, None) };
+    let media_type = unsafe { AVMediaTypeAudio }.ok_or(DecoderError::NoAudioTrack)?;
+    #[allow(deprecated)]
+    let track = unsafe { asset.tracksWithMediaType(media_type) }
+        .firstObject()
+        .ok_or(DecoderError::NoAudioTrack)?;
+    let reader = unsafe { AVAssetReader::assetReaderWithAsset_error(&asset) }
+        .map_err(|error| DecoderError::CreateReader(error.to_string()))?;
+
+    let keys = [
+        NSString::from_str("AVFormatIDKey"),
+        NSString::from_str("AVSampleRateKey"),
+        NSString::from_str("AVNumberOfChannelsKey"),
+        NSString::from_str("AVLinearPCMBitDepthKey"),
+        NSString::from_str("AVLinearPCMIsFloatKey"),
+        NSString::from_str("AVLinearPCMIsBigEndianKey"),
+        NSString::from_str("AVLinearPCMIsNonInterleaved"),
+    ];
+    let key_refs = keys.iter().map(|key| &**key).collect::<Vec<_>>();
+    let values = [
+        NSNumber::new_u32(0x6c70_636d),
+        NSNumber::new_u32(blip_audio::MIX_SAMPLE_RATE),
+        NSNumber::new_u16(blip_audio::MIX_CHANNELS),
+        NSNumber::new_u32(32),
+        NSNumber::new_bool(true),
+        NSNumber::new_bool(false),
+        NSNumber::new_bool(false),
+    ];
+    let value_refs: Vec<&AnyObject> = values.iter().map(|value| &**value as &AnyObject).collect();
+    let settings = NSDictionary::from_slices(&key_refs, &value_refs);
+    let output = unsafe {
+        AVAssetReaderTrackOutput::assetReaderTrackOutputWithTrack_outputSettings(
+            &track,
+            Some(&settings),
+        )
+    };
+    unsafe { output.setAlwaysCopiesSampleData(true) };
+    if !unsafe { reader.canAddOutput(&output) } {
+        return Err(DecoderError::CreateOutput(
+            "canAddOutput returned false".into(),
+        ));
+    }
+    unsafe { reader.addOutput(&output) };
+    if !unsafe { reader.startReading() } {
+        return Err(DecoderError::StartReading(
+            "startReading returned false".into(),
+        ));
+    }
+
+    let mut samples = Vec::new();
+    while let Some(sample_buffer) = unsafe { output.copyNextSampleBuffer() } {
+        let block = unsafe { sample_buffer.data_buffer() }
+            .ok_or_else(|| DecoderError::DecodeAudio("sample has no data buffer".into()))?;
+        let byte_count = unsafe { block.data_length() };
+        if byte_count == 0 || !byte_count.is_multiple_of(size_of::<f32>()) {
+            continue;
+        }
+        let old_len = samples.len();
+        let sample_count = byte_count / size_of::<f32>();
+        samples.resize(old_len.saturating_add(sample_count), 0.0);
+        let output_samples = samples
+            .get_mut(old_len..)
+            .ok_or_else(|| DecoderError::DecodeAudio("could not access PCM buffer".into()))?;
+        let destination = std::ptr::NonNull::new(output_samples.as_mut_ptr().cast())
+            .ok_or_else(|| DecoderError::DecodeAudio("could not allocate PCM buffer".into()))?;
+        let status = unsafe { block.copy_data_bytes(0, byte_count, destination) };
+        if status != 0 {
+            return Err(DecoderError::DecodeAudio(format!(
+                "could not copy PCM bytes ({status})"
+            )));
+        }
+    }
+    if samples.is_empty() {
+        return Err(DecoderError::DecodeAudio(
+            "audio track contains no samples".into(),
+        ));
+    }
+    Ok(samples)
 }
 
 struct ActiveReader {

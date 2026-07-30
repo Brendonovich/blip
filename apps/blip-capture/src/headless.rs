@@ -61,7 +61,7 @@ pub(crate) fn run(args: &CaptureArgs) -> Result<String, String> {
     };
     let target_name =
         display_name(display.id()).unwrap_or_else(|| format!("Display {}", display.id()));
-    let output = output_destination(&profile, &target_name, None)?;
+    let output = output_destination(&profile, &target_name, None, true)?;
     eprintln!(
         "blip-capture: recording display {} for {} seconds to {}",
         display.id(),
@@ -78,6 +78,8 @@ pub(crate) fn run(args: &CaptureArgs) -> Result<String, String> {
         output.cleanup_on_failure,
         Some(server_url),
         format,
+        true,
+        None,
         None,
         event_sender,
     )?;

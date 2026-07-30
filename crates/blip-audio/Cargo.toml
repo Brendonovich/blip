@@ -8,3 +8,4 @@ workspace = true
 
 [dependencies]
 blip-media-time.workspace = true
+cpal.workspace = true

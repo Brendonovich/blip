@@ -3,6 +3,7 @@
 use std::fmt;
 
 mod audio;
+mod audio_latency;
 mod capture;
 mod config;
 mod content;

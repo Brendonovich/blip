@@ -1,5 +1,6 @@
 use std::ptr;
 use std::slice;
+use std::time::Duration;
 
 use blip_audio::AudioPacket;
 use blip_media_time::FrameTimestamp;
@@ -17,7 +18,9 @@ use crate::CaptureError;
 pub(crate) fn audio_packet(
     sample_buffer: &CMSampleBuffer,
     timestamp: Option<FrameTimestamp>,
+    output_latency: Duration,
 ) -> Result<AudioPacket, CaptureError> {
+    let timestamp = compensate_timestamp(timestamp, output_latency);
     // SAFETY: The retained callback sample has immutable format metadata.
     let format = unsafe { sample_buffer.format_description() }.ok_or_else(|| {
         CaptureError::InvalidFrame("system audio sample has no format description".into())
@@ -97,6 +100,18 @@ pub(crate) fn audio_packet(
     }
     AudioPacket::new(samples, sample_rate, channels, timestamp)
         .map_err(|error| CaptureError::InvalidFrame(error.to_string()))
+}
+
+fn compensate_timestamp(
+    timestamp: Option<FrameTimestamp>,
+    output_latency: Duration,
+) -> Option<FrameTimestamp> {
+    timestamp.and_then(|timestamp| {
+        timestamp
+            .duration_since_epoch()
+            .checked_add(output_latency)
+            .map(FrameTimestamp::from_duration_since_epoch)
+    })
 }
 
 fn sample_rate(value: f64) -> Result<u32, CaptureError> {
@@ -210,4 +225,20 @@ fn audio_buffers(sample_buffer: &CMSampleBuffer) -> Result<Vec<AudioBufferData>,
             })
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn advances_audio_timestamp_by_output_latency() {
+        let timestamp = FrameTimestamp::from_duration_since_epoch(Duration::from_secs(10));
+        assert_eq!(
+            compensate_timestamp(Some(timestamp), Duration::from_millis(180)),
+            Some(FrameTimestamp::from_duration_since_epoch(
+                Duration::from_millis(10_180)
+            ))
+        );
+    }
 }

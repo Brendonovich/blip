@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use async_channel::Sender;
 use blip_audio::AudioPacket;
-use blip_avfoundation::{HlsWriter, Mp4Writer, WriterError};
+use blip_avfoundation::{AudioWriter, HlsWriter, Mp4Writer, WriterError};
 use blip_media_time::FrameTimestamp;
 use blip_sck::{
     CaptureColorSpace, CaptureFilter, Capturer, PixelFormat, ShareableContent, StreamConfig,
@@ -91,6 +91,11 @@ pub(crate) struct CameraRecording {
     pub(crate) bundle_path: PathBuf,
 }
 
+pub(crate) struct BundleAudioRecording {
+    pub(crate) output: PathBuf,
+    pub(crate) bundle_path: PathBuf,
+}
+
 pub(crate) fn spawn(
     spec: CaptureSpec,
     camera_window_id: Option<u32>,
@@ -99,6 +104,8 @@ pub(crate) fn spawn(
     cleanup_on_failure: Option<PathBuf>,
     server_url: Option<String>,
     format: RecordingFormat,
+    system_audio: bool,
+    bundle_audio_recording: Option<BundleAudioRecording>,
     camera_recording: Option<CameraRecording>,
     events: Sender<RecordingEvent>,
 ) -> Result<mpsc::Sender<()>, String> {
@@ -138,6 +145,8 @@ pub(crate) fn spawn(
                 camera_window_id,
                 &output,
                 format,
+                system_audio,
+                bundle_audio_recording,
                 camera_recording,
                 &stop_receiver,
                 &events,
@@ -241,6 +250,8 @@ fn record(
     camera_window_id: Option<u32>,
     output: &Path,
     format: RecordingFormat,
+    system_audio: bool,
+    bundle_audio_recording: Option<BundleAudioRecording>,
     camera_recording: Option<CameraRecording>,
     stop_receiver: &mpsc::Receiver<()>,
     events: &Sender<RecordingEvent>,
@@ -257,7 +268,7 @@ fn record(
         .with_queue_depth(8)
         .with_pixel_format(PixelFormat::Bgra)
         .with_color_space(CaptureColorSpace::Srgb)
-        .with_system_audio(format != RecordingFormat::BlipBundle);
+        .with_system_audio(system_audio);
     if let Some((x, y, width, height)) = source_rect {
         config = config.with_source_rect(x, y, width, height);
     }
@@ -279,9 +290,21 @@ fn record(
         .transpose()?;
     let (writer_sender, writer_receiver) = mpsc::sync_channel(FRAME_QUEUE_DEPTH);
     let writer_output = output.to_owned();
+    let bundle_audio_output = bundle_audio_recording
+        .as_ref()
+        .map(|recording| recording.output.clone());
     let writer = thread::Builder::new()
         .name("blip-capture-writer".into())
-        .spawn(move || write_frames(&writer_output, format, &writer_receiver, upload_assets))
+        .spawn(move || {
+            write_frames(
+                &writer_output,
+                format,
+                system_audio,
+                bundle_audio_output,
+                &writer_receiver,
+                upload_assets,
+            )
+        })
         .map_err(|error| error.to_string())?;
     let frame_sender = writer_sender.clone();
     let capture_events = events.clone();
@@ -322,7 +345,7 @@ fn record(
     writer_sender
         .send(WriterMessage::Finish)
         .map_err(|error| error.to_string())?;
-    let screen_first_timestamp = writer
+    let written = writer
         .join()
         .map_err(|_| "video writer terminated unexpectedly".to_owned())?
         .map_err(|error| error.to_string())?;
@@ -331,10 +354,21 @@ fn record(
             .join()
             .map_err(|_| "camera writer terminated unexpectedly".to_owned())?;
         let camera_first_timestamp = camera_result.map_err(|error| error.to_string())?;
-        let start_offset_secs = camera_first_timestamp.signed_seconds_since(screen_first_timestamp);
+        let start_offset_secs = camera_first_timestamp.signed_seconds_since(written.screen_first);
         BlipBundle::load(&bundle_path)?.set_input_start_offset(
             &bundle_path,
             "camera",
+            start_offset_secs,
+        )?;
+    }
+    if let Some(bundle_audio_recording) = bundle_audio_recording {
+        let audio_first = written
+            .audio_first
+            .ok_or_else(|| "system audio recording contains no samples".to_owned())?;
+        let start_offset_secs = audio_first.signed_seconds_since(written.screen_first);
+        BlipBundle::load(&bundle_audio_recording.bundle_path)?.set_input_start_offset(
+            &bundle_audio_recording.bundle_path,
+            "system_audio",
             start_offset_secs,
         )?;
     }
@@ -410,17 +444,21 @@ fn display_relative_intersection(
 fn write_frames(
     output: &Path,
     format: RecordingFormat,
+    system_audio: bool,
+    bundle_audio_output: Option<PathBuf>,
     receiver: &mpsc::Receiver<WriterMessage>,
     upload_assets: Option<HlsUploadSender>,
-) -> Result<FrameTiming, WriterError> {
+) -> Result<WriteResult, WriterError> {
     enum Writer {
         Mp4(Mp4Writer),
         Hls(HlsWriter),
     }
 
     let mut writer: Option<Writer> = None;
+    let mut audio_writer = None;
     let mut frame_count = 0_usize;
     let mut first_timestamp = None;
+    let mut first_audio_timestamp = None;
     while let Ok(message) = receiver.recv() {
         match message {
             WriterMessage::Frame(frame, timing) => {
@@ -430,18 +468,38 @@ fn write_frames(
                     Some(writer) => writer,
                     None => writer.insert(if format == RecordingFormat::Hls {
                         Writer::Hls(if let Some(upload_assets) = upload_assets.clone() {
-                            HlsWriter::new_with_asset_callback_and_system_audio(
+                            let callback = move |path| {
+                                let _ = upload_assets.send(HlsUploadMessage::Asset(path));
+                            };
+                            if system_audio {
+                                HlsWriter::new_with_asset_callback_and_system_audio(
+                                    output,
+                                    frame.width(),
+                                    frame.height(),
+                                    60,
+                                    Duration::from_secs(2),
+                                    callback,
+                                )?
+                            } else {
+                                HlsWriter::new_with_asset_callback(
+                                    output,
+                                    frame.width(),
+                                    frame.height(),
+                                    60,
+                                    Duration::from_secs(2),
+                                    callback,
+                                )?
+                            }
+                        } else if system_audio {
+                            HlsWriter::new_with_system_audio(
                                 output,
                                 frame.width(),
                                 frame.height(),
                                 60,
                                 Duration::from_secs(2),
-                                move |path| {
-                                    let _ = upload_assets.send(HlsUploadMessage::Asset(path));
-                                },
                             )?
                         } else {
-                            HlsWriter::new_with_system_audio(
+                            HlsWriter::new(
                                 output,
                                 frame.width(),
                                 frame.height(),
@@ -450,8 +508,17 @@ fn write_frames(
                             )?
                         })
                     } else {
-                        let writer = if format == RecordingFormat::Mp4 {
+                        let writer = if format == RecordingFormat::Mp4 && system_audio {
                             Mp4Writer::new_with_bitrate_preserving_color_and_system_audio(
+                                output,
+                                frame.width(),
+                                frame.height(),
+                                60,
+                                mp4_bitrate(frame.width(), frame.height(), 60),
+                                frame.image_buffer(),
+                            )?
+                        } else if format == RecordingFormat::Mp4 {
+                            Mp4Writer::new_with_bitrate_preserving_color(
                                 output,
                                 frame.width(),
                                 frame.height(),
@@ -502,6 +569,16 @@ fn write_frames(
                 }
             }
             WriterMessage::Audio(frame, timing) => {
+                if let Some(audio_output) = &bundle_audio_output {
+                    let writer = match &mut audio_writer {
+                        Some(writer) => writer,
+                        None => audio_writer.insert(AudioWriter::new(audio_output)?),
+                    };
+                    if writer.append(&frame, timing.writer_timestamp())? {
+                        first_audio_timestamp.get_or_insert(timing);
+                    }
+                    continue;
+                }
                 let Some(writer) = &mut writer else {
                     continue;
                 };
@@ -525,11 +602,22 @@ fn write_frames(
         Writer::Mp4(writer) => writer.finish()?,
         Writer::Hls(writer) => writer.finish()?,
     }
+    if bundle_audio_output.is_some() {
+        audio_writer.ok_or(WriterError::NoFrames)?.finish()?;
+    }
     tracing::info!(
         total_frames = frame_count,
         "Video writer finalized successfully"
     );
-    first_timestamp.ok_or(WriterError::NoFrames)
+    Ok(WriteResult {
+        screen_first: first_timestamp.ok_or(WriterError::NoFrames)?,
+        audio_first: first_audio_timestamp,
+    })
+}
+
+struct WriteResult {
+    screen_first: FrameTiming,
+    audio_first: Option<FrameTiming>,
 }
 
 fn write_camera_frames(

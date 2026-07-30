@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 
 pub(crate) const MANIFEST_FILE: &str = "manifest.json";
 pub(crate) const PROJECT_CONFIG_FILE: &str = "project-config.json";
-const BUNDLE_VERSION: u32 = 1;
+const BUNDLE_VERSION: u32 = 2;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct BlipBundle {
@@ -176,7 +176,23 @@ pub(crate) struct BundleInput {
     pub(crate) name: String,
     pub(crate) media: PathBuf,
     #[serde(default)]
+    pub(crate) kind: BundleInputKind,
+    #[serde(default)]
     pub(crate) start_offset_secs: f64,
+    #[serde(default = "default_audio_gain")]
+    pub(crate) gain: f32,
+}
+
+const fn default_audio_gain() -> f32 {
+    1.0
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum BundleInputKind {
+    #[default]
+    Video,
+    Audio,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -300,7 +316,11 @@ pub(crate) struct ZoomSegment {
 }
 
 impl BlipBundle {
-    pub(crate) fn create(path: &Path, include_camera: bool) -> Result<Self, String> {
+    pub(crate) fn create(
+        path: &Path,
+        include_camera: bool,
+        include_system_audio: bool,
+    ) -> Result<Self, String> {
         fs::create_dir(path).map_err(|error| format!("failed to create Blip Bundle: {error}"))?;
         let inputs_dir = path.join("inputs");
         if let Err(error) = fs::create_dir(&inputs_dir) {
@@ -311,14 +331,28 @@ impl BlipBundle {
             id: "screen".into(),
             name: "Screen".into(),
             media: PathBuf::from("inputs/screen.mp4"),
+            kind: BundleInputKind::Video,
             start_offset_secs: 0.0,
+            gain: 1.0,
         }];
         if include_camera {
             inputs.push(BundleInput {
                 id: "camera".into(),
                 name: "Camera".into(),
                 media: PathBuf::from("inputs/camera.mp4"),
+                kind: BundleInputKind::Video,
                 start_offset_secs: 0.0,
+                gain: 1.0,
+            });
+        }
+        if include_system_audio {
+            inputs.push(BundleInput {
+                id: "system_audio".into(),
+                name: "System Audio".into(),
+                media: PathBuf::from("inputs/system-audio.m4a"),
+                kind: BundleInputKind::Audio,
+                start_offset_secs: 0.0,
+                gain: 1.0,
             });
         }
         let bundle = Self {
@@ -424,8 +458,8 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{
-        BackgroundType, BlipBundle, CameraCrop, CameraLayout, CameraPosition, ExportFormat,
-        ExportResolution, ExportSettings, OutputAspectRatio, PROJECT_CONFIG_FILE,
+        BackgroundType, BlipBundle, BundleInputKind, CameraCrop, CameraLayout, CameraPosition,
+        ExportFormat, ExportResolution, ExportSettings, OutputAspectRatio, PROJECT_CONFIG_FILE,
         ProjectAppearance, ScreenCrop, VideoSegment, VideoSegmentResizeMode,
     };
 
@@ -435,7 +469,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .map_or(0, |duration| duration.as_nanos());
         let path = std::env::temp_dir().join(format!("blip-bundle-test-{suffix}.blip"));
-        let result = BlipBundle::create(&path, false);
+        let result = BlipBundle::create(&path, false, false);
         assert!(result.is_ok(), "bundle should be created");
         let Some(bundle) = result.ok() else {
             return;
@@ -474,7 +508,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .map_or(0, |duration| duration.as_nanos());
         let path = std::env::temp_dir().join(format!("blip-camera-test-{suffix}.blip"));
-        let mut bundle = BlipBundle::create(&path, true).expect("create camera bundle");
+        let mut bundle = BlipBundle::create(&path, true, false).expect("create camera bundle");
 
         assert_eq!(
             bundle.input_media_path(&path, "camera"),
@@ -492,6 +526,30 @@ mod tests {
     }
 
     #[test]
+    fn creates_system_audio_input_and_persists_its_alignment() {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |duration| duration.as_nanos());
+        let path = std::env::temp_dir().join(format!("blip-audio-test-{suffix}.blip"));
+        let mut bundle = BlipBundle::create(&path, false, true).expect("create audio bundle");
+
+        assert_eq!(
+            bundle.input_media_path(&path, "system_audio"),
+            Some(path.join("inputs/system-audio.m4a"))
+        );
+        assert_eq!(bundle.inputs[1].kind, BundleInputKind::Audio);
+        bundle
+            .set_input_start_offset(&path, "system_audio", 0.125)
+            .expect("save audio alignment");
+
+        let loaded = BlipBundle::load(&path).expect("load audio bundle");
+        assert_eq!(loaded.inputs[1].kind, BundleInputKind::Audio);
+        assert_eq!(loaded.inputs[1].start_offset_secs, 0.125);
+
+        std::fs::remove_dir_all(path).ok();
+    }
+
+    #[test]
     fn loads_manifests_without_zoom_segments() {
         let manifest = r#"{
             "version": 1,
@@ -502,6 +560,8 @@ mod tests {
         assert!(bundle.zoom_segments.is_empty());
         assert!(bundle.video_segments.is_none());
         assert_eq!(bundle.inputs[0].start_offset_secs, 0.0);
+        assert_eq!(bundle.inputs[0].gain, 1.0);
+        assert_eq!(bundle.inputs[0].kind, BundleInputKind::Video);
         assert_eq!(bundle.camera_layout, CameraLayout::default());
         assert_eq!(bundle.output_aspect_ratio, OutputAspectRatio::Wide);
         assert_eq!(bundle.screen_crop, None);
@@ -533,7 +593,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .map_or(0, |duration| duration.as_nanos());
         let path = std::env::temp_dir().join(format!("blip-legacy-config-test-{suffix}.blip"));
-        BlipBundle::create(&path, false).expect("create bundle");
+        BlipBundle::create(&path, false, false).expect("create bundle");
         std::fs::write(path.join(PROJECT_CONFIG_FILE), "{}").expect("write legacy config");
 
         let loaded = BlipBundle::load(&path).expect("load legacy project config");
@@ -550,7 +610,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .map_or(0, |duration| duration.as_nanos());
         let path = std::env::temp_dir().join(format!("blip-config-test-{suffix}.blip"));
-        let mut bundle = BlipBundle::create(&path, false).expect("create bundle");
+        let mut bundle = BlipBundle::create(&path, false, false).expect("create bundle");
         let manifest = std::fs::read(path.join("manifest.json")).expect("read manifest");
         bundle.video_segments = Some(vec![VideoSegment {
             id: 1,

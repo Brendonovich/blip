@@ -24,8 +24,8 @@ use objc2::rc::Retained;
 use objc2::runtime::AnyObject;
 use objc2_av_foundation::{
     AVAssetWriter, AVAssetWriterInput, AVAssetWriterInputPixelBufferAdaptor, AVAssetWriterStatus,
-    AVFileTypeMPEG4, AVFileTypeQuickTimeMovie, AVMediaTypeAudio, AVMediaTypeVideo,
-    AVVideoAverageBitRateKey, AVVideoCodecKey, AVVideoCodecTypeH264,
+    AVFileTypeAppleM4A, AVFileTypeMPEG4, AVFileTypeQuickTimeMovie, AVMediaTypeAudio,
+    AVMediaTypeVideo, AVVideoAverageBitRateKey, AVVideoCodecKey, AVVideoCodecTypeH264,
     AVVideoColorPrimaries_ITU_R_709_2, AVVideoColorPrimariesKey, AVVideoColorPropertiesKey,
     AVVideoCompressionPropertiesKey, AVVideoHeightKey, AVVideoTransferFunction_ITU_R_709_2,
     AVVideoTransferFunctionKey, AVVideoWidthKey, AVVideoYCbCrMatrix_ITU_R_709_2,
@@ -111,6 +111,123 @@ pub struct Mp4Writer {
     last_relative_timestamp_micros: Option<i64>,
     started: bool,
     finished: bool,
+}
+
+pub struct AudioWriter {
+    writer: Retained<AVAssetWriter>,
+    input: Retained<AVAssetWriterInput>,
+    start_timestamp_micros: Option<i64>,
+    end_timestamp_micros: Option<i64>,
+    finished: bool,
+}
+
+impl AudioWriter {
+    /// Creates an AAC-only M4A writer for captured system audio.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the output cannot be prepared or AVFoundation rejects the writer.
+    pub fn new(output: &Path) -> Result<Self, WriterError> {
+        prepare_output(output)?;
+        let path = output.to_str().ok_or(WriterError::InvalidOutputPath)?;
+        let url = NSURL::fileURLWithPath(&NSString::from_str(path));
+        // SAFETY: This framework constant exists on every supported macOS version.
+        let file_type = unsafe { AVFileTypeAppleM4A }
+            .ok_or(WriterError::MissingConstant("AVFileTypeAppleM4A"))?;
+        // SAFETY: The URL is local and the file type is provided by AVFoundation.
+        let writer =
+            unsafe { AVAssetWriter::assetWriterWithURL_fileType_error(&url, file_type) }
+                .map_err(|error| WriterError::Create(error.localizedDescription().to_string()))?;
+        let input = add_audio_input(&writer, true)?.ok_or(WriterError::UnsupportedInput)?;
+        // SAFETY: The audio input and writer configuration are complete.
+        if !unsafe { writer.startWriting() } {
+            return Err(WriterError::Start(writer_error(&writer)));
+        }
+        // SAFETY: Audio timestamps are normalized to the beginning of this dedicated track.
+        unsafe { writer.startSessionAtSourceTime(cm_time(0)) };
+        Ok(Self {
+            writer,
+            input,
+            start_timestamp_micros: None,
+            end_timestamp_micros: None,
+            finished: false,
+        })
+    }
+
+    /// Appends captured system-audio samples and normalizes the first packet to time zero.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the timestamp overflows or AVFoundation rejects the samples.
+    pub fn append(
+        &mut self,
+        packet: &AudioPacket,
+        timestamp: Duration,
+    ) -> Result<bool, WriterError> {
+        // SAFETY: The audio input is retained and attached to the active writer.
+        if !unsafe { self.input.isReadyForMoreMediaData() } {
+            return Ok(false);
+        }
+        let timestamp_micros =
+            i64::try_from(timestamp.as_micros()).map_err(|_| WriterError::TimestampOverflow)?;
+        let start_timestamp = *self.start_timestamp_micros.get_or_insert(timestamp_micros);
+        let relative_timestamp = timestamp_micros
+            .checked_sub(start_timestamp)
+            .ok_or(WriterError::TimestampOverflow)?
+            .max(0);
+        let sample_buffer = audio_sample_buffer(packet, relative_timestamp)?;
+        // SAFETY: The input is ready and the sample buffer has a valid presentation timestamp.
+        if !unsafe { self.input.appendSampleBuffer(&sample_buffer) } {
+            return Err(WriterError::AppendAudio(writer_error(&self.writer)));
+        }
+        let frame_count =
+            u128::try_from(packet.frame_count()).map_err(|_| WriterError::TimestampOverflow)?;
+        let packet_duration = i64::try_from(
+            frame_count
+                .checked_mul(1_000_000)
+                .ok_or(WriterError::TimestampOverflow)?
+                .checked_div(u128::from(packet.sample_rate()))
+                .ok_or(WriterError::TimestampOverflow)?,
+        )
+        .map_err(|_| WriterError::TimestampOverflow)?;
+        let packet_end = relative_timestamp
+            .checked_add(packet_duration.max(1))
+            .ok_or(WriterError::TimestampOverflow)?;
+        self.end_timestamp_micros = Some(
+            self.end_timestamp_micros
+                .map_or(packet_end, |end| end.max(packet_end)),
+        );
+        Ok(true)
+    }
+
+    /// Finalizes the audio track and M4A container.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if no samples were written or AVFoundation cannot finish the file.
+    pub fn finish(&mut self) -> Result<(), WriterError> {
+        if self.finished {
+            return Ok(());
+        }
+        let end_timestamp = self.end_timestamp_micros.ok_or(WriterError::NoFrames)?;
+        // SAFETY: The active session contains all audio samples and this is its final end time.
+        unsafe {
+            self.writer.endSessionAtSourceTime(cm_time(end_timestamp));
+            self.input.markAsFinished();
+        }
+        finish_asset_writer(&self.writer)?;
+        self.finished = true;
+        Ok(())
+    }
+}
+
+impl Drop for AudioWriter {
+    fn drop(&mut self) {
+        if !self.finished {
+            // SAFETY: Cancellation is thread-safe and cleans up an unfinished output file.
+            unsafe { self.writer.cancelWriting() };
+        }
+    }
 }
 
 impl Mp4Writer {
@@ -247,6 +364,22 @@ impl Mp4Writer {
         fps: u32,
         file_type: VideoFileType,
     ) -> Result<Self, WriterError> {
+        Self::new_with_file_type_and_audio(output, width, height, fps, file_type, false)
+    }
+
+    /// Creates an H.264 writer for the selected container with an optional AAC audio track.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the output cannot be prepared or its inputs are unsupported.
+    pub fn new_with_file_type_and_audio(
+        output: &Path,
+        width: usize,
+        height: usize,
+        fps: u32,
+        file_type: VideoFileType,
+        audio: bool,
+    ) -> Result<Self, WriterError> {
         Self::new_with_options(
             output,
             width,
@@ -256,7 +389,7 @@ impl Mp4Writer {
                 file_type,
                 bitrate: None,
                 color_properties: None,
-                system_audio: false,
+                system_audio: audio,
             },
         )
     }
@@ -276,14 +409,7 @@ impl Mp4Writer {
             .checked_div(fps)
             .ok_or(WriterError::InvalidFrameRate)?;
 
-        if let Some(parent) = output.parent()
-            && !parent.as_os_str().is_empty()
-        {
-            fs::create_dir_all(parent)?;
-        }
-        if output.exists() {
-            fs::remove_file(output)?;
-        }
+        prepare_output(output)?;
 
         let path = output.to_str().ok_or(WriterError::InvalidOutputPath)?;
         let url = NSURL::fileURLWithPath(&NSString::from_str(path));
@@ -557,22 +683,7 @@ impl Mp4Writer {
             }
         }
 
-        let (sender, receiver) = mpsc::sync_channel(1);
-        let completion = RcBlock::new(move || {
-            let _ = sender.try_send(());
-        });
-        // SAFETY: All append calls are complete, and the escaping block owns its sender.
-        unsafe {
-            self.writer.finishWritingWithCompletionHandler(&completion);
-        }
-        receiver
-            .recv_timeout(FINISH_TIMEOUT)
-            .map_err(|_| WriterError::FinishTimeout)?;
-
-        // SAFETY: The completion handler has fired, so status and error are stable.
-        if unsafe { self.writer.status() } != AVAssetWriterStatus::Completed {
-            return Err(WriterError::Finish(writer_error(&self.writer)));
-        }
+        finish_asset_writer(&self.writer)?;
         self.finished = true;
         Ok(())
     }
@@ -601,6 +712,35 @@ fn rec709_color_properties() -> Option<VideoColorProperties> {
         transfer_function: Some(NSString::from_str(&transfer_function.to_string())),
         ycbcr_matrix: Some(NSString::from_str(&ycbcr_matrix.to_string())),
     })
+}
+
+fn prepare_output(output: &Path) -> Result<(), WriterError> {
+    if let Some(parent) = output.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        fs::create_dir_all(parent)?;
+    }
+    if output.exists() {
+        fs::remove_file(output)?;
+    }
+    Ok(())
+}
+
+fn finish_asset_writer(writer: &AVAssetWriter) -> Result<(), WriterError> {
+    let (sender, receiver) = mpsc::sync_channel(1);
+    let completion = RcBlock::new(move || {
+        let _ = sender.try_send(());
+    });
+    // SAFETY: All append calls are complete, and the escaping block owns its sender.
+    unsafe { writer.finishWritingWithCompletionHandler(&completion) };
+    receiver
+        .recv_timeout(FINISH_TIMEOUT)
+        .map_err(|_| WriterError::FinishTimeout)?;
+    // SAFETY: The completion handler has fired, so status and error are stable.
+    if unsafe { writer.status() } != AVAssetWriterStatus::Completed {
+        return Err(WriterError::Finish(writer_error(writer)));
+    }
+    Ok(())
 }
 
 fn writer_error(writer: &AVAssetWriter) -> String {
@@ -789,6 +929,8 @@ pub(crate) fn audio_sample_buffer(
 
 #[cfg(test)]
 mod audio_tests {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
     use super::*;
 
     #[test]
@@ -804,6 +946,23 @@ mod audio_tests {
             unsafe { sample_buffer.presentation_time_stamp().seconds() },
             1.0
         );
+        Ok(())
+    }
+
+    #[test]
+    fn writes_audio_only_m4a() -> Result<(), Box<dyn std::error::Error>> {
+        let suffix = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+        let path = std::env::temp_dir().join(format!("blip-audio-writer-{suffix}.m4a"));
+        let packet = AudioPacket::new(vec![0.0; 960], 48_000, 2, None)?;
+        let mut writer = AudioWriter::new(&path)?;
+
+        assert!(writer.append(&packet, Duration::from_secs(10))?);
+        writer.finish()?;
+        assert!(fs::metadata(&path)?.len() > 0);
+        let decoded = decode_audio(&path)?;
+        assert!(decoded.len() >= packet.samples().len());
+
+        fs::remove_file(path)?;
         Ok(())
     }
 }

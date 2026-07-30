@@ -30,6 +30,7 @@ struct Callbacks {
 
 struct OutputIvars {
     callbacks: Mutex<Callbacks>,
+    output_audio_latency: Duration,
 }
 
 define_class!(
@@ -62,6 +63,7 @@ define_class!(
                         && let Ok(packet) = crate::audio::audio_packet(
                             sample_buffer,
                             normalized_frame_timestamp(stream, sample_buffer),
+                            self.ivars().output_audio_latency,
                         )
                     {
                         callback(packet);
@@ -86,9 +88,10 @@ define_class!(
 );
 
 impl StreamOutput {
-    fn new(callbacks: Callbacks) -> Retained<Self> {
+    fn new(callbacks: Callbacks, output_audio_latency: Duration) -> Retained<Self> {
         let this = Self::alloc().set_ivars(OutputIvars {
             callbacks: Mutex::new(callbacks),
+            output_audio_latency,
         });
         // SAFETY: `this` is allocated with fully initialized ivars and NSObject permits `init`.
         unsafe { msg_send![super(this), init] }
@@ -243,7 +246,13 @@ impl CapturerBuilder {
     pub fn build(self) -> Result<Capturer, CaptureError> {
         initialize_core_graphics();
         let has_audio_callback = self.callbacks.audio.is_some();
-        let output = StreamOutput::new(self.callbacks);
+        let output_audio_latency = self
+            .config
+            .captures_audio()
+            .then(crate::audio_latency::default_output_latency)
+            .flatten()
+            .unwrap_or_default();
+        let output = StreamOutput::new(self.callbacks, output_audio_latency);
         let delegate = ProtocolObject::<dyn SCStreamDelegate>::from_ref(&*output);
         // SAFETY: The filter, configuration, and delegate remain retained for the stream lifetime.
         let stream = unsafe {

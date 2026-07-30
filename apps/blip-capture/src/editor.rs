@@ -33,9 +33,9 @@ use gpui::{
 use crate::{
     assets::{CHECK, CHEVRON_DOWN, PAUSE, PLAY, PLAYBACK_BACK, PLAYBACK_FORWARD, SHAPE_FRAME},
     bundle::{
-        BackgroundType, BlipBundle, CameraCrop, CameraLayout, CameraPosition, ExportFormat,
-        ExportResolution, OutputAspectRatio, ScreenCrop, VideoSegment, VideoSegmentResizeMode,
-        ZoomSegment, ZoomTransitionSpeed,
+        BackgroundType, BlipBundle, BundleInputKind, CameraCrop, CameraLayout, CameraPosition,
+        ExportFormat, ExportResolution, OutputAspectRatio, ScreenCrop, VideoSegment,
+        VideoSegmentResizeMode, ZoomSegment, ZoomTransitionSpeed,
     },
     theme,
 };
@@ -186,6 +186,7 @@ struct ExportJob {
     padding: f32,
     border_radius: f32,
     shadow: f32,
+    audio_mixer: blip_audio::AudioMixer,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -395,6 +396,8 @@ pub(crate) struct BundleEditor {
     exporting: bool,
     export_error: Option<String>,
     exported_path: Option<PathBuf>,
+    audio_sources: Vec<blip_audio::AudioSource>,
+    audio_playback: Option<blip_audio::AudioPlayback>,
 }
 
 impl BundleEditor {
@@ -407,8 +410,12 @@ impl BundleEditor {
         );
         let mut decoder_inputs = Vec::new();
         let mut source_ranges = Vec::new();
+        let mut audio_sources = Vec::new();
         let mut timeline_fps = None;
         for (index, input) in bundle.inputs.iter().enumerate() {
+            if input.kind != BundleInputKind::Video {
+                continue;
+            }
             let media_path = path.join(&input.media);
             match blip_avfoundation::VideoDecoder::open(&media_path) {
                 Ok(decoder) => {
@@ -432,6 +439,25 @@ impl BundleEditor {
                         media_path.display()
                     );
                 }
+            }
+        }
+        for input in bundle
+            .inputs
+            .iter()
+            .filter(|input| input.kind == BundleInputKind::Audio)
+        {
+            let media_path = path.join(&input.media);
+            match blip_avfoundation::decode_audio(&media_path).and_then(|samples| {
+                blip_audio::AudioSource::new(samples, input.start_offset_secs, input.gain).map_err(
+                    |error| blip_avfoundation::DecoderError::DecodeAudio(error.to_string()),
+                )
+            }) {
+                Ok(source) => audio_sources.push(source),
+                Err(error) => tracing::error!(
+                    path = %media_path.display(),
+                    error = %error,
+                    "Failed to decode audio input"
+                ),
             }
         }
         let (source_start_secs, source_end_secs) =
@@ -619,6 +645,8 @@ impl BundleEditor {
                         exporting: false,
                         export_error: None,
                         exported_path: None,
+                        audio_sources,
+                        audio_playback: None,
                     };
                     editor.request_preview();
                     editor
@@ -742,6 +770,7 @@ impl BundleEditor {
             .inputs
             .iter()
             .enumerate()
+            .filter(|(_, input)| input.kind == BundleInputKind::Video)
             .map(|(index, input)| {
                 (
                     self.path.join(&input.media),
@@ -767,6 +796,7 @@ impl BundleEditor {
             padding: self.bundle.appearance.padding,
             border_radius: self.bundle.appearance.border_radius,
             shadow: self.bundle.appearance.shadow,
+            audio_mixer: audio_mixer(&self.audio_sources, &self.bundle),
         };
         let (events, event_receiver) = async_channel::unbounded();
         if let Err(error) = std::thread::Builder::new()
@@ -1769,6 +1799,7 @@ impl BundleEditor {
         self.playback_started_at = None;
         self.playback_generation = self.playback_generation.wrapping_add(1);
         self.last_playback_preview_time_secs = None;
+        self.audio_playback = None;
     }
 
     fn toggle_playback(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1793,6 +1824,13 @@ impl BundleEditor {
         self.last_playback_preview_time_secs = None;
         let generation = self.playback_generation;
         self.playback_started_at = Some((Instant::now(), self.current_time_secs));
+        let mixer = audio_mixer(&self.audio_sources, &self.bundle);
+        if mixer.has_sources() {
+            match blip_audio::AudioPlayback::start(mixer, self.current_time_secs) {
+                Ok(playback) => self.audio_playback = Some(playback),
+                Err(error) => tracing::error!(error, "Failed to start preview audio"),
+            }
+        }
         self.request_preview();
         cx.notify();
         self.schedule_playback_frame(generation, window, cx);
@@ -5402,6 +5440,20 @@ fn video_timeline_duration(bundle: &BlipBundle) -> f64 {
         .sum()
 }
 
+fn audio_mixer(sources: &[blip_audio::AudioSource], bundle: &BlipBundle) -> blip_audio::AudioMixer {
+    let segments = bundle
+        .video_segments
+        .as_deref()
+        .unwrap_or(&[])
+        .iter()
+        .map(|segment| blip_audio::AudioTimelineSegment {
+            source_start_secs: segment.source_start_secs,
+            source_end_secs: segment.source_end_secs,
+        })
+        .collect();
+    blip_audio::AudioMixer::new(sources.to_vec(), segments)
+}
+
 fn can_split_video_segment(duration_secs: f64, offset_secs: f64) -> bool {
     offset_secs >= MIN_VIDEO_SEGMENT_DURATION_SECS
         && duration_secs - offset_secs >= MIN_VIDEO_SEGMENT_DURATION_SECS
@@ -6035,12 +6087,14 @@ fn render_export(
         job.aspect_ratio,
         job.padding,
     );
-    let mut writer = blip_avfoundation::Mp4Writer::new_with_file_type(
+    let has_audio = job.audio_mixer.has_sources();
+    let mut writer = blip_avfoundation::Mp4Writer::new_with_file_type_and_audio(
         &job.output,
         dimensions.0,
         dimensions.1,
         job.fps,
         job.file_type,
+        has_audio,
     )
     .map_err(|error| format!("Could not create export: {error}"))?;
     let frame_count = (job.duration_secs * f64::from(job.fps)).ceil().max(1.0) as usize;
@@ -6077,6 +6131,29 @@ fn render_export(
         let _ = events.send_blocking(ExportEvent::Progress(
             (frame_index + 1) as f32 / frame_count as f32,
         ));
+    }
+    if has_audio {
+        const AUDIO_PACKET_FRAMES: usize = 1_024;
+        let total_audio_frames = (job.duration_secs * f64::from(blip_audio::MIX_SAMPLE_RATE))
+            .ceil()
+            .max(1.0) as usize;
+        let mut audio_frame = 0;
+        while audio_frame < total_audio_frames {
+            let frame_count = AUDIO_PACKET_FRAMES.min(total_audio_frames - audio_frame);
+            let timestamp_secs = audio_frame as f64 / f64::from(blip_audio::MIX_SAMPLE_RATE);
+            let packet = job
+                .audio_mixer
+                .render(timestamp_secs, frame_count)
+                .map_err(|error| format!("Could not mix audio: {error}"))?;
+            let timestamp = Duration::from_secs_f64(timestamp_secs);
+            while !writer
+                .append_audio(&packet, timestamp)
+                .map_err(|error| format!("Could not encode audio: {error}"))?
+            {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            audio_frame += frame_count;
+        }
     }
     writer
         .finish()
@@ -6653,9 +6730,10 @@ fn timeline_ruler_label(time_secs: f64, interval: f64) -> String {
 }
 
 fn input_is_camera(input: &crate::bundle::BundleInput, index: usize) -> bool {
-    input.id.eq_ignore_ascii_case("camera")
-        || input.name.to_lowercase().contains("camera")
-        || (index > 0 && !input.id.eq_ignore_ascii_case("screen"))
+    input.kind == BundleInputKind::Video
+        && (input.id.eq_ignore_ascii_case("camera")
+            || input.name.to_lowercase().contains("camera")
+            || (index > 0 && !input.id.eq_ignore_ascii_case("screen")))
 }
 
 fn aspect_fit_size(

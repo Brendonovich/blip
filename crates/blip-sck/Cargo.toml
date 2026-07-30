@@ -17,6 +17,7 @@ dispatch2 = "0.3.0"
 objc2 = "0.6.2"
 objc2-core-foundation = "0.3.2"
 objc2-core-audio-types.workspace = true
+objc2-core-audio.workspace = true
 objc2-core-graphics = { version = "0.3.2", features = ["CGColorSpace", "CGDirectDisplay"] }
 objc2-core-media = { version = "0.3.2", features = ["CMBlockBuffer", "CMFormatDescription", "CMSampleBuffer", "CMSync", "CMTime", "objc2-core-audio-types", "objc2-core-video"] }
 objc2-core-video.workspace = true

@@ -93,7 +93,7 @@ actions!(
 #[allow(clippy::arithmetic_side_effects)]
 fn toolbar_dimensions_for_label(label: &str) -> (f32, f32) {
     let char_count = label.chars().count().clamp(3, 30);
-    let width = 448.0 + (char_count as f32 * 8.0);
+    let width = 584.0 + (char_count as f32 * 8.0);
     (width, 56.0)
 }
 type RegionSelection = (u32, f64, f64, f64, f64);
@@ -332,6 +332,7 @@ struct CaptureApp {
     destination_sender: async_channel::Sender<DestinationMenuAction>,
     cameras: Vec<CameraDevice>,
     selected_camera: Option<usize>,
+    system_audio_enabled: bool,
     camera_sender: async_channel::Sender<CameraMenuAction>,
     camera_window: Option<WindowHandle<CameraPreview>>,
     camera_window_id: Option<u32>,
@@ -495,6 +496,7 @@ impl CaptureApp {
             destination_sender,
             cameras,
             selected_camera: None,
+            system_audio_enabled: false,
             camera_sender,
             camera_window: None,
             camera_window_id: None,
@@ -930,6 +932,7 @@ impl CaptureApp {
             &profile,
             &target_name,
             camera.as_ref().map(|(_, crop)| *crop),
+            self.system_audio_enabled,
         ) {
             Ok(output) => output,
             Err(error) => {
@@ -951,6 +954,14 @@ impl CaptureApp {
                 output,
                 bundle_path,
             });
+        let bundle_audio_recording = output
+            .system_audio_media_path
+            .clone()
+            .zip(output.bundle_path.clone())
+            .map(|(output, bundle_path)| recording::BundleAudioRecording {
+                output,
+                bundle_path,
+            });
         let sender = match recording::spawn(
             spec,
             self.camera_window_id,
@@ -959,6 +970,8 @@ impl CaptureApp {
             output.cleanup_on_failure,
             server_url,
             profile.format,
+            self.system_audio_enabled,
+            bundle_audio_recording,
             camera_recording,
             self.event_sender.clone(),
         ) {
@@ -1245,6 +1258,12 @@ impl Render for CaptureApp {
                 }),
             );
         if matches!(self.status, Status::Idle) {
+            let system_audio_supported = self.profiles.selected().is_some_and(|profile| {
+                matches!(
+                    profile.format,
+                    RecordingFormat::Mp4 | RecordingFormat::Hls | RecordingFormat::BlipBundle
+                )
+            });
             return shell
                 .child(
                     div()
@@ -1284,6 +1303,35 @@ impl Render for CaptureApp {
                             app.show_camera_menu(window, cx);
                         }
                     })),
+                )
+                .child(
+                    overlay_secondary_button("system-audio", "System Audio")
+                        .border_color(rgba(
+                            if self.system_audio_enabled && system_audio_supported {
+                                0xffff_ff38
+                            } else {
+                                0xffff_ff18
+                            },
+                        ))
+                        .bg(rgba(
+                            if self.system_audio_enabled && system_audio_supported {
+                                0xffff_ff28
+                            } else {
+                                0xffff_ff12
+                            },
+                        ))
+                        .opacity(if system_audio_supported { 1.0 } else { 0.5 })
+                        .when(!system_audio_supported, |button| {
+                            button.cursor_not_allowed()
+                        })
+                        .when(system_audio_supported, |button| {
+                            button.on_click(cx.listener(|app, _, window, cx| {
+                                if !app.was_dragged(window) {
+                                    app.system_audio_enabled = !app.system_audio_enabled;
+                                    cx.notify();
+                                }
+                            }))
+                        }),
                 )
                 .child(
                     div()
@@ -3119,6 +3167,7 @@ fn profile_settings_options(cx: &App) -> WindowOptions {
 struct OutputDestination {
     media_path: PathBuf,
     camera_media_path: Option<PathBuf>,
+    system_audio_media_path: Option<PathBuf>,
     bundle_path: Option<PathBuf>,
     completed_path: PathBuf,
     cleanup_on_failure: Option<PathBuf>,
@@ -3128,6 +3177,7 @@ fn output_destination(
     profile: &RecordingProfile,
     target_name: &str,
     camera_crop: Option<CameraCrop>,
+    system_audio: bool,
 ) -> Result<OutputDestination, String> {
     let folder = match &profile.target {
         RecordingTarget::Local { folder } => folder.clone(),
@@ -3145,6 +3195,7 @@ fn output_destination(
         return Ok(OutputDestination {
             media_path: output.clone(),
             camera_media_path: None,
+            system_audio_media_path: None,
             bundle_path: None,
             completed_path: output.clone(),
             cleanup_on_failure: Some(output),
@@ -3152,16 +3203,18 @@ fn output_destination(
     }
     if profile.format == RecordingFormat::BlipBundle {
         let completed_path = unique_output_path(&folder, &filename, "blip");
-        let mut bundle = BlipBundle::create(&completed_path, camera_crop.is_some())?;
+        let mut bundle = BlipBundle::create(&completed_path, camera_crop.is_some(), system_audio)?;
         if let Some(crop) = camera_crop {
             bundle.camera_layout.crop = crop;
             bundle.save_project_config(&completed_path)?;
         }
         let media_path = bundle.media_path(&completed_path)?;
         let camera_media_path = bundle.input_media_path(&completed_path, "camera");
+        let system_audio_media_path = bundle.input_media_path(&completed_path, "system_audio");
         return Ok(OutputDestination {
             media_path,
             camera_media_path,
+            system_audio_media_path,
             bundle_path: Some(completed_path.clone()),
             completed_path: completed_path.clone(),
             cleanup_on_failure: Some(completed_path),
@@ -3171,6 +3224,7 @@ fn output_destination(
     Ok(OutputDestination {
         media_path: completed_path.clone(),
         camera_media_path: None,
+        system_audio_media_path: None,
         bundle_path: None,
         completed_path,
         cleanup_on_failure: None,
@@ -3830,14 +3884,14 @@ mod tests {
 
     #[test]
     fn calculates_dynamic_toolbar_dimensions() {
-        assert_eq!(super::toolbar_dimensions_for_label("Dev"), (472.0, 56.0));
+        assert_eq!(super::toolbar_dimensions_for_label("Dev"), (608.0, 56.0));
         assert_eq!(
             super::toolbar_dimensions_for_label("Prod Server"),
-            (536.0, 56.0)
+            (672.0, 56.0)
         );
         assert_eq!(
             super::toolbar_dimensions_for_label("A Very Long Server Name That Exceeds Max"),
-            (688.0, 56.0)
+            (824.0, 56.0)
         );
     }
 
