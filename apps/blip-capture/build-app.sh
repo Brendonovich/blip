@@ -9,6 +9,7 @@ app="$bundle_dir/macos/Blip Capture.app"
 dmg="$bundle_dir/dmg/Blip-Capture.dmg"
 binary="$target_dir/release/blip-capture"
 identity="${APPLE_SIGNING_IDENTITY:--}"
+entitlements="${APPLE_ENTITLEMENTS:-$script_dir/Entitlements.plist}"
 build_number="${BLIP_BUILD_NUMBER:-1}"
 make_dmg=false
 notarize=false
@@ -105,17 +106,16 @@ fi
 
 strip -S -x "$app/Contents/MacOS/blip-capture"
 
-sign_args=(--force --sign "$identity")
+sign_args=(--force --sign "$identity" --entitlements "$entitlements")
 if [[ "$identity" != "-" ]]; then
     sign_args+=(--options runtime --timestamp)
-fi
-if [[ -n "${APPLE_ENTITLEMENTS:-}" ]]; then
-    sign_args+=(--entitlements "$APPLE_ENTITLEMENTS")
 fi
 codesign "${sign_args[@]}" "$app"
 
 plutil -lint "$app/Contents/Info.plist"
 codesign --verify --deep --strict --verbose=2 "$app"
+test "$(codesign -d --entitlements :- "$app" 2>/dev/null | \
+    plutil -extract 'com\.apple\.security\.device\.camera' raw -)" = true
 test "$(plutil -extract CFBundleIdentifier raw "$app/Contents/Info.plist")" = \
     "dev.brendonovich.blip.capture"
 test "$(plutil -extract CFBundleShortVersionString raw "$app/Contents/Info.plist")" = "$version"
