@@ -21,6 +21,10 @@ pub(crate) struct BlipBundle {
     pub(crate) video_segment_resize_mode: VideoSegmentResizeMode,
     #[serde(default, skip_serializing)]
     pub(crate) camera_layout: CameraLayout,
+    #[serde(default, skip_serializing)]
+    pub(crate) output_aspect_ratio: OutputAspectRatio,
+    #[serde(default, skip_serializing)]
+    pub(crate) screen_crop: Option<ScreenCrop>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -33,6 +37,35 @@ struct ProjectConfig {
     video_segment_resize_mode: VideoSegmentResizeMode,
     #[serde(default)]
     camera_layout: CameraLayout,
+    #[serde(default)]
+    output_aspect_ratio: OutputAspectRatio,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    screen_crop: Option<ScreenCrop>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub(crate) struct ScreenCrop {
+    pub(crate) position: [f32; 2],
+    pub(crate) size: [f32; 2],
+}
+
+impl ScreenCrop {
+    pub(crate) const FULL: Self = Self {
+        position: [0.0, 0.0],
+        size: [1.0, 1.0],
+    };
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum OutputAspectRatio {
+    Auto,
+    #[default]
+    Wide,
+    Vertical,
+    Square,
+    Classic,
+    Tall,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -189,6 +222,8 @@ impl BlipBundle {
             video_segments: None,
             video_segment_resize_mode: VideoSegmentResizeMode::default(),
             camera_layout: CameraLayout::default(),
+            output_aspect_ratio: OutputAspectRatio::default(),
+            screen_crop: None,
         };
         if let Err(error) = bundle.save_manifest(path) {
             fs::remove_dir_all(path).ok();
@@ -210,6 +245,8 @@ impl BlipBundle {
                 bundle.video_segments = config.video_segments;
                 bundle.video_segment_resize_mode = config.video_segment_resize_mode;
                 bundle.camera_layout = config.camera_layout;
+                bundle.output_aspect_ratio = config.output_aspect_ratio;
+                bundle.screen_crop = config.screen_crop;
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(format!("failed to read project config: {error}")),
@@ -259,6 +296,8 @@ impl BlipBundle {
             video_segments: self.video_segments.clone(),
             video_segment_resize_mode: self.video_segment_resize_mode,
             camera_layout: self.camera_layout,
+            output_aspect_ratio: self.output_aspect_ratio,
+            screen_crop: self.screen_crop,
         };
         let contents = serde_json::to_string_pretty(&config)
             .map_err(|error| format!("failed to encode project config: {error}"))?;
@@ -272,7 +311,8 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{
-        BlipBundle, CameraCrop, CameraLayout, CameraPosition, VideoSegment, VideoSegmentResizeMode,
+        BlipBundle, CameraCrop, CameraLayout, CameraPosition, OutputAspectRatio, ScreenCrop,
+        VideoSegment, VideoSegmentResizeMode,
     };
 
     #[test]
@@ -306,6 +346,8 @@ mod tests {
             VideoSegmentResizeMode::Ghost
         );
         assert_eq!(bundle.camera_layout, CameraLayout::default());
+        assert_eq!(bundle.output_aspect_ratio, OutputAspectRatio::Wide);
+        assert_eq!(bundle.screen_crop, None);
 
         std::fs::remove_dir_all(path).ok();
     }
@@ -345,6 +387,8 @@ mod tests {
         assert!(bundle.video_segments.is_none());
         assert_eq!(bundle.inputs[0].start_offset_secs, 0.0);
         assert_eq!(bundle.camera_layout, CameraLayout::default());
+        assert_eq!(bundle.output_aspect_ratio, OutputAspectRatio::Wide);
+        assert_eq!(bundle.screen_crop, None);
     }
 
     #[test]
@@ -387,6 +431,11 @@ mod tests {
             shadow: 25.0,
             crop: CameraCrop::Circle,
         };
+        bundle.output_aspect_ratio = OutputAspectRatio::Auto;
+        bundle.screen_crop = Some(ScreenCrop {
+            position: [0.1, 0.2],
+            size: [0.7, 0.6],
+        });
 
         bundle
             .save_project_config(&path)
@@ -410,6 +459,8 @@ mod tests {
             VideoSegmentResizeMode::Live
         );
         assert_eq!(loaded.camera_layout, bundle.camera_layout);
+        assert_eq!(loaded.output_aspect_ratio, OutputAspectRatio::Auto);
+        assert_eq!(loaded.screen_crop, bundle.screen_crop);
 
         std::fs::remove_dir_all(path).ok();
     }

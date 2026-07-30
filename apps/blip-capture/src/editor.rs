@@ -19,9 +19,9 @@ use core_foundation::{
     string::CFString,
 };
 use gpui::{
-    Animation, AnimationExt as _, AnyElement, App, Bounds, Context, Div, FocusHandle, FontWeight,
-    IntoElement, MouseButton, MouseDownEvent, MouseExitEvent, MouseMoveEvent, ObjectFit,
-    PinchEvent, Pixels, Render, ScrollWheelEvent, SharedString, TextAlign, TextRun,
+    Animation, AnimationExt as _, AnyElement, App, Bounds, Context, CursorStyle, Div, FocusHandle,
+    FontWeight, IntoElement, MouseButton, MouseDownEvent, MouseExitEvent, MouseMoveEvent,
+    ObjectFit, PinchEvent, Pixels, Render, ScrollWheelEvent, SharedString, TextAlign, TextRun,
     TitlebarOptions, Window, WindowOptions, canvas, div, fill, img, point, prelude::*, px,
     relative, rgb, rgba, size, surface, svg,
 };
@@ -29,13 +29,15 @@ use gpui::{
 use crate::{
     assets::{PAUSE, PLAY, PLAYBACK_BACK, PLAYBACK_FORWARD},
     bundle::{
-        BlipBundle, CameraCrop, CameraLayout, CameraPosition, VideoSegment, VideoSegmentResizeMode,
-        ZoomSegment, ZoomTransitionSpeed,
+        BlipBundle, CameraCrop, CameraLayout, CameraPosition, OutputAspectRatio, ScreenCrop,
+        VideoSegment, VideoSegmentResizeMode, ZoomSegment, ZoomTransitionSpeed,
     },
     theme,
 };
 
 const ACCENT: u32 = 0x00ff_4f58;
+const CROP_SELECTION: u32 = 0x00ff_ffff;
+const CROP_ACTION: u32 = 0x00d2_d2d2;
 const PREVIEW_HANDLE: u32 = 0x007f_7f7f;
 const SIDEBAR_WIDTH: Pixels = px(280.0);
 const PREVIEW_LOADING_DURATION: Duration = Duration::from_millis(1_400);
@@ -169,10 +171,10 @@ enum ExportResolution {
 }
 
 impl ExportResolution {
-    fn dimensions(self) -> (usize, usize) {
+    fn short_edge(self) -> usize {
         match self {
-            Self::P1080 => (1920, 1080),
-            Self::P720 => (1280, 720),
+            Self::P1080 => 1080,
+            Self::P720 => 720,
         }
     }
 }
@@ -186,7 +188,8 @@ enum ExportEvent {
 struct ExportJob {
     output: PathBuf,
     file_type: blip_avfoundation::VideoFileType,
-    dimensions: (usize, usize),
+    short_edge: usize,
+    aspect_ratio: OutputAspectRatio,
     fps: u32,
     duration_secs: f64,
     bundle: BlipBundle,
@@ -293,11 +296,13 @@ struct PreviewRequest {
     background_type: BackgroundType,
     background_preset: usize,
     padding: f32,
+    aspect_ratio: OutputAspectRatio,
     border_radius: f32,
     shadow: f32,
     corner_style: CornerStyle,
     zoom: blip_compositor::OutputTransform,
     camera_layout: CameraLayout,
+    screen_crop: Option<ScreenCrop>,
 }
 
 struct PreviewFrame(core_video::pixel_buffer::CVPixelBuffer);
@@ -306,12 +311,40 @@ struct PreviewResult {
     playback_generation: u64,
     timeline_time_secs: f64,
     frame: PreviewFrame,
+    screen: PreviewFrame,
 }
 
 struct ContentFrame {
     screen: core_video::pixel_buffer::CVPixelBuffer,
     camera: Option<core_video::pixel_buffer::CVPixelBuffer>,
     dimensions: (usize, usize),
+}
+
+#[derive(Clone, Copy)]
+enum CropDrag {
+    Create {
+        start: [f32; 2],
+    },
+    Move {
+        pointer_start: [f32; 2],
+        original: ScreenCrop,
+    },
+    Resize {
+        handle: CropResizeHandle,
+        original: ScreenCrop,
+    },
+}
+
+#[derive(Clone, Copy)]
+enum CropResizeHandle {
+    TopLeft,
+    Top,
+    TopRight,
+    Right,
+    BottomRight,
+    Bottom,
+    BottomLeft,
+    Left,
 }
 
 // CVPixelBuffers have thread-safe Core Foundation ownership and are immutable after composition.
@@ -367,6 +400,11 @@ pub(crate) struct BundleEditor {
     video_segment_drag: Option<VideoSegmentDrag>,
     video_timeline_resize_animation: Option<VideoTimelineResizeAnimation>,
     video_timeline_resize_generation: u64,
+    crop_dialog_open: bool,
+    crop_draft: ScreenCrop,
+    crop_drag: Option<CropDrag>,
+    crop_preview_bounds: Rc<Cell<Bounds<Pixels>>>,
+    crop_frame: Option<core_video::pixel_buffer::CVPixelBuffer>,
     export_dialog_open: bool,
     export_format: ExportFormat,
     export_resolution: ExportResolution,
@@ -431,6 +469,8 @@ impl BundleEditor {
             clamp_video_timeline_to_source_range(&mut bundle, source_start_secs, source_end_secs);
         }
         let timeline_duration = video_timeline_duration(&bundle);
+        bundle.screen_crop = normalize_screen_crop(bundle.screen_crop);
+        let crop_draft = bundle.screen_crop.unwrap_or(ScreenCrop::FULL);
         let background_images = bundled_backgrounds();
         let preview_backgrounds = background_images
             .iter()
@@ -502,6 +542,7 @@ impl BundleEditor {
                                             Some(result.timeline_time_secs);
                                     }
                                     editor.current_frame = Some(result.frame.0);
+                                    editor.crop_frame = Some(result.screen.0);
                                     cx.notify();
                                 })
                                 .is_err()
@@ -583,6 +624,11 @@ impl BundleEditor {
                         video_segment_drag: None,
                         video_timeline_resize_animation: None,
                         video_timeline_resize_generation: 0,
+                        crop_dialog_open: false,
+                        crop_draft,
+                        crop_drag: None,
+                        crop_preview_bounds: Rc::new(Cell::new(Bounds::default())),
+                        crop_frame: None,
                         export_dialog_open: false,
                         export_format: ExportFormat::Mp4,
                         export_resolution: ExportResolution::P1080,
@@ -732,7 +778,8 @@ impl BundleEditor {
         let job = ExportJob {
             output: output.clone(),
             file_type: self.export_format.file_type(),
-            dimensions: self.export_resolution.dimensions(),
+            short_edge: self.export_resolution.short_edge(),
+            aspect_ratio: self.bundle.output_aspect_ratio,
             fps: self.export_fps,
             duration_secs: self.duration_secs,
             bundle: self.bundle.clone(),
@@ -1595,6 +1642,101 @@ impl BundleEditor {
         }
     }
 
+    fn open_crop_dialog(&mut self, cx: &mut Context<Self>) {
+        self.stop_playback();
+        self.crop_draft = self.bundle.screen_crop.unwrap_or(ScreenCrop::FULL);
+        self.crop_drag = None;
+        self.crop_dialog_open = true;
+        self.request_preview();
+        cx.notify();
+    }
+
+    fn crop_position_at(&self, position: gpui::Point<Pixels>) -> Option<[f32; 2]> {
+        let bounds = self.crop_preview_bounds.get();
+        if bounds.size.width <= Pixels::ZERO || bounds.size.height <= Pixels::ZERO {
+            return None;
+        }
+        Some([
+            ((position.x - bounds.origin.x) / bounds.size.width).clamp(0.0, 1.0),
+            ((position.y - bounds.origin.y) / bounds.size.height).clamp(0.0, 1.0),
+        ])
+    }
+
+    fn begin_screen_crop(&mut self, position: gpui::Point<Pixels>, cx: &mut Context<Self>) {
+        let Some(start) = self.crop_position_at(position) else {
+            return;
+        };
+        let original = self.crop_draft;
+        self.crop_drag = Some(
+            if let Some(handle) =
+                crop_handle_at(position, self.crop_preview_bounds.get(), self.crop_draft)
+            {
+                CropDrag::Resize { handle, original }
+            } else if crop_contains(self.crop_draft, start) {
+                CropDrag::Move {
+                    pointer_start: start,
+                    original,
+                }
+            } else {
+                self.crop_draft = ScreenCrop {
+                    position: start,
+                    size: [0.01_f32.min(1.0 - start[0]), 0.01_f32.min(1.0 - start[1])],
+                };
+                CropDrag::Create { start }
+            },
+        );
+        cx.notify();
+    }
+
+    fn drag_screen_crop(&mut self, position: gpui::Point<Pixels>, cx: &mut Context<Self>) -> bool {
+        let Some(operation) = self.crop_drag else {
+            return false;
+        };
+        let Some(current) = self.crop_position_at(position) else {
+            return true;
+        };
+        self.crop_draft = match operation {
+            CropDrag::Create { start } => ScreenCrop {
+                position: [start[0].min(current[0]), start[1].min(current[1])],
+                size: [
+                    (start[0] - current[0]).abs().max(0.01),
+                    (start[1] - current[1]).abs().max(0.01),
+                ],
+            },
+            CropDrag::Move {
+                pointer_start,
+                original,
+            } => ScreenCrop {
+                position: [
+                    (original.position[0] + current[0] - pointer_start[0])
+                        .clamp(0.0, 1.0 - original.size[0]),
+                    (original.position[1] + current[1] - pointer_start[1])
+                        .clamp(0.0, 1.0 - original.size[1]),
+                ],
+                size: original.size,
+            },
+            CropDrag::Resize { handle, original } => resized_screen_crop(original, handle, current),
+        };
+        self.crop_draft = normalize_screen_crop(Some(self.crop_draft)).unwrap_or(ScreenCrop::FULL);
+        cx.notify();
+        true
+    }
+
+    fn apply_screen_crop(&mut self, cx: &mut Context<Self>) {
+        self.bundle.screen_crop = normalize_screen_crop(Some(self.crop_draft));
+        self.crop_dialog_open = false;
+        self.crop_drag = None;
+        self.save_bundle();
+        self.request_preview();
+        cx.notify();
+    }
+
+    fn close_crop_dialog(&mut self, cx: &mut Context<Self>) {
+        self.crop_dialog_open = false;
+        self.crop_drag = None;
+        cx.notify();
+    }
+
     fn set_playback_time(&mut self, time_secs: f64) {
         self.stop_playback();
         self.current_time_secs = time_secs.clamp(0.0, self.duration_secs);
@@ -1784,11 +1926,13 @@ impl BundleEditor {
             background_type: self.background_type,
             background_preset: self.background_preset,
             padding: self.background_padding,
+            aspect_ratio: self.bundle.output_aspect_ratio,
             border_radius: self.border_radius,
             shadow: self.shadow,
             corner_style: self.corner_style,
             zoom: zoom_transform_at(&self.bundle.zoom_segments, time_secs),
             camera_layout: self.bundle.camera_layout,
+            screen_crop: self.bundle.screen_crop,
         });
     }
 
@@ -1854,6 +1998,9 @@ impl BundleEditor {
     }
 
     fn drag_slider(&mut self, event: &MouseMoveEvent, cx: &mut Context<Self>) {
+        if event.dragging() && self.drag_screen_crop(event.position, cx) {
+            return;
+        }
         if self.drag_video_segment(event, cx) {
             return;
         }
@@ -2123,6 +2270,25 @@ impl BundleEditor {
             .on_click(cx.listener(move |editor, _, _, cx| on_click(editor, cx)))
             .child(label)
             .into_any_element()
+    }
+
+    fn aspect_ratio_option(
+        &self,
+        label: &'static str,
+        value: OutputAspectRatio,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        self.zoom_value_option(
+            label,
+            self.bundle.output_aspect_ratio == value,
+            cx,
+            move |editor, cx| {
+                editor.bundle.output_aspect_ratio = value;
+                editor.save_bundle();
+                editor.request_preview();
+                cx.notify();
+            },
+        )
     }
 
     fn camera_position_option(
@@ -2652,6 +2818,64 @@ impl BundleEditor {
                     .gap_5()
                     .child(
                         div()
+                            .text_sm()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child("Output"),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(rgb(theme::TEXT_MUTED))
+                                    .child("Aspect ratio"),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .gap_1()
+                                    .child(self.aspect_ratio_option(
+                                        "Auto",
+                                        OutputAspectRatio::Auto,
+                                        cx,
+                                    ))
+                                    .child(self.aspect_ratio_option(
+                                        "16:9",
+                                        OutputAspectRatio::Wide,
+                                        cx,
+                                    ))
+                                    .child(self.aspect_ratio_option(
+                                        "9:16",
+                                        OutputAspectRatio::Vertical,
+                                        cx,
+                                    )),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .gap_1()
+                                    .child(self.aspect_ratio_option(
+                                        "1:1",
+                                        OutputAspectRatio::Square,
+                                        cx,
+                                    ))
+                                    .child(self.aspect_ratio_option(
+                                        "4:3",
+                                        OutputAspectRatio::Classic,
+                                        cx,
+                                    ))
+                                    .child(self.aspect_ratio_option(
+                                        "3:4",
+                                        OutputAspectRatio::Tall,
+                                        cx,
+                                    )),
+                            ),
+                    )
+                    .child(
+                        div()
                             .text_xs()
                             .font_weight(FontWeight::SEMIBOLD)
                             .child("Background"),
@@ -2909,6 +3133,180 @@ impl BundleEditor {
             .on_click(cx.listener(move |editor, _, _, cx| on_click(editor, cx)))
             .child(label)
             .into_any_element()
+    }
+
+    fn crop_dialog(&self, cx: &mut Context<Self>) -> Div {
+        let crop = self.crop_draft;
+        let measured_bounds = Rc::clone(&self.crop_preview_bounds);
+        let preview = if let Some(frame) = &self.crop_frame {
+            let aspect_ratio = frame.get_width() as f32 / frame.get_height().max(1) as f32;
+            let (preview_width, preview_height) = fit_dimensions(aspect_ratio, 760.0, 440.0);
+            div()
+                .w(px(preview_width + 20.0))
+                .h(px(preview_height + 20.0))
+                .flex_none()
+                .relative()
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|editor, event: &MouseDownEvent, _, cx| {
+                        editor.begin_screen_crop(event.position, cx);
+                    }),
+                )
+                .child(
+                    div()
+                        .absolute()
+                        .left(px(10.0))
+                        .top(px(10.0))
+                        .w(px(preview_width))
+                        .h(px(preview_height))
+                        .rounded_md()
+                        .cursor_crosshair()
+                        .child(surface(frame.clone()).absolute().size_full())
+                        .child(
+                            canvas(
+                                move |bounds, _, _| measured_bounds.set(bounds),
+                                |_, (), _, _| {},
+                            )
+                            .absolute()
+                            .size_full(),
+                        )
+                        .child(crop_mask(0.0, 0.0, 1.0, crop.position[1]))
+                        .child(crop_mask(
+                            0.0,
+                            crop.position[1] + crop.size[1],
+                            1.0,
+                            1.0 - crop.position[1] - crop.size[1],
+                        ))
+                        .child(crop_mask(
+                            0.0,
+                            crop.position[1],
+                            crop.position[0],
+                            crop.size[1],
+                        ))
+                        .child(crop_mask(
+                            crop.position[0] + crop.size[0],
+                            crop.position[1],
+                            1.0 - crop.position[0] - crop.size[0],
+                            crop.size[1],
+                        ))
+                        .child(
+                            div()
+                                .absolute()
+                                .left(relative(crop.position[0]))
+                                .top(relative(crop.position[1]))
+                                .w(relative(crop.size[0]))
+                                .h(relative(crop.size[1]))
+                                .border_2()
+                                .border_color(rgb(CROP_SELECTION))
+                                .cursor(CursorStyle::OpenHand),
+                        ),
+                )
+                .children(crop_resize_handles(crop, preview_width, preview_height))
+        } else {
+            div()
+                .w_full()
+                .h(px(320.0))
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded_md()
+                .bg(rgb(theme::CANVAS_BACKGROUND))
+                .text_sm()
+                .text_color(rgb(theme::TEXT_MUTED))
+                .child("Loading screen frame...")
+        };
+
+        div()
+            .absolute()
+            .inset_0()
+            .flex()
+            .items_center()
+            .justify_center()
+            .bg(rgba(0x0000_00a8))
+            .child(
+                div()
+                    .id("crop-dialog")
+                    .w(px(820.0))
+                    .p_5()
+                    .flex()
+                    .flex_col()
+                    .gap_4()
+                    .rounded_lg()
+                    .bg(rgb(theme::PANEL_BACKGROUND))
+                    .border_1()
+                    .border_color(rgb(theme::BORDER))
+                    .shadow_lg()
+                    .child(
+                        div()
+                            .flex()
+                            .items_start()
+                            .justify_between()
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .gap_1()
+                                    .child(
+                                        div()
+                                            .text_lg()
+                                            .font_weight(FontWeight::SEMIBOLD)
+                                            .child("Crop screen"),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(rgb(theme::TEXT_MUTED))
+                                            .child("Drag to select, then move or resize the crop."),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .id("close-crop-dialog")
+                                    .px_2()
+                                    .py_1()
+                                    .rounded_md()
+                                    .hover(|button| button.bg(rgb(theme::CONTROL_HOVER)))
+                                    .cursor_pointer()
+                                    .text_color(rgb(theme::TEXT_MUTED))
+                                    .on_click(cx.listener(|editor, _, _, cx| {
+                                        editor.close_crop_dialog(cx);
+                                    }))
+                                    .child("Close"),
+                            ),
+                    )
+                    .child(div().flex().justify_center().child(preview))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .child(crop_dialog_button("full-crop", "Full screen").on_click(
+                                cx.listener(|editor, _, _, cx| {
+                                    editor.crop_draft = ScreenCrop::FULL;
+                                    cx.notify();
+                                }),
+                            ))
+                            .child(
+                                div()
+                                    .flex()
+                                    .gap_2()
+                                    .child(crop_dialog_button("cancel-crop", "Cancel").on_click(
+                                        cx.listener(|editor, _, _, cx| {
+                                            editor.close_crop_dialog(cx);
+                                        }),
+                                    ))
+                                    .child(
+                                        crop_dialog_button("apply-crop", "Apply")
+                                            .bg(rgb(CROP_ACTION))
+                                            .text_color(rgb(0x0017_1717))
+                                            .font_weight(FontWeight::SEMIBOLD)
+                                            .on_click(cx.listener(|editor, _, _, cx| {
+                                                editor.apply_screen_crop(cx);
+                                            })),
+                                    ),
+                            ),
+                    ),
+            )
     }
 
     fn export_dialog(&self, cx: &mut Context<Self>) -> Div {
@@ -3173,12 +3571,17 @@ impl BundleEditor {
     }
 
     fn preview(&self, selected: Option<&crate::bundle::BundleInput>) -> Div {
+        let aspect_ratio = self
+            .current_frame
+            .as_ref()
+            .map(|frame| frame.get_width() as f32 / frame.get_height() as f32)
+            .unwrap_or(16.0 / 9.0);
         if let Some(frame) = &self.current_frame {
             div()
                 .w_full()
                 .max_w(px(1280.0))
                 .max_h(px(720.0))
-                .aspect_ratio(1.777_777_8)
+                .aspect_ratio(aspect_ratio)
                 .rounded_md()
                 .overflow_hidden()
                 .child(
@@ -3226,7 +3629,7 @@ impl BundleEditor {
             div()
                 .w_full()
                 .max_w(px(720.0))
-                .aspect_ratio(1.777_777_8)
+                .aspect_ratio(aspect_ratio)
                 .rounded_lg()
                 .bg(rgb(theme::CANVAS_BACKGROUND))
                 .border_1()
@@ -4547,7 +4950,9 @@ impl Render for BundleEditor {
                 editor.delete_selected(cx);
             }))
             .on_action(cx.listener(|editor, _: &crate::CloseExportDialog, _, cx| {
-                if editor.export_dialog_open
+                if editor.crop_dialog_open {
+                    editor.close_crop_dialog(cx);
+                } else if editor.export_dialog_open
                     || editor.selected_zoom.is_some()
                     || editor.selected_video_segment.is_some()
                 {
@@ -4587,6 +4992,7 @@ impl Render for BundleEditor {
                         editor.save_bundle();
                     }
                     editor.dragging_zoom_target = false;
+                    editor.crop_drag = None;
                 }),
             )
             .on_mouse_up_out(
@@ -4611,6 +5017,7 @@ impl Render for BundleEditor {
                         editor.save_bundle();
                     }
                     editor.dragging_zoom_target = false;
+                    editor.crop_drag = None;
                 }),
             )
             .child(
@@ -4623,6 +5030,25 @@ impl Render for BundleEditor {
                     .gap_2()
                     .border_b_1()
                     .border_color(rgb(theme::BORDER_SUBTLE))
+                    .child(
+                        div()
+                            .id("open-crop")
+                            .h(px(24.0))
+                            .px_3()
+                            .flex()
+                            .items_center()
+                            .rounded_md()
+                            .bg(rgb(theme::CONTROL_BACKGROUND))
+                            .border_1()
+                            .border_color(rgb(theme::BORDER_SUBTLE))
+                            .hover(|button| button.bg(rgb(theme::CONTROL_HOVER)))
+                            .cursor_pointer()
+                            .text_xs()
+                            .on_click(cx.listener(|editor, _, _, cx| {
+                                editor.open_crop_dialog(cx);
+                            }))
+                            .child("Crop"),
+                    )
                     .child(
                         div()
                             .id("reveal-bundle")
@@ -4682,10 +5108,161 @@ impl Render for BundleEditor {
                     .child(self.sidebar(cx)),
             )
             .child(self.timeline(cx))
+            .when(self.crop_dialog_open, |editor| {
+                editor.child(self.crop_dialog(cx))
+            })
             .when(self.export_dialog_open, |editor| {
                 editor.child(self.export_dialog(cx))
             })
     }
+}
+
+fn crop_mask(left: f32, top: f32, width: f32, height: f32) -> Div {
+    div()
+        .absolute()
+        .left(relative(left.clamp(0.0, 1.0)))
+        .top(relative(top.clamp(0.0, 1.0)))
+        .w(relative(width.clamp(0.0, 1.0)))
+        .h(relative(height.clamp(0.0, 1.0)))
+        .bg(rgba(0x0000_0099))
+}
+
+fn crop_contains(crop: ScreenCrop, point: [f32; 2]) -> bool {
+    point[0] >= crop.position[0]
+        && point[0] <= crop.position[0] + crop.size[0]
+        && point[1] >= crop.position[1]
+        && point[1] <= crop.position[1] + crop.size[1]
+}
+
+fn crop_handle_points() -> [(CropResizeHandle, [f32; 2]); 8] {
+    [
+        (CropResizeHandle::TopLeft, [0.0, 0.0]),
+        (CropResizeHandle::Top, [0.5, 0.0]),
+        (CropResizeHandle::TopRight, [1.0, 0.0]),
+        (CropResizeHandle::Right, [1.0, 0.5]),
+        (CropResizeHandle::BottomRight, [1.0, 1.0]),
+        (CropResizeHandle::Bottom, [0.5, 1.0]),
+        (CropResizeHandle::BottomLeft, [0.0, 1.0]),
+        (CropResizeHandle::Left, [0.0, 0.5]),
+    ]
+}
+
+fn crop_handle_at(
+    position: gpui::Point<Pixels>,
+    viewport: Bounds<Pixels>,
+    crop: ScreenCrop,
+) -> Option<CropResizeHandle> {
+    if viewport.size.width <= Pixels::ZERO || viewport.size.height <= Pixels::ZERO {
+        return None;
+    }
+    crop_handle_points()
+        .into_iter()
+        .find(|(_, point)| {
+            let x = viewport.origin.x
+                + viewport.size.width * (crop.position[0] + crop.size[0] * point[0]);
+            let y = viewport.origin.y
+                + viewport.size.height * (crop.position[1] + crop.size[1] * point[1]);
+            (position.x - x).abs() <= px(10.0) && (position.y - y).abs() <= px(10.0)
+        })
+        .map(|(handle, _)| handle)
+}
+
+fn crop_resize_handles(
+    crop: ScreenCrop,
+    preview_width: f32,
+    preview_height: f32,
+) -> Vec<gpui::Stateful<Div>> {
+    crop_handle_points()
+        .into_iter()
+        .enumerate()
+        .map(|(index, (handle, point))| {
+            div()
+                .id(format!("crop-resize-handle-{index}"))
+                .absolute()
+                .left(px(10.0
+                    + preview_width
+                        * (crop.position[0] + crop.size[0] * point[0])))
+                .top(px(10.0
+                    + preview_height
+                        * (crop.position[1] + crop.size[1] * point[1])))
+                .ml(px(-5.0))
+                .mt(px(-5.0))
+                .size(px(10.0))
+                .rounded_sm()
+                .bg(rgb(CROP_SELECTION))
+                .cursor(crop_resize_cursor(handle))
+        })
+        .collect()
+}
+
+const fn crop_resize_cursor(handle: CropResizeHandle) -> CursorStyle {
+    match handle {
+        CropResizeHandle::TopLeft | CropResizeHandle::BottomRight => {
+            CursorStyle::ResizeUpLeftDownRight
+        }
+        CropResizeHandle::TopRight | CropResizeHandle::BottomLeft => {
+            CursorStyle::ResizeUpRightDownLeft
+        }
+        CropResizeHandle::Top | CropResizeHandle::Bottom => CursorStyle::ResizeUpDown,
+        CropResizeHandle::Left | CropResizeHandle::Right => CursorStyle::ResizeLeftRight,
+    }
+}
+
+fn resized_screen_crop(
+    original: ScreenCrop,
+    handle: CropResizeHandle,
+    pointer: [f32; 2],
+) -> ScreenCrop {
+    let mut left = original.position[0];
+    let mut top = original.position[1];
+    let mut right = left + original.size[0];
+    let mut bottom = top + original.size[1];
+    if matches!(
+        handle,
+        CropResizeHandle::TopLeft | CropResizeHandle::Left | CropResizeHandle::BottomLeft
+    ) {
+        left = pointer[0].clamp(0.0, right - 0.01);
+    }
+    if matches!(
+        handle,
+        CropResizeHandle::TopRight | CropResizeHandle::Right | CropResizeHandle::BottomRight
+    ) {
+        right = pointer[0].clamp(left + 0.01, 1.0);
+    }
+    if matches!(
+        handle,
+        CropResizeHandle::TopLeft | CropResizeHandle::Top | CropResizeHandle::TopRight
+    ) {
+        top = pointer[1].clamp(0.0, bottom - 0.01);
+    }
+    if matches!(
+        handle,
+        CropResizeHandle::BottomLeft | CropResizeHandle::Bottom | CropResizeHandle::BottomRight
+    ) {
+        bottom = pointer[1].clamp(top + 0.01, 1.0);
+    }
+    ScreenCrop {
+        position: [left, top],
+        size: [right - left, bottom - top],
+    }
+}
+
+fn crop_dialog_button(id: &'static str, label: &'static str) -> gpui::Stateful<Div> {
+    div()
+        .id(id)
+        .h(px(34.0))
+        .px_3()
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded_md()
+        .bg(rgb(theme::CONTROL_BACKGROUND))
+        .border_1()
+        .border_color(rgb(theme::BORDER_SUBTLE))
+        .hover(|button| button.bg(rgb(theme::CONTROL_HOVER)))
+        .cursor_pointer()
+        .text_xs()
+        .child(label)
 }
 
 fn export_field(label: &'static str, control: impl IntoElement) -> Div {
@@ -5070,9 +5647,16 @@ fn preview_worker(
         let Some((_, content_frame)) = &content_frame_cache else {
             continue;
         };
+        let (_, cropped_dimensions) =
+            screen_crop_rect(content_frame.dimensions, request.screen_crop);
 
-        let output_width = content_frame.dimensions.0.max(2) & !1;
-        let output_height = (((output_width as f64 * 9.0 / 16.0).round() as usize).max(2) + 1) & !1;
+        let preview_short_edge = cropped_dimensions.0.min(cropped_dimensions.1).min(1080);
+        let (output_width, output_height) = output_dimensions(
+            preview_short_edge,
+            cropped_dimensions,
+            request.aspect_ratio,
+            request.padding,
+        );
         if wallpaper_pending {
             while background_frames[request.background_preset].is_none()
                 && !failed_backgrounds[request.background_preset]
@@ -5105,6 +5689,7 @@ fn preview_worker(
             request.corner_style,
             request.zoom,
             request.camera_layout,
+            request.screen_crop,
         ) {
             Ok(frame) => {
                 if results
@@ -5112,6 +5697,7 @@ fn preview_worker(
                         playback_generation: request.playback_generation,
                         timeline_time_secs: request.timeline_time_secs,
                         frame: PreviewFrame(frame),
+                        screen: PreviewFrame(content_frame.screen.clone()),
                     })
                     .is_err()
                 {
@@ -5200,8 +5786,11 @@ fn render_output_frame(
     corner_style: CornerStyle,
     zoom: blip_compositor::OutputTransform,
     camera_layout: CameraLayout,
+    screen_crop: Option<ScreenCrop>,
 ) -> Result<core_video::pixel_buffer::CVPixelBuffer, String> {
-    let (canvas_width, canvas_height) = canvas_dimensions;
+    let (screen_content_rect, cropped_dimensions) =
+        screen_crop_rect(canvas_dimensions, screen_crop);
+    let (canvas_width, canvas_height) = cropped_dimensions;
     let (output_width, output_height) = output_dimensions;
     let shortest_dimension = output_width.min(output_height) as f32;
     let inset = shortest_dimension * padding / 200.0;
@@ -5242,7 +5831,7 @@ fn render_output_frame(
     let content_source = output_sources.len();
     output_sources.push(blip_compositor::CompositorSource {
         pixel_buffer: content_frame,
-        content_rect: None,
+        content_rect: Some(screen_content_rect),
     });
     let content_transform = blip_compositor::ItemTransform::new([0.5, 0.5], content_size)
         .with_corner_radius(corner_radius)
@@ -5263,7 +5852,10 @@ fn render_output_frame(
             &output_sources,
             &output_items,
             output_dimensions,
-            map_output_transform_to_item(zoom, content_transform),
+            map_output_transform_to_item(
+                map_output_transform_to_crop(zoom, screen_crop),
+                content_transform,
+            ),
         )
         .map_err(|error| format!("error composing output frame: {error}"))?;
     let Some(camera_frame) = camera_frame else {
@@ -5330,10 +5922,23 @@ fn render_export(
         .map_err(|error| format!("Could not create content renderer: {error}"))?;
     let mut output_compositor = blip_compositor::FrameCompositor::new()
         .map_err(|error| format!("Could not create output renderer: {error}"))?;
+    let source_dimensions = decoders
+        .iter()
+        .find(|(_, is_camera, _)| !*is_camera)
+        .or_else(|| decoders.first())
+        .map(|(decoder, _, _)| (decoder.width(), decoder.height()))
+        .unwrap_or((1920, 1080));
+    let (_, cropped_dimensions) = screen_crop_rect(source_dimensions, job.bundle.screen_crop);
+    let dimensions = output_dimensions(
+        job.short_edge,
+        cropped_dimensions,
+        job.aspect_ratio,
+        job.padding,
+    );
     let mut writer = blip_avfoundation::Mp4Writer::new_with_file_type(
         &job.output,
-        job.dimensions.0,
-        job.dimensions.1,
+        dimensions.0,
+        dimensions.1,
         job.fps,
         job.file_type,
     )
@@ -5352,7 +5957,7 @@ fn render_export(
             &content_frame.screen,
             content_frame.camera.as_ref(),
             content_frame.dimensions,
-            job.dimensions,
+            dimensions,
             wallpaper.as_ref(),
             job.background_type,
             job.padding,
@@ -5361,6 +5966,7 @@ fn render_export(
             job.corner_style,
             zoom_transform_at(&job.bundle.zoom_segments, timeline_time_secs),
             job.bundle.camera_layout,
+            job.bundle.screen_crop,
         )?;
         let timestamp = Duration::from_secs_f64(timeline_time_secs);
         while !writer
@@ -5967,6 +6573,90 @@ fn aspect_fit_size(
     }
 }
 
+fn fit_dimensions(aspect_ratio: f32, maximum_width: f32, maximum_height: f32) -> (f32, f32) {
+    let aspect_ratio = aspect_ratio.max(f32::EPSILON);
+    if maximum_width / maximum_height > aspect_ratio {
+        (maximum_height * aspect_ratio, maximum_height)
+    } else {
+        (maximum_width, maximum_width / aspect_ratio)
+    }
+}
+
+fn normalize_screen_crop(crop: Option<ScreenCrop>) -> Option<ScreenCrop> {
+    let crop = crop?;
+    let mut position = crop.position;
+    let mut size = crop.size;
+    for axis in 0..2 {
+        if !position[axis].is_finite() {
+            position[axis] = 0.0;
+        }
+        position[axis] = position[axis].clamp(0.0, 0.99);
+        if !size[axis].is_finite() || size[axis] <= 0.0 {
+            size[axis] = 1.0 - position[axis];
+        }
+        let remaining = 1.0 - position[axis];
+        size[axis] = size[axis].max(0.01_f32.min(remaining)).min(remaining);
+    }
+    let crop = ScreenCrop { position, size };
+    let full = crop.position.iter().all(|value| value.abs() < 0.0001)
+        && crop.size.iter().all(|value| (value - 1.0).abs() < 0.0001);
+    (!full).then_some(crop)
+}
+
+fn screen_crop_rect(
+    dimensions: (usize, usize),
+    crop: Option<ScreenCrop>,
+) -> (blip_compositor::ContentRect, (usize, usize)) {
+    let crop = normalize_screen_crop(crop).unwrap_or(ScreenCrop::FULL);
+    let width = dimensions.0.max(1) as f64;
+    let height = dimensions.1.max(1) as f64;
+    let crop_width = (width * f64::from(crop.size[0])).max(1.0);
+    let crop_height = (height * f64::from(crop.size[1])).max(1.0);
+    (
+        blip_compositor::ContentRect {
+            x: width * f64::from(crop.position[0]),
+            y: height * f64::from(crop.position[1]),
+            width: crop_width,
+            height: crop_height,
+        },
+        (crop_width.round() as usize, crop_height.round() as usize),
+    )
+}
+
+fn output_dimensions(
+    short_edge: usize,
+    (source_width, source_height): (usize, usize),
+    aspect_ratio: OutputAspectRatio,
+    padding: f32,
+) -> (usize, usize) {
+    let ratio = match aspect_ratio {
+        OutputAspectRatio::Auto => {
+            let source_ratio = source_width.max(1) as f64 / source_height.max(1) as f64;
+            let padding_fraction = f64::from(padding.clamp(0.0, 50.0)) / 100.0;
+            if source_ratio >= 1.0 {
+                source_ratio * (1.0 - padding_fraction) + padding_fraction
+            } else {
+                1.0 / ((1.0 - padding_fraction) / source_ratio + padding_fraction)
+            }
+        }
+        OutputAspectRatio::Wide => 16.0 / 9.0,
+        OutputAspectRatio::Vertical => 9.0 / 16.0,
+        OutputAspectRatio::Square => 1.0,
+        OutputAspectRatio::Classic => 4.0 / 3.0,
+        OutputAspectRatio::Tall => 3.0 / 4.0,
+    };
+    let short_edge = even_dimension(short_edge as f64);
+    if ratio >= 1.0 {
+        (even_dimension(short_edge as f64 * ratio), short_edge)
+    } else {
+        (short_edge, even_dimension(short_edge as f64 / ratio))
+    }
+}
+
+fn even_dimension(value: f64) -> usize {
+    ((value / 2.0).round() as usize * 2).max(2)
+}
+
 fn map_output_transform_to_item(
     mut output: blip_compositor::OutputTransform,
     item: blip_compositor::ItemTransform,
@@ -5974,6 +6664,20 @@ fn map_output_transform_to_item(
     output.center = [
         item.center[0] + (output.center[0] - 0.5) * item.size[0],
         item.center[1] + (output.center[1] - 0.5) * item.size[1],
+    ];
+    output
+}
+
+fn map_output_transform_to_crop(
+    mut output: blip_compositor::OutputTransform,
+    crop: Option<ScreenCrop>,
+) -> blip_compositor::OutputTransform {
+    let Some(crop) = normalize_screen_crop(crop) else {
+        return output;
+    };
+    output.center = [
+        ((output.center[0] - crop.position[0]) / crop.size[0]).clamp(0.0, 1.0),
+        ((output.center[1] - crop.position[1]) / crop.size[1]).clamp(0.0, 1.0),
     ];
     output
 }
@@ -6057,21 +6761,158 @@ fn camera_crop_rect(
 #[cfg(test)]
 mod tests {
     use crate::bundle::{
-        BlipBundle, CameraCrop, CameraLayout, CameraPosition, VideoSegment, VideoSegmentResizeMode,
-        ZoomSegment, ZoomTransitionSpeed,
+        BlipBundle, CameraCrop, CameraLayout, CameraPosition, OutputAspectRatio, ScreenCrop,
+        VideoSegment, VideoSegmentResizeMode, ZoomSegment, ZoomTransitionSpeed,
     };
 
     use super::{
-        VideoSegmentEdge, ZoomSegmentEdge, aligned_input_time, camera_crop_rect, camera_transform,
-        can_split_video_segment, clamp_video_timeline_to_source_range, cubic_bezier_ease,
-        cut_gap_label, edit_video_cut, include_timeline_fps, map_output_transform_to_item,
-        panned_timeline_view, playback_position, resize_video_segment_range,
-        resize_zoom_segment_range, ripple_delete_ranges, ripple_insert_ranges, shared_source_range,
+        CropResizeHandle, VideoSegmentEdge, ZoomSegmentEdge, aligned_input_time, camera_crop_rect,
+        camera_transform, can_split_video_segment, clamp_video_timeline_to_source_range,
+        crop_contains, cubic_bezier_ease, cut_gap_label, edit_video_cut, fit_dimensions,
+        include_timeline_fps, map_output_transform_to_crop, map_output_transform_to_item,
+        normalize_screen_crop, output_dimensions, panned_timeline_view, playback_position,
+        resize_video_segment_range, resize_zoom_segment_range, resized_screen_crop,
+        ripple_delete_ranges, ripple_insert_ranges, screen_crop_rect, shared_source_range,
         source_time_at, timeline_extent_secs, timeline_range_fraction, timeline_ruler_interval,
         timeline_ruler_label, timeline_segment_range_fraction, timeline_time_fraction,
         timeline_timecode, video_cut_gap_secs, video_segment_drag_layout, zoom_segment_range_at,
         zoom_transform_at, zoomed_timeline_view,
     };
+
+    #[test]
+    fn fixed_output_aspect_ratios_use_the_resolution_short_edge() {
+        assert_eq!(
+            output_dimensions(1080, (1920, 1080), OutputAspectRatio::Wide, 8.0),
+            (1920, 1080)
+        );
+        assert_eq!(
+            output_dimensions(1080, (1920, 1080), OutputAspectRatio::Vertical, 8.0),
+            (1080, 1920)
+        );
+        assert_eq!(
+            output_dimensions(1080, (1920, 1080), OutputAspectRatio::Square, 8.0),
+            (1080, 1080)
+        );
+        assert_eq!(
+            output_dimensions(1080, (1920, 1080), OutputAspectRatio::Classic, 8.0),
+            (1440, 1080)
+        );
+        assert_eq!(
+            output_dimensions(1080, (1920, 1080), OutputAspectRatio::Tall, 8.0),
+            (1080, 1440)
+        );
+    }
+
+    #[test]
+    fn crop_preview_fits_without_changing_the_content_aspect_ratio() {
+        let wide = fit_dimensions(16.0 / 9.0, 760.0, 440.0);
+        let classic = fit_dimensions(4.0 / 3.0, 760.0, 440.0);
+        assert_eq!(wide, (760.0, 427.5));
+        assert!((classic.0 - 586.6667).abs() < 0.001);
+        assert_eq!(classic.1, 440.0);
+    }
+
+    #[test]
+    fn auto_output_has_equal_padding_on_every_side() {
+        for source in [(1920, 1080), (1080, 1920)] {
+            let output = output_dimensions(1080, source, OutputAspectRatio::Auto, 8.0);
+            let inset = output.0.min(output.1) as f32 * 8.0 / 200.0;
+            let maximum_size = [
+                (output.0 as f32 - inset * 2.0) / output.0 as f32,
+                (output.1 as f32 - inset * 2.0) / output.1 as f32,
+            ];
+            let content_size = super::aspect_fit_size(
+                maximum_size,
+                (source.0 as f64, source.1 as f64),
+                (output.0 as f64, output.1 as f64),
+            );
+            let horizontal_padding = (output.0 as f32 - content_size[0] * output.0 as f32) / 2.0;
+            let vertical_padding = (output.1 as f32 - content_size[1] * output.1 as f32) / 2.0;
+
+            assert!((horizontal_padding - vertical_padding).abs() < 1.0);
+        }
+    }
+
+    #[test]
+    fn screen_crop_maps_normalized_geometry_to_source_pixels() {
+        let crop = ScreenCrop {
+            position: [0.25, 0.1],
+            size: [0.5, 0.75],
+        };
+        let (rect, dimensions) = screen_crop_rect((1920, 1080), Some(crop));
+
+        assert_eq!(rect.x, 480.0);
+        assert!((rect.y - 108.0).abs() < 0.001);
+        assert_eq!(rect.width, 960.0);
+        assert!((rect.height - 810.0).abs() < 0.001);
+        assert_eq!(dimensions, (960, 810));
+    }
+
+    #[test]
+    fn screen_crop_clamps_invalid_values_and_canonicalizes_full_frame() {
+        assert_eq!(normalize_screen_crop(Some(ScreenCrop::FULL)), None);
+        assert_eq!(normalize_screen_crop(None), None);
+
+        let crop = normalize_screen_crop(Some(ScreenCrop {
+            position: [f32::NAN, 1.5],
+            size: [f32::INFINITY, -1.0],
+        }))
+        .expect("partial crop should remain");
+        assert_eq!(crop.position, [0.0, 0.99]);
+        assert_eq!(crop.size[0], 1.0);
+        assert!((crop.size[1] - 0.01).abs() < 0.000_001);
+    }
+
+    #[test]
+    fn screen_crop_remaps_zoom_targets_to_visible_content() {
+        let crop = Some(ScreenCrop {
+            position: [0.25, 0.2],
+            size: [0.5, 0.5],
+        });
+        let centered = map_output_transform_to_crop(
+            blip_compositor::OutputTransform {
+                center: [0.5, 0.45],
+                scale: 2.0,
+            },
+            crop,
+        );
+        let outside = map_output_transform_to_crop(
+            blip_compositor::OutputTransform {
+                center: [0.0, 1.0],
+                scale: 2.0,
+            },
+            crop,
+        );
+
+        assert!((centered.center[0] - 0.5).abs() < 0.000_001);
+        assert!((centered.center[1] - 0.5).abs() < 0.000_001);
+        assert_eq!(outside.center, [0.0, 1.0]);
+    }
+
+    #[test]
+    fn screen_crop_detects_points_inside_the_selection() {
+        let crop = ScreenCrop {
+            position: [0.2, 0.25],
+            size: [0.5, 0.5],
+        };
+
+        assert!(crop_contains(crop, [0.2, 0.25]));
+        assert!(crop_contains(crop, [0.7, 0.75]));
+        assert!(!crop_contains(crop, [0.1, 0.5]));
+    }
+
+    #[test]
+    fn screen_crop_corner_resize_keeps_the_opposite_corner_fixed() {
+        let crop = ScreenCrop {
+            position: [0.2, 0.2],
+            size: [0.5, 0.5],
+        };
+        let resized = resized_screen_crop(crop, CropResizeHandle::TopLeft, [0.1, 0.05]);
+
+        assert_eq!(resized.position, [0.1, 0.05]);
+        assert!((resized.position[0] + resized.size[0] - 0.7).abs() < 0.000_001);
+        assert!((resized.position[1] + resized.size[1] - 0.7).abs() < 0.000_001);
+    }
 
     #[test]
     fn camera_stays_edge_anchored_and_shrinks_with_zoom() {

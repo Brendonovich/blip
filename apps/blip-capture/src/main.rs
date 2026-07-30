@@ -77,6 +77,7 @@ const OVERLAY_BLACK: u32 = 0x0000_0060;
 const OVERLAY_BLUE_TINT: u32 = 0x184d_8280;
 const CAPTURE_TIMEOUT: Duration = Duration::from_secs(5);
 const CAMERA_PERMISSION_TIMEOUT: Duration = Duration::from_secs(30);
+const CAMERA_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const WINDOW_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const CAMERA_WINDOW_AUTOSAVE_NAME: &str = "Camera Preview";
 
@@ -456,6 +457,25 @@ impl CaptureApp {
             }
         })
         .detach();
+        cx.spawn(async move |app, cx| {
+            loop {
+                cx.background_executor().timer(CAMERA_POLL_INTERVAL).await;
+                let cameras = cx
+                    .background_executor()
+                    .spawn(async { list_video_devices() })
+                    .await;
+                let Ok(cameras) = cameras else {
+                    continue;
+                };
+                if app
+                    .update(cx, |app, cx| app.update_camera_snapshot(cameras, cx))
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        })
+        .detach();
         Self {
             controller_window,
             displays,
@@ -626,6 +646,33 @@ impl CaptureApp {
         .is_err()
         {
             self.error = Some("Failed to open the camera menu".into());
+            cx.notify();
+        }
+    }
+
+    fn update_camera_snapshot(&mut self, cameras: Vec<CameraDevice>, cx: &mut Context<Self>) {
+        let devices_changed = self.cameras.len() != cameras.len()
+            || self
+                .cameras
+                .iter()
+                .zip(&cameras)
+                .any(|(old, new)| old.unique_id() != new.unique_id());
+        let previous_selection = self.selected_camera;
+        let selected_id = self
+            .selected_camera
+            .and_then(|index| self.cameras.get(index))
+            .map(|camera| camera.unique_id().to_owned());
+        let selected_camera = selected_id
+            .as_deref()
+            .and_then(|id| cameras.iter().position(|camera| camera.unique_id() == id));
+        let selection_disconnected = self.selected_camera.is_some() && selected_camera.is_none();
+
+        self.cameras = cameras;
+        self.selected_camera = selected_camera;
+        if selection_disconnected {
+            self.close_camera_window(cx);
+        }
+        if devices_changed || previous_selection != selected_camera {
             cx.notify();
         }
     }
