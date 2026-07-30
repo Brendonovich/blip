@@ -1,0 +1,10 @@
+[package]
+name = "blip-audio"
+version = "0.1.0"
+edition.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+blip-media-time.workspace = true

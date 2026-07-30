@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 
 use crate::StreamArgs;
 use crate::assets::{CHEVRON_DOWN, GRIP_VERTICAL, StudioAssets};
-use crate::numeric_input::{NumericInput, NumericInputEvent};
+use crate::project::{self, Project};
 use crate::rtmp::{RtmpConfig, RtmpStream};
 use crate::theme;
 use anyhow::Context as _;
@@ -24,6 +24,10 @@ use blip_sck::{
     CaptureError, CaptureFilter, Capturer, Display as CaptureDisplay, PixelFormat,
     ShareableContent, StreamConfig, StreamConfigBuilder, VideoFrame, Window as CaptureWindow,
 };
+use blip_ui::{
+    DROPDOWN_ANIMATION_DURATION, DropdownStyle, NumericInput, NumericInputEvent, dropdown_chevron,
+    dropdown_menu, dropdown_option, dropdown_trigger,
+};
 use core_foundation::base::TCFType;
 use core_video::pixel_buffer::CVPixelBuffer;
 #[cfg(target_os = "macos")]
@@ -31,9 +35,8 @@ use gpui::KeyBinding;
 use gpui::{
     Animation, AnimationExt as _, App, BorderStyle, Bounds, Context, DevicePixels, Div,
     DragMoveEvent, Entity, FontWeight, IntoElement, MouseButton, MouseDownEvent, MouseMoveEvent,
-    MouseUpEvent, ObjectFit, Pixels, Point, Render, TitlebarOptions, Transformation, Window,
-    WindowOptions, canvas, deferred, div, ease_out_quint, outline, percentage, prelude::*, px,
-    quad, rgb, size, surface, svg,
+    MouseUpEvent, ObjectFit, Pixels, Point, Render, TitlebarOptions, Window, WindowOptions, canvas,
+    deferred, div, ease_out_quint, outline, prelude::*, px, quad, rgb, size, surface, svg,
 };
 enum ViewerEvent {
     RenderReady,
@@ -47,7 +50,6 @@ const INSPECTOR_WIDTH: Pixels = px(232.0);
 const TITLEBAR_SAFE_AREA: Pixels = px(38.0);
 const CAPTURE_TIMEOUT: Duration = Duration::from_secs(5);
 const RENDER_INTERVAL: Duration = Duration::from_nanos(16_666_667);
-const SOURCE_MENU_ANIMATION_DURATION: Duration = Duration::from_millis(150);
 const SCENE_ROW_ANIMATION_DURATION: Duration = Duration::from_millis(140);
 const SCENE_ROW_STRIDE: f32 = 36.0;
 const DEFAULT_CANVAS_DIMENSIONS: (usize, usize) = (1920, 1080);
@@ -271,6 +273,78 @@ impl Scene {
         self.elements.insert(destination, element);
         true
     }
+}
+
+fn project_snapshot(
+    scene: &Scene,
+    colors: &HashMap<SourceId, ColorSource>,
+    selected_item: Option<ElementId>,
+) -> Project {
+    let elements = scene
+        .elements
+        .iter()
+        .map(|element| {
+            let source = match element.source {
+                SourceId::Display(id) => project::Source::Display(id),
+                SourceId::Window(id) => project::Source::Window(id),
+                SourceId::Camera(id) => project::Source::Camera(id),
+                SourceId::Color(id) => project::Source::Color {
+                    id,
+                    value: colors
+                        .get(&element.source)
+                        .map_or([0, 0, 0], |source| source.color),
+                },
+            };
+            project::Element {
+                id: element.id,
+                source,
+                center: element.layout.center,
+                size: element.layout.size,
+                corner_radius_ratio: element.layout.corner_radius_ratio,
+            }
+        })
+        .collect();
+    Project {
+        elements,
+        selected_item,
+    }
+}
+
+fn restore_project(
+    project: Project,
+) -> (
+    Scene,
+    HashMap<SourceId, ColorSource>,
+    Option<ElementId>,
+    u64,
+) {
+    let mut scene = Scene::new();
+    let mut colors = HashMap::new();
+    let mut next_color_source_id = 1_u64;
+    for element in project.elements {
+        let source = match element.source {
+            project::Source::Display(id) => SourceId::Display(id),
+            project::Source::Window(id) => SourceId::Window(id),
+            project::Source::Camera(id) => SourceId::Camera(id),
+            project::Source::Color { id, value } => {
+                let source = SourceId::Color(id);
+                colors.insert(source, ColorSource { color: value });
+                next_color_source_id = next_color_source_id.max(id.saturating_add(1));
+                source
+            }
+        };
+        scene.next_id = scene.next_id.max(element.id.saturating_add(1));
+        scene.elements.push(SceneElement {
+            id: element.id,
+            source,
+            layout: ItemLayout {
+                center: element.center,
+                size: element.size,
+                corner_radius_ratio: element.corner_radius_ratio,
+            },
+        });
+    }
+    (scene, colors, project.selected_item, next_color_source_id)
 }
 
 #[derive(Clone, Copy)]
@@ -704,6 +778,15 @@ fn transform_input(
 }
 
 impl FrameViewer {
+    fn save_project(&self) {
+        let project = project_snapshot(
+            &self.scene.borrow(),
+            &self.colors.borrow(),
+            self.selected_item,
+        );
+        _ = project::save(&project);
+    }
+
     fn blur_inputs(&mut self, _: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         window.blur();
         if self.open_menu == Some(OpenMenu::Source) {
@@ -746,7 +829,7 @@ impl FrameViewer {
         let viewer = cx.entity().downgrade();
         cx.spawn(async move |_, cx| {
             cx.background_executor()
-                .timer(SOURCE_MENU_ANIMATION_DURATION)
+                .timer(DROPDOWN_ANIMATION_DURATION)
                 .await;
             let _ = viewer.update(cx, |viewer, cx| {
                 if viewer.open_menu != Some(OpenMenu::Source)
@@ -763,6 +846,7 @@ impl FrameViewer {
 
     fn select_scene_item(&mut self, item: ElementId, cx: &mut Context<Self>) {
         self.selected_item = Some(item);
+        self.save_project();
         cx.notify();
     }
 
@@ -795,6 +879,7 @@ impl FrameViewer {
             self.scene_item_animation_started = Some(Instant::now());
             drop(scene);
             self.frame_hub.scene_changed(None);
+            self.save_project();
             cx.notify();
         }
     }
@@ -809,6 +894,7 @@ impl FrameViewer {
         self.animate_scene_drag_release(drag.item, window);
         self.scene_dragging_item = None;
         self.selected_item = Some(drag.item);
+        self.save_project();
         cx.notify();
     }
 
@@ -885,6 +971,7 @@ impl FrameViewer {
         self.hovered_handle = None;
         self.corner_handle_hovered = false;
         self.frame_hub.scene_changed(removed_source);
+        self.save_project();
         cx.notify();
     }
 
@@ -915,6 +1002,7 @@ impl FrameViewer {
             nudged_center(element.layout.center, delta, [width as f32, height as f32]);
         drop(scene);
         self.frame_hub.scene_changed(None);
+        self.save_project();
         cx.notify();
     }
 
@@ -1029,6 +1117,7 @@ impl FrameViewer {
         self.close_source_menu(cx);
         self.control_error = None;
         self.frame_hub.scene_changed(None);
+        self.save_project();
         cx.notify();
     }
 
@@ -1096,6 +1185,7 @@ impl FrameViewer {
         };
         self.open_menu = None;
         self.frame_hub.scene_changed(removed_source);
+        self.save_project();
         cx.notify();
     }
 
@@ -1106,6 +1196,7 @@ impl FrameViewer {
         self.close_source_menu(cx);
         self.control_error = None;
         self.frame_hub.scene_changed(None);
+        self.save_project();
 
         if self.captures.borrow().contains_key(&source)
             || self.pending_captures.contains_key(&source)
@@ -1200,6 +1291,7 @@ impl FrameViewer {
         self.selected_item = Some(id);
         self.close_source_menu(cx);
         self.frame_hub.scene_changed(None);
+        self.save_project();
         cx.notify();
     }
 
@@ -1259,7 +1351,9 @@ impl FrameViewer {
             return;
         };
         source.color = color;
+        drop(colors);
         self.frame_hub.scene_changed(None);
+        self.save_project();
         cx.notify();
     }
 
@@ -1440,12 +1534,16 @@ impl FrameViewer {
     }
 
     fn end_drag(&mut self, _event: &MouseUpEvent, window: &mut Window, cx: &mut Context<Self>) {
-        self.drag_operation = None;
+        let project_changed =
+            self.drag_operation.take().is_some() || self.scene_dragging_item.is_some();
         self.snap_guides = SnapGuides::default();
         if let Some(item) = self.scene_dragging_item {
             self.animate_scene_drag_release(item, window);
         }
         self.scene_dragging_item = None;
+        if project_changed {
+            self.save_project();
+        }
         cx.notify();
     }
 
@@ -1580,7 +1678,9 @@ impl FrameViewer {
                 return;
             };
             *channel = value.round().clamp(0.0, 255.0) as u8;
+            drop(colors);
             self.frame_hub.scene_changed(None);
+            self.save_project();
             cx.notify();
             return;
         }
@@ -1627,6 +1727,7 @@ impl FrameViewer {
         }
         drop(scene);
         self.frame_hub.scene_changed(None);
+        self.save_project();
         cx.notify();
     }
 
@@ -2037,75 +2138,30 @@ impl FrameViewer {
     fn source_picker(&self, cx: &mut Context<Self>) -> Div {
         let opening = self.open_menu == Some(OpenMenu::Source);
         let transition = self.source_menu_transition;
-        let chevron = svg()
-            .size(px(14.0))
-            .path(CHEVRON_DOWN)
-            .text_color(rgb(theme::TEXT_MUTED))
-            .flex_none();
-        let chevron = if transition == 0 {
-            chevron.into_any_element()
-        } else {
-            chevron
-                .with_animation(
-                    format!("source-chevron-transition-{transition}"),
-                    Animation::new(SOURCE_MENU_ANIMATION_DURATION).with_easing(ease_out_quint()),
-                    move |chevron, delta| {
-                        let progress = if opening { delta } else { 1.0 - delta };
-                        chevron
-                            .with_transformation(Transformation::rotate(percentage(progress * 0.5)))
-                    },
-                )
-                .into_any_element()
-        };
+        let style = DropdownStyle::default();
+        let chevron = dropdown_chevron(CHEVRON_DOWN, opening, transition, style);
         let mut picker = div().relative().h(px(30.0)).child(
-            div()
-                .id("add-source")
-                .w_full()
-                .h(px(30.0))
-                .px_2()
-                .flex()
-                .items_center()
-                .justify_between()
-                .rounded_sm()
-                .bg(rgb(theme::CONTROL_BACKGROUND))
-                .border_1()
-                .border_color(rgb(theme::BORDER_SUBTLE))
-                .hover(|button| button.bg(rgb(theme::CONTROL_HOVER)))
-                .child(div().text_sm().child("Add source"))
+            dropdown_trigger("add-source", style)
+                .child(div().flex_1().text_sm().child("Add source"))
                 .child(chevron)
-                .on_mouse_down(MouseButton::Left, cx.listener(Self::stop_mouse_propagation))
                 .on_click(cx.listener(|viewer, _, _, cx| viewer.toggle_source_menu(cx))),
         );
         if self.source_menu_visible {
-            let menu = div()
-                .id("source-menu")
-                .absolute()
-                .left_0()
-                .right_0()
-                .max_h(px(280.0))
-                .p_1()
-                .flex()
-                .flex_col()
-                .gap_1()
-                .overflow_y_scroll()
-                .rounded_sm()
-                .bg(rgb(theme::CONTROL_BACKGROUND))
-                .border_1()
-                .border_color(rgb(theme::BORDER))
-                .on_mouse_down(MouseButton::Left, cx.listener(Self::stop_mouse_propagation))
-                .child(self.source_picker_group("Displays", SourceGroup::Displays, cx))
-                .child(self.source_picker_group("Windows", SourceGroup::Windows, cx))
-                .child(self.source_picker_group("Cameras", SourceGroup::Cameras, cx))
-                .child(Self::color_source_picker(cx))
-                .with_animation(
-                    format!("source-menu-transition-{transition}"),
-                    Animation::new(SOURCE_MENU_ANIMATION_DURATION).with_easing(ease_out_quint()),
-                    move |menu, delta| {
-                        let visibility = if opening { delta } else { 1.0 - delta };
-                        menu.top(px(34.0 - 6.0 * (1.0 - visibility)))
-                            .opacity(visibility)
-                    },
-                );
+            let menu = dropdown_menu(
+                "source-menu",
+                opening,
+                transition,
+                style,
+                [
+                    self.source_picker_group("Displays", SourceGroup::Displays, cx)
+                        .into_any_element(),
+                    self.source_picker_group("Windows", SourceGroup::Windows, cx)
+                        .into_any_element(),
+                    self.source_picker_group("Cameras", SourceGroup::Cameras, cx)
+                        .into_any_element(),
+                    Self::color_source_picker(cx).into_any_element(),
+                ],
+            );
             picker = picker.child(deferred(menu).priority(1));
         }
         picker
@@ -2137,28 +2193,23 @@ impl FrameViewer {
                 } else {
                     format!("{} ({count})", target.label())
                 };
-                div()
-                    .id(format!("source-option-{index}"))
-                    .w_full()
-                    .min_h(px(28.0))
-                    .px_2()
-                    .flex()
-                    .items_center()
-                    .rounded_sm()
-                    .text_xs()
-                    .hover(|option| option.bg(rgb(theme::CONTROL_HOVER)))
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .overflow_hidden()
-                            .whitespace_nowrap()
-                            .text_ellipsis()
-                            .child(label),
-                    )
-                    .on_click(cx.listener(move |viewer, _, _, cx| {
-                        viewer.add_capture_target(index, cx);
-                    }))
+                dropdown_option(
+                    format!("source-option-{index}"),
+                    false,
+                    DropdownStyle::default(),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .overflow_hidden()
+                        .whitespace_nowrap()
+                        .text_ellipsis()
+                        .child(label),
+                )
+                .on_click(cx.listener(move |viewer, _, _, cx| {
+                    viewer.add_capture_target(index, cx);
+                }))
             });
         div()
             .flex()
@@ -2189,17 +2240,8 @@ impl FrameViewer {
                     .child("Other"),
             )
             .child(
-                div()
-                    .id("source-option-color")
-                    .w_full()
-                    .min_h(px(28.0))
-                    .px_2()
-                    .flex()
-                    .items_center()
+                dropdown_option("source-option-color", false, DropdownStyle::default())
                     .gap_2()
-                    .rounded_sm()
-                    .text_xs()
-                    .hover(|option| option.bg(rgb(theme::CONTROL_HOVER)))
                     .child(
                         div()
                             .size(px(14.0))
@@ -2599,24 +2641,53 @@ pub(crate) fn view(args: &StreamArgs) -> Result<(), Box<dyn Error>> {
         .cloned()
         .ok_or(CaptureError::NoDisplay)?;
     let initial_source = target.id();
-    let initial_generation = 1;
-    let (initial_capturer, initial_configuration) =
-        build_capturer(&target, options, initial_generation, &frame_hub)?;
-    initial_capturer.start()?;
-    let captures = Rc::new(RefCell::new(HashMap::from([(
-        initial_source,
-        CaptureResource {
-            capturer: initial_capturer,
-            generation: initial_generation,
-            configuration: initial_configuration,
-        },
-    )])));
-    let mut initial_scene = Scene::new();
-    initial_scene.add(initial_source, full_canvas_layout());
-    let selected_item = initial_scene.add(initial_source, inset_layout());
+    let (initial_scene, initial_colors, selected_item, next_color_source_id) =
+        if let Some(project) = project::load() {
+            restore_project(project)
+        } else {
+            let mut scene = Scene::new();
+            scene.add(initial_source, full_canvas_layout());
+            let selected = scene.add(initial_source, inset_layout());
+            (scene, HashMap::new(), Some(selected), 1)
+        };
+    let mut captures_by_source = HashMap::new();
+    let mut next_capture_generation = 1_u64;
+    for capture_target in std::iter::once(&target).chain(&targets) {
+        let source = capture_target.id();
+        if captures_by_source.contains_key(&source)
+            || (source != initial_source && !initial_scene.uses_source(source))
+        {
+            continue;
+        }
+        let generation = next_capture_generation;
+        let result = build_capturer(capture_target, options, generation, &frame_hub).and_then(
+            |(capturer, configuration)| {
+                capturer
+                    .start()
+                    .map_err(|error| CaptureError::Framework(error.to_string()))?;
+                Ok((capturer, configuration))
+            },
+        );
+        match result {
+            Ok((capturer, configuration)) => {
+                captures_by_source.insert(
+                    source,
+                    CaptureResource {
+                        capturer,
+                        generation,
+                        configuration,
+                    },
+                );
+                next_capture_generation = next_capture_generation.saturating_add(1);
+            }
+            Err(error) if source == initial_source => return Err(error.into()),
+            Err(_) => {}
+        }
+    }
+    let captures = Rc::new(RefCell::new(captures_by_source));
     let scene = Rc::new(RefCell::new(initial_scene));
     let compositor_scene = Rc::clone(&scene);
-    let colors = Rc::new(RefCell::new(HashMap::new()));
+    let colors = Rc::new(RefCell::new(initial_colors));
     let viewer_colors = Rc::clone(&colors);
     let compositor_colors = Rc::clone(&colors);
     let stream_canvas = Rc::new(Cell::new(None));
@@ -2685,7 +2756,7 @@ pub(crate) fn view(args: &StreamArgs) -> Result<(), Box<dyn Error>> {
                     content_dimensions: None,
                     scene,
                     rendered_elements: Vec::new(),
-                    selected_item: Some(selected_item),
+                    selected_item,
                     drag_operation: None,
                     snap_guides: SnapGuides::default(),
                     hovered_handle: None,
@@ -2707,9 +2778,9 @@ pub(crate) fn view(args: &StreamArgs) -> Result<(), Box<dyn Error>> {
                     captures: viewer_captures,
                     pending_captures: HashMap::new(),
                     failed_captures: HashSet::new(),
-                    next_capture_generation: 2,
+                    next_capture_generation,
                     colors: viewer_colors,
-                    next_color_source_id: 1,
+                    next_color_source_id,
                     frame_hub: viewer_frame_hub,
                     stream: None,
                     stream_url,
@@ -3830,6 +3901,40 @@ mod tests {
                 .iter()
                 .all(|element| element.source == source)
         );
+    }
+
+    #[test]
+    fn project_snapshot_restores_scene_order_layout_colors_and_selection() {
+        let mut scene = Scene::new();
+        let display = scene.add(SourceId::Display(3), full_canvas_layout());
+        let color_source = SourceId::Color(7);
+        let mut color_layout = inset_layout();
+        color_layout.center = [0.25, 0.75];
+        let color = scene.add(color_source, color_layout);
+        let colors = HashMap::from([(
+            color_source,
+            ColorSource {
+                color: [12, 34, 56],
+            },
+        )]);
+        let snapshot = project_snapshot(&scene, &colors, Some(color));
+
+        let (restored_scene, restored_colors, selected, next_color_id) =
+            restore_project(snapshot.clone());
+
+        assert_eq!(
+            project_snapshot(&restored_scene, &restored_colors, selected),
+            snapshot
+        );
+        assert_eq!(
+            restored_scene
+                .elements
+                .iter()
+                .map(|element| element.id)
+                .collect::<Vec<_>>(),
+            vec![display, color]
+        );
+        assert_eq!(next_color_id, 8);
     }
 
     #[test]

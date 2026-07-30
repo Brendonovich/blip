@@ -7,7 +7,7 @@ use clap::Parser;
 
 mod assets;
 mod headless;
-mod numeric_input;
+mod project;
 mod rtmp;
 mod theme;
 mod viewer;

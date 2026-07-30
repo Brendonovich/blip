@@ -6,6 +6,7 @@ use std::ptr::NonNull;
 use std::sync::Mutex;
 use std::time::Duration;
 
+use blip_audio::AudioPacket;
 use block2::RcBlock;
 use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, ProtocolObject};
@@ -21,7 +22,9 @@ use objc2_core_video::CVPixelBuffer;
 use objc2_foundation::{NSData, NSDictionary, NSNumber, NSObject, NSObjectProtocol};
 use objc2_uniform_type_identifiers::UTTypeMPEG4Movie;
 
-use crate::{FINISH_TIMEOUT, WriterError, cm_time, writer_error};
+use crate::{
+    FINISH_TIMEOUT, WriterError, add_audio_input, audio_sample_buffer, cm_time, writer_error,
+};
 
 const PLAYLIST_NAME: &str = "playlist.m3u8";
 const INITIALIZATION_SEGMENT_NAME: &str = "init.mp4";
@@ -176,6 +179,7 @@ impl PlaylistSink {
 pub struct HlsWriter {
     writer: Retained<AVAssetWriter>,
     input: Retained<AVAssetWriterInput>,
+    audio_input: Option<Retained<AVAssetWriterInput>>,
     adaptor: Retained<AVAssetWriterInputPixelBufferAdaptor>,
     delegate: Retained<SegmentDelegate>,
     frame_duration: Duration,
@@ -202,7 +206,39 @@ impl HlsWriter {
         fps: u32,
         segment_duration: Duration,
     ) -> Result<Self, WriterError> {
-        Self::new_with_asset_callback(output, width, height, fps, segment_duration, |_| {})
+        Self::new_with_asset_callback_inner(
+            output,
+            width,
+            height,
+            fps,
+            segment_duration,
+            false,
+            |_| {},
+        )
+    }
+
+    /// Creates an Apple HLS fMP4 writer with an AAC system-audio track.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the configuration is invalid or `AVFoundation`
+    /// rejects the video or audio writer input.
+    pub fn new_with_system_audio(
+        output: &Path,
+        width: usize,
+        height: usize,
+        fps: u32,
+        segment_duration: Duration,
+    ) -> Result<Self, WriterError> {
+        Self::new_with_asset_callback_inner(
+            output,
+            width,
+            height,
+            fps,
+            segment_duration,
+            true,
+            |_| {},
+        )
     }
 
     /// Creates an HLS writer that reports each initialization or media asset
@@ -218,6 +254,51 @@ impl HlsWriter {
         height: usize,
         fps: u32,
         segment_duration: Duration,
+        asset_callback: impl Fn(PathBuf) + Send + 'static,
+    ) -> Result<Self, WriterError> {
+        Self::new_with_asset_callback_inner(
+            output,
+            width,
+            height,
+            fps,
+            segment_duration,
+            false,
+            asset_callback,
+        )
+    }
+
+    /// Creates an HLS writer with system audio and incremental asset callbacks.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the configuration is invalid or `AVFoundation`
+    /// rejects the video or audio writer input.
+    pub fn new_with_asset_callback_and_system_audio(
+        output: &Path,
+        width: usize,
+        height: usize,
+        fps: u32,
+        segment_duration: Duration,
+        asset_callback: impl Fn(PathBuf) + Send + 'static,
+    ) -> Result<Self, WriterError> {
+        Self::new_with_asset_callback_inner(
+            output,
+            width,
+            height,
+            fps,
+            segment_duration,
+            true,
+            asset_callback,
+        )
+    }
+
+    fn new_with_asset_callback_inner(
+        output: &Path,
+        width: usize,
+        height: usize,
+        fps: u32,
+        segment_duration: Duration,
+        system_audio: bool,
         asset_callback: impl Fn(PathBuf) + Send + 'static,
     ) -> Result<Self, WriterError> {
         if width == 0 || height == 0 {
@@ -280,6 +361,7 @@ impl HlsWriter {
         }
         // SAFETY: `canAddInput` succeeded and writing has not started.
         unsafe { writer.addInput(&input) };
+        let audio_input = add_audio_input(&writer, system_audio)?;
         // SAFETY: Captured pixel buffers are supplied directly.
         let adaptor = unsafe {
             AVAssetWriterInputPixelBufferAdaptor::assetWriterInputPixelBufferAdaptorWithAssetWriterInput_sourcePixelBufferAttributes(
@@ -304,6 +386,7 @@ impl HlsWriter {
         Ok(Self {
             writer,
             input,
+            audio_input,
             adaptor,
             delegate,
             frame_duration,
@@ -364,6 +447,37 @@ impl HlsWriter {
         Ok(true)
     }
 
+    /// Appends captured system-audio samples at the supplied source timestamp.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the timestamp overflows, encoding fails, or an HLS
+    /// playlist or segment cannot be written.
+    pub fn append_audio(
+        &mut self,
+        packet: &AudioPacket,
+        timestamp: Duration,
+    ) -> Result<bool, WriterError> {
+        let Some(input) = &self.audio_input else {
+            return Ok(false);
+        };
+        // SAFETY: The audio input is retained and attached to the active writer.
+        if !unsafe { input.isReadyForMoreMediaData() } {
+            return Ok(false);
+        }
+        let timestamp_micros =
+            i64::try_from(timestamp.as_micros()).map_err(|_| WriterError::TimestampOverflow)?;
+        let start_timestamp = self.start_timestamp_micros.ok_or(WriterError::NoFrames)?;
+        let relative_timestamp = timestamp_micros.saturating_sub(start_timestamp).max(0);
+        let sample_buffer = audio_sample_buffer(packet, relative_timestamp)?;
+        // SAFETY: The input is ready and the sample buffer has a valid presentation timestamp.
+        if !unsafe { input.appendSampleBuffer(&sample_buffer) } {
+            return Err(WriterError::AppendAudio(writer_error(&self.writer)));
+        }
+        self.delegate.check_error()?;
+        Ok(true)
+    }
+
     /// Finalizes the final segment and writes an HLS VOD end marker.
     ///
     /// # Errors
@@ -386,6 +500,9 @@ impl HlsWriter {
         unsafe {
             self.writer.endSessionAtSourceTime(cm_time(end_timestamp));
             self.input.markAsFinished();
+            if let Some(input) = &self.audio_input {
+                input.markAsFinished();
+            }
         }
         let (sender, receiver) = std::sync::mpsc::sync_channel(1);
         let completion = RcBlock::new(move || {

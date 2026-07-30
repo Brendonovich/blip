@@ -7,6 +7,7 @@ edition.workspace = true
 workspace = true
 
 [dependencies]
+blip-audio.workspace = true
 blip-media-time.workspace = true
 block2.workspace = true
 core-foundation.workspace = true
@@ -15,6 +16,7 @@ dispatch2 = "0.3.0"
 objc2.workspace = true
 objc2-av-foundation.workspace = true
 objc2-core-foundation = "0.3.2"
+objc2-core-audio-types.workspace = true
 objc2-core-media.workspace = true
 objc2-core-video.workspace = true
 objc2-foundation.workspace = true

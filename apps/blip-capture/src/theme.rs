@@ -1,3 +1,5 @@
+use blip_ui::NumericInputStyle;
+
 pub(crate) const APP_BACKGROUND: u32 = 0x0009_0909;
 pub(crate) const CANVAS_BACKGROUND: u32 = 0x000d_0d0d;
 pub(crate) const PANEL_BACKGROUND: u32 = 0x0015_1515;
@@ -12,3 +14,13 @@ pub(crate) const TEXT_DIM: u32 = TEXT_MUTED;
 pub(crate) const FOCUS: u32 = 0x007e_8ea6;
 pub(crate) const SELECTION: u32 = 0x0082_94ad;
 pub(crate) const SELECTION_FILL: u32 = 0x0039_4352;
+
+pub(crate) const NUMERIC_INPUT_STYLE: NumericInputStyle = NumericInputStyle {
+    control_background: CONTROL_BACKGROUND,
+    border_subtle: BORDER_SUBTLE,
+    text: TEXT,
+    text_muted: TEXT_MUTED,
+    text_dim: TEXT_DIM,
+    focus: FOCUS,
+    selection_fill: SELECTION_FILL,
+};

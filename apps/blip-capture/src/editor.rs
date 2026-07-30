@@ -12,6 +12,10 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
+use blip_ui::{
+    DROPDOWN_ANIMATION_DURATION, DropdownStyle, dropdown_chevron, dropdown_menu, dropdown_option,
+    dropdown_trigger,
+};
 use core_foundation::{
     base::{CFType, TCFType},
     boolean::CFBoolean,
@@ -22,15 +26,16 @@ use gpui::{
     Animation, AnimationExt as _, AnyElement, App, Bounds, Context, CursorStyle, Div, FocusHandle,
     FontWeight, IntoElement, MouseButton, MouseDownEvent, MouseExitEvent, MouseMoveEvent,
     ObjectFit, PinchEvent, Pixels, Render, ScrollWheelEvent, SharedString, TextAlign, TextRun,
-    TitlebarOptions, Window, WindowOptions, canvas, div, fill, img, point, prelude::*, px,
-    relative, rgb, rgba, size, surface, svg,
+    TitlebarOptions, Window, WindowOptions, canvas, deferred, div, fill, img, point, prelude::*,
+    px, relative, rgb, rgba, size, surface, svg,
 };
 
 use crate::{
-    assets::{PAUSE, PLAY, PLAYBACK_BACK, PLAYBACK_FORWARD},
+    assets::{CHECK, CHEVRON_DOWN, PAUSE, PLAY, PLAYBACK_BACK, PLAYBACK_FORWARD, SHAPE_FRAME},
     bundle::{
-        BlipBundle, CameraCrop, CameraLayout, CameraPosition, OutputAspectRatio, ScreenCrop,
-        VideoSegment, VideoSegmentResizeMode, ZoomSegment, ZoomTransitionSpeed,
+        BackgroundType, BlipBundle, CameraCrop, CameraLayout, CameraPosition, ExportFormat,
+        ExportResolution, OutputAspectRatio, ScreenCrop, VideoSegment, VideoSegmentResizeMode,
+        ZoomSegment, ZoomTransitionSpeed,
     },
     theme,
 };
@@ -43,9 +48,9 @@ const SIDEBAR_WIDTH: Pixels = px(280.0);
 const PREVIEW_LOADING_DURATION: Duration = Duration::from_millis(1_400);
 const PREVIEW_FADE_DURATION: Duration = Duration::from_millis(240);
 const TIMELINE_RESIZE_DURATION: Duration = Duration::from_millis(180);
+const TIMELINE_TRAILING_SPACE_SECS: f64 = 3.0;
 const ANIMATION_TICK_INTERVAL: Duration = Duration::from_millis(16);
 const MIN_VIDEO_SEGMENT_DURATION_SECS: f64 = 1.0;
-const TIMELINE_EXPANSION_SPACE_SECS: f64 = 5.0;
 const BUNDLED_BACKGROUNDS: [(&str, &[u8], &[u8]); 15] = [
     (
         "tahoe-dusk.jpg",
@@ -125,27 +130,15 @@ const BUNDLED_BACKGROUNDS: [(&str, &[u8], &[u8]); 15] = [
 ];
 
 struct BackgroundImage {
+    name: String,
     image: PathBuf,
     thumbnail: PathBuf,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum BackgroundType {
-    Color,
-    Image,
-    Gradient,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum CornerStyle {
-    Circular,
-    Squircle,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum ExportFormat {
-    Mp4,
-    Mov,
+enum SidebarTab {
+    Screen,
+    Camera,
 }
 
 impl ExportFormat {
@@ -162,12 +155,6 @@ impl ExportFormat {
             Self::Mov => blip_avfoundation::VideoFileType::Mov,
         }
     }
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum ExportResolution {
-    P1080,
-    P720,
 }
 
 impl ExportResolution {
@@ -199,7 +186,6 @@ struct ExportJob {
     padding: f32,
     border_radius: f32,
     shadow: f32,
-    corner_style: CornerStyle,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -299,7 +285,6 @@ struct PreviewRequest {
     aspect_ratio: OutputAspectRatio,
     border_radius: f32,
     shadow: f32,
-    corner_style: CornerStyle,
     zoom: blip_compositor::OutputTransform,
     camera_layout: CameraLayout,
     screen_crop: Option<ScreenCrop>,
@@ -378,13 +363,8 @@ pub(crate) struct BundleEditor {
     timeline_bounds: Rc<Cell<Bounds<Pixels>>>,
     timeline_rows_bounds: Rc<Cell<Bounds<Pixels>>>,
     zoom_target_bounds: Rc<Cell<Bounds<Pixels>>>,
-    background_type: BackgroundType,
     background_preset: usize,
     background_images: Vec<BackgroundImage>,
-    background_padding: f32,
-    border_radius: f32,
-    shadow: f32,
-    corner_style: CornerStyle,
     padding_slider_bounds: Rc<Cell<Bounds<Pixels>>>,
     radius_slider_bounds: Rc<Cell<Bounds<Pixels>>>,
     shadow_slider_bounds: Rc<Cell<Bounds<Pixels>>>,
@@ -400,16 +380,17 @@ pub(crate) struct BundleEditor {
     video_segment_drag: Option<VideoSegmentDrag>,
     video_timeline_resize_animation: Option<VideoTimelineResizeAnimation>,
     video_timeline_resize_generation: u64,
+    sidebar_tab: SidebarTab,
+    settings_dialog_open: bool,
+    aspect_ratio_dropdown_open: bool,
+    aspect_ratio_dropdown_visible: bool,
+    aspect_ratio_dropdown_transition: u64,
     crop_dialog_open: bool,
     crop_draft: ScreenCrop,
     crop_drag: Option<CropDrag>,
     crop_preview_bounds: Rc<Cell<Bounds<Pixels>>>,
     crop_frame: Option<core_video::pixel_buffer::CVPixelBuffer>,
     export_dialog_open: bool,
-    export_format: ExportFormat,
-    export_resolution: ExportResolution,
-    export_fps: u32,
-    export_destination: Option<PathBuf>,
     export_progress: f32,
     exporting: bool,
     export_error: Option<String>,
@@ -472,6 +453,10 @@ impl BundleEditor {
         bundle.screen_crop = normalize_screen_crop(bundle.screen_crop);
         let crop_draft = bundle.screen_crop.unwrap_or(ScreenCrop::FULL);
         let background_images = bundled_backgrounds();
+        let background_preset = background_images
+            .iter()
+            .position(|background| background.name == bundle.appearance.background_image)
+            .unwrap_or(0);
         let preview_backgrounds = background_images
             .iter()
             .map(|background| background.image.clone())
@@ -602,13 +587,8 @@ impl BundleEditor {
                         timeline_bounds: Rc::new(Cell::new(Bounds::default())),
                         timeline_rows_bounds: Rc::new(Cell::new(Bounds::default())),
                         zoom_target_bounds: Rc::new(Cell::new(Bounds::default())),
-                        background_type: BackgroundType::Gradient,
-                        background_preset: 0,
+                        background_preset,
                         background_images,
-                        background_padding: 8.0,
-                        border_radius: 8.0,
-                        shadow: 20.0,
-                        corner_style: CornerStyle::Squircle,
                         padding_slider_bounds: Rc::new(Cell::new(Bounds::default())),
                         radius_slider_bounds: Rc::new(Cell::new(Bounds::default())),
                         shadow_slider_bounds: Rc::new(Cell::new(Bounds::default())),
@@ -624,16 +604,17 @@ impl BundleEditor {
                         video_segment_drag: None,
                         video_timeline_resize_animation: None,
                         video_timeline_resize_generation: 0,
+                        sidebar_tab: SidebarTab::Screen,
+                        settings_dialog_open: false,
+                        aspect_ratio_dropdown_open: false,
+                        aspect_ratio_dropdown_visible: false,
+                        aspect_ratio_dropdown_transition: 0,
                         crop_dialog_open: false,
                         crop_draft,
                         crop_drag: None,
                         crop_preview_bounds: Rc::new(Cell::new(Bounds::default())),
                         crop_frame: None,
                         export_dialog_open: false,
-                        export_format: ExportFormat::Mp4,
-                        export_resolution: ExportResolution::P1080,
-                        export_fps: 30,
-                        export_destination: None,
                         export_progress: 0.0,
                         exporting: false,
                         export_error: None,
@@ -653,15 +634,6 @@ impl BundleEditor {
         }
         cx.activate(true);
         Ok(())
-    }
-
-    fn select_input(&mut self, index: usize, cx: &mut Context<Self>) {
-        if self.bundle.inputs.get(index).is_some() {
-            self.selected_input = index;
-            self.selected_zoom = None;
-            self.selected_video_segment = None;
-            cx.notify();
-        }
     }
 
     fn selected_zoom(&self) -> Option<&ZoomSegment> {
@@ -710,7 +682,9 @@ impl BundleEditor {
 
     fn choose_export_destination(&mut self, cx: &mut Context<Self>) {
         let directory = self
-            .export_destination
+            .bundle
+            .export_settings
+            .destination
             .as_deref()
             .and_then(Path::parent)
             .map(Path::to_path_buf)
@@ -725,12 +699,13 @@ impl BundleEditor {
             .file_stem()
             .and_then(|name| name.to_str())
             .unwrap_or("Blip Export");
-        let suggested_name = format!("{stem}.{}", self.export_format.extension());
+        let suggested_name = format!("{stem}.{}", self.bundle.export_settings.format.extension());
         let receiver = cx.prompt_for_new_path(&directory, Some(&suggested_name));
         cx.spawn(async move |editor, cx| match receiver.await {
             Ok(Ok(Some(path))) => {
                 let _ = editor.update(cx, |editor, cx| {
-                    editor.export_destination = Some(path);
+                    editor.bundle.export_settings.destination = Some(path);
+                    editor.save_bundle();
                     editor.export_error = None;
                     editor.exported_path = None;
                     cx.notify();
@@ -751,7 +726,7 @@ impl BundleEditor {
         if self.exporting {
             return;
         }
-        let Some(destination) = self.export_destination.clone() else {
+        let Some(destination) = self.bundle.export_settings.destination.clone() else {
             self.export_error = Some("Choose a destination before exporting.".into());
             cx.notify();
             return;
@@ -761,7 +736,7 @@ impl BundleEditor {
             cx.notify();
             return;
         }
-        let output = destination.with_extension(self.export_format.extension());
+        let output = destination.with_extension(self.bundle.export_settings.format.extension());
         let decoder_inputs = self
             .bundle
             .inputs
@@ -777,22 +752,21 @@ impl BundleEditor {
             .collect();
         let job = ExportJob {
             output: output.clone(),
-            file_type: self.export_format.file_type(),
-            short_edge: self.export_resolution.short_edge(),
+            file_type: self.bundle.export_settings.format.file_type(),
+            short_edge: self.bundle.export_settings.resolution.short_edge(),
             aspect_ratio: self.bundle.output_aspect_ratio,
-            fps: self.export_fps,
+            fps: self.bundle.export_settings.fps,
             duration_secs: self.duration_secs,
             bundle: self.bundle.clone(),
             decoder_inputs,
-            wallpaper: (self.background_type == BackgroundType::Image)
+            wallpaper: (self.bundle.appearance.background_type == BackgroundType::Image)
                 .then(|| self.background_images.get(self.background_preset))
                 .flatten()
                 .map(|background| background.image.clone()),
-            background_type: self.background_type,
-            padding: self.background_padding,
-            border_radius: self.border_radius,
-            shadow: self.shadow,
-            corner_style: self.corner_style,
+            background_type: self.bundle.appearance.background_type,
+            padding: self.bundle.appearance.padding,
+            border_radius: self.bundle.appearance.border_radius,
+            shadow: self.bundle.appearance.shadow,
         };
         let (events, event_receiver) = async_channel::unbounded();
         if let Err(error) = std::thread::Builder::new()
@@ -807,7 +781,8 @@ impl BundleEditor {
         self.export_progress = 0.0;
         self.export_error = None;
         self.exported_path = None;
-        self.export_destination = Some(output);
+        self.bundle.export_settings.destination = Some(output);
+        self.save_bundle();
         cx.notify();
 
         cx.spawn(async move |editor, cx| {
@@ -1057,9 +1032,11 @@ impl BundleEditor {
             .timeline_view_duration_secs
             .min(timeline_extent_secs)
             .max(0.0);
-        let target_view_start_secs = self
-            .timeline_view_start_secs
-            .min((timeline_extent_secs - target_view_duration_secs).max(0.0));
+        let target_view_start_secs = clamp_timeline_view_start(
+            self.timeline_view_start_secs,
+            target_view_duration_secs,
+            timeline_extent_secs,
+        );
         self.request_preview();
         self.request_zoom_target();
         self.save_bundle();
@@ -1189,9 +1166,11 @@ impl BundleEditor {
             .timeline_view_duration_secs
             .min(timeline_extent_secs)
             .max(0.0);
-        self.timeline_view_start_secs = self
-            .timeline_view_start_secs
-            .min((timeline_extent_secs - self.timeline_view_duration_secs).max(0.0));
+        self.timeline_view_start_secs = clamp_timeline_view_start(
+            self.timeline_view_start_secs,
+            self.timeline_view_duration_secs,
+            timeline_extent_secs,
+        );
         self.current_time_secs = timeline_start.min(self.duration_secs);
         self.cursor_time_secs = None;
         if self.duration_secs == 0.0 {
@@ -1285,8 +1264,11 @@ impl BundleEditor {
             (0.0, timeline_extent_secs)
         } else {
             (
-                self.timeline_view_start_secs
-                    .min((timeline_extent_secs - self.timeline_view_duration_secs).max(0.0)),
+                clamp_timeline_view_start(
+                    self.timeline_view_start_secs,
+                    self.timeline_view_duration_secs,
+                    timeline_extent_secs,
+                ),
                 self.timeline_view_duration_secs,
             )
         };
@@ -1644,10 +1626,49 @@ impl BundleEditor {
 
     fn open_crop_dialog(&mut self, cx: &mut Context<Self>) {
         self.stop_playback();
+        self.close_aspect_ratio_dropdown(cx);
         self.crop_draft = self.bundle.screen_crop.unwrap_or(ScreenCrop::FULL);
         self.crop_drag = None;
         self.crop_dialog_open = true;
         self.request_preview();
+        cx.notify();
+    }
+
+    fn toggle_aspect_ratio_dropdown(&mut self, cx: &mut Context<Self>) {
+        if self.aspect_ratio_dropdown_open {
+            self.close_aspect_ratio_dropdown(cx);
+            return;
+        }
+        self.aspect_ratio_dropdown_transition =
+            self.aspect_ratio_dropdown_transition.saturating_add(1);
+        self.aspect_ratio_dropdown_visible = true;
+        self.aspect_ratio_dropdown_open = true;
+        cx.notify();
+    }
+
+    fn close_aspect_ratio_dropdown(&mut self, cx: &mut Context<Self>) {
+        if !self.aspect_ratio_dropdown_visible || !self.aspect_ratio_dropdown_open {
+            return;
+        }
+        self.aspect_ratio_dropdown_transition =
+            self.aspect_ratio_dropdown_transition.saturating_add(1);
+        let transition = self.aspect_ratio_dropdown_transition;
+        self.aspect_ratio_dropdown_open = false;
+        let editor = cx.entity().downgrade();
+        cx.spawn(async move |_, cx| {
+            cx.background_executor()
+                .timer(DROPDOWN_ANIMATION_DURATION)
+                .await;
+            let _ = editor.update(cx, |editor, cx| {
+                if !editor.aspect_ratio_dropdown_open
+                    && editor.aspect_ratio_dropdown_transition == transition
+                {
+                    editor.aspect_ratio_dropdown_visible = false;
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
         cx.notify();
     }
 
@@ -1923,13 +1944,12 @@ impl BundleEditor {
             playback_generation: self.playback_generation,
             timeline_time_secs: time_secs,
             time_secs: source_time_secs,
-            background_type: self.background_type,
+            background_type: self.bundle.appearance.background_type,
             background_preset: self.background_preset,
-            padding: self.background_padding,
+            padding: self.bundle.appearance.padding,
             aspect_ratio: self.bundle.output_aspect_ratio,
-            border_radius: self.border_radius,
-            shadow: self.shadow,
-            corner_style: self.corner_style,
+            border_radius: self.bundle.appearance.border_radius,
+            shadow: self.bundle.appearance.shadow,
             zoom: zoom_transform_at(&self.bundle.zoom_segments, time_secs),
             camera_layout: self.bundle.camera_layout,
             screen_crop: self.bundle.screen_crop,
@@ -1961,9 +1981,9 @@ impl BundleEditor {
         }
         let fraction = ((position - bounds.origin.x) / bounds.size.width).clamp(0.0, 1.0);
         match kind {
-            SliderKind::Padding => self.background_padding = (fraction * 50.0).round(),
-            SliderKind::Radius => self.border_radius = (fraction * 50.0).round(),
-            SliderKind::Shadow => self.shadow = (fraction * 50.0).round(),
+            SliderKind::Padding => self.bundle.appearance.padding = (fraction * 50.0).round(),
+            SliderKind::Radius => self.bundle.appearance.border_radius = (fraction * 50.0).round(),
+            SliderKind::Shadow => self.bundle.appearance.shadow = (fraction * 50.0).round(),
             SliderKind::CameraSize => self.bundle.camera_layout.size = (fraction * 50.0).round(),
             SliderKind::CameraPadding => {
                 self.bundle.camera_layout.edge_padding = (fraction * 50.0).round();
@@ -1985,8 +2005,11 @@ impl BundleEditor {
                 let view_center_secs =
                     self.timeline_view_start_secs + self.timeline_view_duration_secs * 0.5;
                 self.timeline_view_duration_secs = view_duration_secs;
-                self.timeline_view_start_secs = (view_center_secs - view_duration_secs * 0.5)
-                    .clamp(0.0, timeline_duration_secs - view_duration_secs);
+                self.timeline_view_start_secs = clamp_timeline_view_start(
+                    view_center_secs - view_duration_secs * 0.5,
+                    view_duration_secs,
+                    timeline_duration_secs,
+                );
                 self.video_timeline_resize_generation += 1;
                 self.video_timeline_resize_animation = None;
                 cx.notify();
@@ -2109,7 +2132,7 @@ impl BundleEditor {
         value: BackgroundType,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let selected = self.background_type == value;
+        let selected = self.bundle.appearance.background_type == value;
         div()
             .id(format!("background-type-{label}"))
             .flex_1()
@@ -2138,7 +2161,8 @@ impl BundleEditor {
                 theme::TEXT_MUTED
             }))
             .on_click(cx.listener(move |editor, _, _, cx| {
-                editor.background_type = value;
+                editor.bundle.appearance.background_type = value;
+                editor.save_bundle();
                 editor.request_preview();
                 cx.notify();
             }))
@@ -2146,8 +2170,9 @@ impl BundleEditor {
     }
 
     fn background_preset(&self, index: usize, path: PathBuf, cx: &mut Context<Self>) -> AnyElement {
-        let selected =
-            self.background_type == BackgroundType::Image && self.background_preset == index;
+        let selected = self.bundle.appearance.background_type == BackgroundType::Image
+            && self.background_preset == index;
+        let name = self.background_images[index].name.clone();
         div()
             .id(format!("background-preset-{index}"))
             .size(px(43.0))
@@ -2162,8 +2187,10 @@ impl BundleEditor {
             }))
             .cursor_pointer()
             .on_click(cx.listener(move |editor, _, _, cx| {
-                editor.background_type = BackgroundType::Image;
+                editor.bundle.appearance.background_type = BackgroundType::Image;
+                editor.bundle.appearance.background_image = name.clone();
                 editor.background_preset = index;
+                editor.save_bundle();
                 editor.request_preview();
                 cx.notify();
             }))
@@ -2182,60 +2209,6 @@ impl BundleEditor {
             rows.push(row);
         }
         div().flex().flex_col().gap_1().children(rows)
-    }
-
-    fn corner_option(
-        &self,
-        label: &'static str,
-        value: CornerStyle,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
-        let selected = self.corner_style == value;
-        let sample = div().w(px(24.0)).h(px(16.0)).bg(rgb(if selected {
-            theme::TEXT
-        } else {
-            theme::TEXT_MUTED
-        }));
-        let sample = match value {
-            CornerStyle::Circular => sample.rounded_full(),
-            CornerStyle::Squircle => sample.rounded(px(5.0)),
-        };
-        div()
-            .id(format!("corner-style-{label}"))
-            .flex_1()
-            .h(px(52.0))
-            .flex()
-            .flex_col()
-            .items_center()
-            .justify_center()
-            .gap_1()
-            .rounded_sm()
-            .bg(rgb(if selected {
-                theme::CONTROL_ACTIVE
-            } else {
-                theme::CONTROL_BACKGROUND
-            }))
-            .border_1()
-            .border_color(rgb(if selected {
-                theme::BORDER
-            } else {
-                theme::BORDER_SUBTLE
-            }))
-            .hover(|option| option.bg(rgb(theme::CONTROL_HOVER)))
-            .cursor_pointer()
-            .text_xs()
-            .text_color(rgb(if selected {
-                theme::TEXT
-            } else {
-                theme::TEXT_MUTED
-            }))
-            .on_click(cx.listener(move |editor, _, _, cx| {
-                editor.corner_style = value;
-                editor.request_preview();
-                cx.notify();
-            }))
-            .child(sample)
-            .child(label)
     }
 
     fn zoom_value_option(
@@ -2272,42 +2245,35 @@ impl BundleEditor {
             .into_any_element()
     }
 
-    fn aspect_ratio_option(
-        &self,
-        label: &'static str,
-        value: OutputAspectRatio,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        self.zoom_value_option(
-            label,
-            self.bundle.output_aspect_ratio == value,
-            cx,
-            move |editor, cx| {
-                editor.bundle.output_aspect_ratio = value;
-                editor.save_bundle();
-                editor.request_preview();
-                cx.notify();
-            },
-        )
-    }
-
-    fn camera_position_option(
-        &self,
-        label: &'static str,
-        value: CameraPosition,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        self.zoom_value_option(
-            label,
-            self.bundle.camera_layout.position == value,
-            cx,
-            move |editor, cx| {
+    fn camera_position_option(&self, value: CameraPosition, cx: &mut Context<Self>) -> AnyElement {
+        let selected = self.bundle.camera_layout.position == value;
+        div()
+            .id(format!("camera-position-{value:?}"))
+            .flex_1()
+            .h_full()
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded_sm()
+            .hover(|option| option.bg(rgb(theme::CONTROL_HOVER)))
+            .cursor_pointer()
+            .on_click(cx.listener(move |editor, _, _, cx| {
                 editor.bundle.camera_layout.position = value;
                 editor.save_bundle();
                 editor.request_preview();
                 cx.notify();
-            },
-        )
+            }))
+            .child(
+                div()
+                    .size(px(if selected { 10.0 } else { 7.0 }))
+                    .rounded_full()
+                    .bg(rgb(if selected {
+                        theme::SELECTION
+                    } else {
+                        theme::TEXT_MUTED
+                    })),
+            )
+            .into_any_element()
     }
 
     fn camera_crop_option(
@@ -2732,6 +2698,208 @@ impl BundleEditor {
             )
     }
 
+    fn sidebar_tab(
+        &self,
+        label: &'static str,
+        tab: SidebarTab,
+        cx: &mut Context<Self>,
+    ) -> gpui::Stateful<Div> {
+        let selected = self.sidebar_tab == tab;
+        div()
+            .id(format!("sidebar-tab-{label}"))
+            .flex_1()
+            .h(px(30.0))
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded_sm()
+            .bg(rgb(if selected {
+                theme::CONTROL_ACTIVE
+            } else {
+                theme::PANEL_BACKGROUND
+            }))
+            .text_xs()
+            .text_color(rgb(if selected {
+                theme::TEXT
+            } else {
+                theme::TEXT_MUTED
+            }))
+            .hover(|tab| tab.bg(rgb(theme::CONTROL_HOVER)))
+            .cursor_pointer()
+            .on_click(cx.listener(move |editor, _, _, cx| {
+                editor.sidebar_tab = tab;
+                cx.notify();
+            }))
+            .child(label)
+    }
+
+    fn screen_sidebar(&self, cx: &mut Context<Self>) -> Div {
+        div()
+            .flex()
+            .flex_col()
+            .gap_5()
+            .child(
+                div()
+                    .text_xs()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .child("Background"),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(theme::TEXT_MUTED))
+                            .child("Type"),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .gap_1()
+                            .child(self.background_option("Color", BackgroundType::Color, cx))
+                            .child(self.background_option("Image", BackgroundType::Image, cx))
+                            .child(self.background_option(
+                                "Gradient",
+                                BackgroundType::Gradient,
+                                cx,
+                            )),
+                    )
+                    .when(
+                        self.bundle.appearance.background_type == BackgroundType::Image,
+                        |section| section.child(self.background_presets(cx)),
+                    ),
+            )
+            .child(self.percentage_slider(
+                "Padding",
+                self.bundle.appearance.padding,
+                SliderKind::Padding,
+                Rc::clone(&self.padding_slider_bounds),
+                cx,
+            ))
+            .child(self.percentage_slider(
+                "Border radius",
+                self.bundle.appearance.border_radius,
+                SliderKind::Radius,
+                Rc::clone(&self.radius_slider_bounds),
+                cx,
+            ))
+            .child(self.percentage_slider(
+                "Shadow",
+                self.bundle.appearance.shadow,
+                SliderKind::Shadow,
+                Rc::clone(&self.shadow_slider_bounds),
+                cx,
+            ))
+    }
+
+    fn camera_sidebar(&self, cx: &mut Context<Self>) -> Div {
+        div()
+            .flex()
+            .flex_col()
+            .gap_5()
+            .child(self.percentage_slider(
+                "Size",
+                self.bundle.camera_layout.size,
+                SliderKind::CameraSize,
+                Rc::clone(&self.camera_size_slider_bounds),
+                cx,
+            ))
+            .child(self.percentage_slider(
+                "Edge padding",
+                self.bundle.camera_layout.edge_padding,
+                SliderKind::CameraPadding,
+                Rc::clone(&self.camera_padding_slider_bounds),
+                cx,
+            ))
+            .child(self.percentage_slider(
+                "Zoom reduction",
+                self.bundle.camera_layout.zoom_size_reduction,
+                SliderKind::CameraZoomReduction,
+                Rc::clone(&self.camera_zoom_reduction_slider_bounds),
+                cx,
+            ))
+            .child(self.percentage_slider(
+                "Shadow",
+                self.bundle.camera_layout.shadow,
+                SliderKind::CameraShadow,
+                Rc::clone(&self.camera_shadow_slider_bounds),
+                cx,
+            ))
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(theme::TEXT_MUTED))
+                            .child("Shape"),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .gap_1()
+                            .child(self.camera_crop_option("Circle", CameraCrop::Circle, cx))
+                            .child(self.camera_crop_option("Square", CameraCrop::Squircle, cx))
+                            .child(self.camera_crop_option("Full", CameraCrop::Squirectangle, cx)),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(theme::TEXT_MUTED))
+                            .child("Position"),
+                    )
+                    .child(
+                        div()
+                            .w_full()
+                            .h(px(96.0))
+                            .flex()
+                            .flex_col()
+                            .p_1()
+                            .rounded_lg()
+                            .border_1()
+                            .border_color(rgb(theme::BORDER_SUBTLE))
+                            .bg(rgb(theme::CONTROL_BACKGROUND))
+                            .children(
+                                [
+                                    [
+                                        CameraPosition::TopLeft,
+                                        CameraPosition::TopCenter,
+                                        CameraPosition::TopRight,
+                                    ],
+                                    [
+                                        CameraPosition::MiddleLeft,
+                                        CameraPosition::Center,
+                                        CameraPosition::MiddleRight,
+                                    ],
+                                    [
+                                        CameraPosition::BottomLeft,
+                                        CameraPosition::BottomCenter,
+                                        CameraPosition::BottomRight,
+                                    ],
+                                ]
+                                .map(|row| {
+                                    div().flex_1().flex().children(
+                                        row.map(|position| {
+                                            self.camera_position_option(position, cx)
+                                        }),
+                                    )
+                                }),
+                            ),
+                    ),
+            )
+    }
+
     fn sidebar(&self, cx: &mut Context<Self>) -> AnyElement {
         if self.selected_zoom().is_some() {
             return self.zoom_sidebar(cx).into_any_element();
@@ -2745,353 +2913,47 @@ impl BundleEditor {
             .iter()
             .enumerate()
             .any(|(index, input)| input_is_camera(input, index));
+        let active_tab = if !has_camera && self.sidebar_tab == SidebarTab::Camera {
+            SidebarTab::Screen
+        } else {
+            self.sidebar_tab
+        };
+        let content = match active_tab {
+            SidebarTab::Screen => self.screen_sidebar(cx).into_any_element(),
+            SidebarTab::Camera => self.camera_sidebar(cx).into_any_element(),
+        };
+
         div()
             .id("editor-sidebar")
             .w(SIDEBAR_WIDTH)
             .h_full()
             .flex_none()
-            .p_4()
             .flex()
             .flex_col()
-            .gap_5()
-            .overflow_y_scroll()
             .bg(rgb(theme::PANEL_BACKGROUND))
             .border_l_1()
             .border_color(rgb(theme::BORDER_SUBTLE))
             .child(
                 div()
+                    .p_2()
                     .flex()
-                    .flex_col()
-                    .gap_5()
-                    .child(
-                        div()
-                            .text_sm()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .child("Timeline"),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .gap_2()
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(rgb(theme::TEXT_MUTED))
-                                    .child("Resize behavior"),
-                            )
-                            .child(
-                                div()
-                                    .flex()
-                                    .gap_1()
-                                    .child(self.zoom_value_option(
-                                        "Ghost",
-                                        self.bundle.video_segment_resize_mode
-                                            == VideoSegmentResizeMode::Ghost,
-                                        cx,
-                                        |editor, cx| {
-                                            editor.bundle.video_segment_resize_mode =
-                                                VideoSegmentResizeMode::Ghost;
-                                            editor.save_bundle();
-                                            cx.notify();
-                                        },
-                                    ))
-                                    .child(self.zoom_value_option(
-                                        "Live",
-                                        self.bundle.video_segment_resize_mode
-                                            == VideoSegmentResizeMode::Live,
-                                        cx,
-                                        |editor, cx| {
-                                            editor.bundle.video_segment_resize_mode =
-                                                VideoSegmentResizeMode::Live;
-                                            editor.save_bundle();
-                                            cx.notify();
-                                        },
-                                    )),
-                            ),
-                    ),
+                    .gap_1()
+                    .border_b_1()
+                    .border_color(rgb(theme::BORDER_SUBTLE))
+                    .child(self.sidebar_tab("Screen", SidebarTab::Screen, cx))
+                    .when(has_camera, |tabs| {
+                        tabs.child(self.sidebar_tab("Camera", SidebarTab::Camera, cx))
+                    }),
             )
             .child(
                 div()
-                    .flex()
-                    .flex_col()
-                    .gap_5()
-                    .child(
-                        div()
-                            .text_sm()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .child("Output"),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .gap_2()
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(rgb(theme::TEXT_MUTED))
-                                    .child("Aspect ratio"),
-                            )
-                            .child(
-                                div()
-                                    .flex()
-                                    .gap_1()
-                                    .child(self.aspect_ratio_option(
-                                        "Auto",
-                                        OutputAspectRatio::Auto,
-                                        cx,
-                                    ))
-                                    .child(self.aspect_ratio_option(
-                                        "16:9",
-                                        OutputAspectRatio::Wide,
-                                        cx,
-                                    ))
-                                    .child(self.aspect_ratio_option(
-                                        "9:16",
-                                        OutputAspectRatio::Vertical,
-                                        cx,
-                                    )),
-                            )
-                            .child(
-                                div()
-                                    .flex()
-                                    .gap_1()
-                                    .child(self.aspect_ratio_option(
-                                        "1:1",
-                                        OutputAspectRatio::Square,
-                                        cx,
-                                    ))
-                                    .child(self.aspect_ratio_option(
-                                        "4:3",
-                                        OutputAspectRatio::Classic,
-                                        cx,
-                                    ))
-                                    .child(self.aspect_ratio_option(
-                                        "3:4",
-                                        OutputAspectRatio::Tall,
-                                        cx,
-                                    )),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .text_xs()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .child("Background"),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .gap_2()
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(rgb(theme::TEXT_MUTED))
-                                    .child("Type"),
-                            )
-                            .child(
-                                div()
-                                    .flex()
-                                    .gap_1()
-                                    .child(self.background_option(
-                                        "Color",
-                                        BackgroundType::Color,
-                                        cx,
-                                    ))
-                                    .child(self.background_option(
-                                        "Image",
-                                        BackgroundType::Image,
-                                        cx,
-                                    ))
-                                    .child(self.background_option(
-                                        "Gradient",
-                                        BackgroundType::Gradient,
-                                        cx,
-                                    )),
-                            )
-                            .when(self.background_type == BackgroundType::Image, |section| {
-                                section.child(self.background_presets(cx))
-                            }),
-                    )
-                    .child(self.percentage_slider(
-                        "Padding",
-                        self.background_padding,
-                        SliderKind::Padding,
-                        Rc::clone(&self.padding_slider_bounds),
-                        cx,
-                    )),
+                    .id("editor-sidebar-content")
+                    .flex_1()
+                    .min_h_0()
+                    .p_4()
+                    .overflow_y_scroll()
+                    .child(content),
             )
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap_5()
-                    .child(
-                        div()
-                            .text_sm()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .child("Screen"),
-                    )
-                    .child(self.percentage_slider(
-                        "Border radius",
-                        self.border_radius,
-                        SliderKind::Radius,
-                        Rc::clone(&self.radius_slider_bounds),
-                        cx,
-                    ))
-                    .child(self.percentage_slider(
-                        "Shadow",
-                        self.shadow,
-                        SliderKind::Shadow,
-                        Rc::clone(&self.shadow_slider_bounds),
-                        cx,
-                    ))
-                    .child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .gap_2()
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(rgb(theme::TEXT_MUTED))
-                                    .child("Corner style"),
-                            )
-                            .child(
-                                div()
-                                    .flex()
-                                    .gap_2()
-                                    .child(self.corner_option(
-                                        "Circular",
-                                        CornerStyle::Circular,
-                                        cx,
-                                    ))
-                                    .child(self.corner_option(
-                                        "Squircle",
-                                        CornerStyle::Squircle,
-                                        cx,
-                                    )),
-                            ),
-                    ),
-            )
-            .when(has_camera, |sidebar| {
-                sidebar.child(
-                    div()
-                        .flex()
-                        .flex_col()
-                        .gap_5()
-                        .child(
-                            div()
-                                .text_sm()
-                                .font_weight(FontWeight::SEMIBOLD)
-                                .child("Camera"),
-                        )
-                        .child(self.percentage_slider(
-                            "Size",
-                            self.bundle.camera_layout.size,
-                            SliderKind::CameraSize,
-                            Rc::clone(&self.camera_size_slider_bounds),
-                            cx,
-                        ))
-                        .child(self.percentage_slider(
-                            "Edge padding",
-                            self.bundle.camera_layout.edge_padding,
-                            SliderKind::CameraPadding,
-                            Rc::clone(&self.camera_padding_slider_bounds),
-                            cx,
-                        ))
-                        .child(self.percentage_slider(
-                            "Zoom reduction",
-                            self.bundle.camera_layout.zoom_size_reduction,
-                            SliderKind::CameraZoomReduction,
-                            Rc::clone(&self.camera_zoom_reduction_slider_bounds),
-                            cx,
-                        ))
-                        .child(self.percentage_slider(
-                            "Shadow",
-                            self.bundle.camera_layout.shadow,
-                            SliderKind::CameraShadow,
-                            Rc::clone(&self.camera_shadow_slider_bounds),
-                            cx,
-                        ))
-                        .child(
-                            div()
-                                .flex()
-                                .flex_col()
-                                .gap_2()
-                                .child(
-                                    div()
-                                        .text_xs()
-                                        .text_color(rgb(theme::TEXT_MUTED))
-                                        .child("Crop"),
-                                )
-                                .child(
-                                    div()
-                                        .flex()
-                                        .gap_1()
-                                        .child(self.camera_crop_option(
-                                            "Circle",
-                                            CameraCrop::Circle,
-                                            cx,
-                                        ))
-                                        .child(self.camera_crop_option(
-                                            "Squircle",
-                                            CameraCrop::Squircle,
-                                            cx,
-                                        )),
-                                )
-                                .child(div().flex().child(self.camera_crop_option(
-                                    "Squirectangle",
-                                    CameraCrop::Squirectangle,
-                                    cx,
-                                ))),
-                        )
-                        .child(
-                            div()
-                                .flex()
-                                .flex_col()
-                                .gap_2()
-                                .child(
-                                    div()
-                                        .text_xs()
-                                        .text_color(rgb(theme::TEXT_MUTED))
-                                        .child("Position"),
-                                )
-                                .child(
-                                    div()
-                                        .flex()
-                                        .gap_1()
-                                        .child(self.camera_position_option(
-                                            "Top left",
-                                            CameraPosition::TopLeft,
-                                            cx,
-                                        ))
-                                        .child(self.camera_position_option(
-                                            "Top right",
-                                            CameraPosition::TopRight,
-                                            cx,
-                                        )),
-                                )
-                                .child(
-                                    div()
-                                        .flex()
-                                        .gap_1()
-                                        .child(self.camera_position_option(
-                                            "Bottom left",
-                                            CameraPosition::BottomLeft,
-                                            cx,
-                                        ))
-                                        .child(self.camera_position_option(
-                                            "Bottom right",
-                                            CameraPosition::BottomRight,
-                                            cx,
-                                        )),
-                                ),
-                        ),
-                )
-            })
             .into_any_element()
     }
 
@@ -3133,6 +2995,223 @@ impl BundleEditor {
             .on_click(cx.listener(move |editor, _, _, cx| on_click(editor, cx)))
             .child(label)
             .into_any_element()
+    }
+
+    fn aspect_ratio_dropdown_option(
+        &self,
+        label: &'static str,
+        value: OutputAspectRatio,
+        cx: &mut Context<Self>,
+    ) -> gpui::Stateful<Div> {
+        let selected = self.bundle.output_aspect_ratio == value;
+        dropdown_option(
+            format!("aspect-ratio-dropdown-{label}"),
+            selected,
+            Self::aspect_ratio_dropdown_style(),
+        )
+        .justify_between()
+        .on_click(cx.listener(move |editor, _, _, cx| {
+            editor.bundle.output_aspect_ratio = value;
+            editor.close_aspect_ratio_dropdown(cx);
+            editor.save_bundle();
+            editor.request_preview();
+            cx.notify();
+        }))
+        .child(label)
+        .when(selected, |item| {
+            item.child(
+                svg()
+                    .size(px(14.0))
+                    .path(CHECK)
+                    .text_color(rgb(theme::TEXT_MUTED)),
+            )
+        })
+    }
+
+    fn aspect_ratio_dropdown_style() -> DropdownStyle {
+        DropdownStyle {
+            control_background: theme::CONTROL_BACKGROUND,
+            control_hover: theme::CONTROL_HOVER,
+            control_active: theme::CONTROL_ACTIVE,
+            border_subtle: theme::BORDER_SUBTLE,
+            border: theme::BORDER,
+            text_muted: theme::TEXT_MUTED,
+            trigger_full_width: true,
+            trigger_height: px(26.0),
+            menu_top: px(30.0),
+            option_height: px(24.0),
+            menu_shadow: true,
+            ..DropdownStyle::default()
+        }
+    }
+
+    fn aspect_ratio_dropdown(&self, cx: &mut Context<Self>) -> Div {
+        let current = match self.bundle.output_aspect_ratio {
+            OutputAspectRatio::Auto => "Auto",
+            OutputAspectRatio::Wide => "16:9",
+            OutputAspectRatio::Vertical => "9:16",
+            OutputAspectRatio::Square => "1:1",
+            OutputAspectRatio::Classic => "4:3",
+            OutputAspectRatio::Tall => "3:4",
+        };
+        let style = Self::aspect_ratio_dropdown_style();
+        let opening = self.aspect_ratio_dropdown_open;
+        let transition = self.aspect_ratio_dropdown_transition;
+        let trigger = dropdown_trigger("aspect-ratio-dropdown", style)
+            .px_3()
+            .rounded_md()
+            .bg(rgb(theme::PANEL_BACKGROUND))
+            .border_color(rgb(theme::BORDER))
+            .shadow_sm()
+            .text_xs()
+            .on_click(cx.listener(|editor, _, _, cx| {
+                editor.toggle_aspect_ratio_dropdown(cx);
+            }))
+            .child(
+                svg()
+                    .size(px(14.0))
+                    .path(SHAPE_FRAME)
+                    .text_color(rgb(theme::TEXT_MUTED)),
+            )
+            .child(div().text_color(rgb(theme::TEXT_MUTED)).child(current))
+            .child(dropdown_chevron(CHEVRON_DOWN, opening, transition, style));
+        let mut dropdown = div().relative().w(px(104.0)).child(trigger);
+        if self.aspect_ratio_dropdown_visible {
+            let menu = dropdown_menu(
+                "aspect-ratio-dropdown-menu",
+                opening,
+                transition,
+                style,
+                [
+                    self.aspect_ratio_dropdown_option("Auto", OutputAspectRatio::Auto, cx)
+                        .into_any_element(),
+                    self.aspect_ratio_dropdown_option("16:9", OutputAspectRatio::Wide, cx)
+                        .into_any_element(),
+                    self.aspect_ratio_dropdown_option("9:16", OutputAspectRatio::Vertical, cx)
+                        .into_any_element(),
+                    self.aspect_ratio_dropdown_option("1:1", OutputAspectRatio::Square, cx)
+                        .into_any_element(),
+                    self.aspect_ratio_dropdown_option("4:3", OutputAspectRatio::Classic, cx)
+                        .into_any_element(),
+                    self.aspect_ratio_dropdown_option("3:4", OutputAspectRatio::Tall, cx)
+                        .into_any_element(),
+                ],
+            );
+            dropdown = dropdown.child(deferred(menu).priority(2));
+        }
+        dropdown
+    }
+
+    fn settings_dialog(&self, cx: &mut Context<Self>) -> Div {
+        div()
+            .absolute()
+            .inset_0()
+            .flex()
+            .items_center()
+            .justify_center()
+            .bg(rgba(0x0000_00a8))
+            .child(
+                div()
+                    .id("editor-settings-dialog")
+                    .w(px(430.0))
+                    .p_5()
+                    .flex()
+                    .flex_col()
+                    .gap_5()
+                    .rounded_lg()
+                    .bg(rgb(theme::PANEL_BACKGROUND))
+                    .border_1()
+                    .border_color(rgb(theme::BORDER))
+                    .shadow_lg()
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .child(
+                                div()
+                                    .text_lg()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .child("Editor settings"),
+                            )
+                            .child(
+                                div()
+                                    .id("close-editor-settings")
+                                    .px_2()
+                                    .py_1()
+                                    .rounded_md()
+                                    .hover(|button| button.bg(rgb(theme::CONTROL_HOVER)))
+                                    .cursor_pointer()
+                                    .text_color(rgb(theme::TEXT_MUTED))
+                                    .on_click(cx.listener(|editor, _, _, cx| {
+                                        editor.settings_dialog_open = false;
+                                        cx.notify();
+                                    }))
+                                    .child("Close"),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_3()
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .child("Timeline"),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .gap_2()
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(rgb(theme::TEXT_MUTED))
+                                            .child("Resize behavior"),
+                                    )
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .gap_2()
+                                            .child(self.zoom_value_option(
+                                                "Ghost",
+                                                self.bundle.video_segment_resize_mode
+                                                    == VideoSegmentResizeMode::Ghost,
+                                                cx,
+                                                |editor, cx| {
+                                                    editor.bundle.video_segment_resize_mode =
+                                                        VideoSegmentResizeMode::Ghost;
+                                                    editor.save_bundle();
+                                                    cx.notify();
+                                                },
+                                            ))
+                                            .child(self.zoom_value_option(
+                                                "Live",
+                                                self.bundle.video_segment_resize_mode
+                                                    == VideoSegmentResizeMode::Live,
+                                                cx,
+                                                |editor, cx| {
+                                                    editor.bundle.video_segment_resize_mode =
+                                                        VideoSegmentResizeMode::Live;
+                                                    editor.save_bundle();
+                                                    cx.notify();
+                                                },
+                                            )),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(rgb(theme::TEXT_DIM))
+                                            .child(
+                                                "Choose whether adjacent clips move while resizing or after the edit.",
+                                            ),
+                                    ),
+                            ),
+                    ),
+            )
     }
 
     fn crop_dialog(&self, cx: &mut Context<Self>) -> Div {
@@ -3280,12 +3359,14 @@ impl BundleEditor {
                             .flex()
                             .items_center()
                             .justify_between()
-                            .child(crop_dialog_button("full-crop", "Full screen").on_click(
-                                cx.listener(|editor, _, _, cx| {
-                                    editor.crop_draft = ScreenCrop::FULL;
-                                    cx.notify();
-                                }),
-                            ))
+                            .child(
+                                crop_dialog_button("full-crop", "Reset").on_click(cx.listener(
+                                    |editor, _, _, cx| {
+                                        editor.crop_draft = ScreenCrop::FULL;
+                                        cx.notify();
+                                    },
+                                )),
+                            )
                             .child(
                                 div()
                                     .flex()
@@ -3311,13 +3392,15 @@ impl BundleEditor {
 
     fn export_dialog(&self, cx: &mut Context<Self>) -> Div {
         let destination = self
-            .export_destination
+            .bundle
+            .export_settings
+            .destination
             .as_deref()
             .and_then(Path::file_name)
             .and_then(|name| name.to_str())
             .unwrap_or("Choose a file...")
             .to_owned();
-        let can_export = self.export_destination.is_some() && !self.exporting;
+        let can_export = self.bundle.export_settings.destination.is_some() && !self.exporting;
         let exported_path = self.exported_path.clone();
 
         div()
@@ -3378,22 +3461,24 @@ impl BundleEditor {
                             .child(self.export_option(
                                 "export-format-mp4",
                                 "MP4 (H.264)",
-                                self.export_format == ExportFormat::Mp4,
+                                self.bundle.export_settings.format == ExportFormat::Mp4,
                                 cx,
                                 |editor, cx| {
-                                    editor.export_format = ExportFormat::Mp4;
+                                    editor.bundle.export_settings.format = ExportFormat::Mp4;
                                     editor.exported_path = None;
+                                    editor.save_bundle();
                                     cx.notify();
                                 },
                             ))
                             .child(self.export_option(
                                 "export-format-mov",
                                 "MOV (H.264)",
-                                self.export_format == ExportFormat::Mov,
+                                self.bundle.export_settings.format == ExportFormat::Mov,
                                 cx,
                                 |editor, cx| {
-                                    editor.export_format = ExportFormat::Mov;
+                                    editor.bundle.export_settings.format = ExportFormat::Mov;
                                     editor.exported_path = None;
+                                    editor.save_bundle();
                                     cx.notify();
                                 },
                             )),
@@ -3406,22 +3491,26 @@ impl BundleEditor {
                             .child(self.export_option(
                                 "export-resolution-1080",
                                 "1080p",
-                                self.export_resolution == ExportResolution::P1080,
+                                self.bundle.export_settings.resolution == ExportResolution::P1080,
                                 cx,
                                 |editor, cx| {
-                                    editor.export_resolution = ExportResolution::P1080;
+                                    editor.bundle.export_settings.resolution =
+                                        ExportResolution::P1080;
                                     editor.exported_path = None;
+                                    editor.save_bundle();
                                     cx.notify();
                                 },
                             ))
                             .child(self.export_option(
                                 "export-resolution-720",
                                 "720p",
-                                self.export_resolution == ExportResolution::P720,
+                                self.bundle.export_settings.resolution == ExportResolution::P720,
                                 cx,
                                 |editor, cx| {
-                                    editor.export_resolution = ExportResolution::P720;
+                                    editor.bundle.export_settings.resolution =
+                                        ExportResolution::P720;
                                     editor.exported_path = None;
+                                    editor.save_bundle();
                                     cx.notify();
                                 },
                             )),
@@ -3434,22 +3523,24 @@ impl BundleEditor {
                             .child(self.export_option(
                                 "export-fps-30",
                                 "30 fps",
-                                self.export_fps == 30,
+                                self.bundle.export_settings.fps == 30,
                                 cx,
                                 |editor, cx| {
-                                    editor.export_fps = 30;
+                                    editor.bundle.export_settings.fps = 30;
                                     editor.exported_path = None;
+                                    editor.save_bundle();
                                     cx.notify();
                                 },
                             ))
                             .child(self.export_option(
                                 "export-fps-60",
                                 "60 fps",
-                                self.export_fps == 60,
+                                self.bundle.export_settings.fps == 60,
                                 cx,
                                 |editor, cx| {
-                                    editor.export_fps = 60;
+                                    editor.bundle.export_settings.fps = 60;
                                     editor.exported_path = None;
+                                    editor.save_bundle();
                                     cx.notify();
                                 },
                             )),
@@ -3721,15 +3812,8 @@ impl BundleEditor {
             .absolute()
             .size_full(),
         );
-        let mut cut_bubbles = div().absolute().left(px(92.0)).right_0().top_0().bottom_0();
+        let mut cut_bubbles = div().absolute().inset_0();
         let video_track_top = 0.0;
-        let video_track_name = self
-            .bundle
-            .inputs
-            .iter()
-            .map(|input| input.name.as_str())
-            .collect::<Vec<_>>()
-            .join(" + ");
         if let Some((index, _)) = self.bundle.inputs.iter().enumerate().next() {
             let bounds_cell = Rc::clone(&bounds_cell);
             let uses_ghost_resize =
@@ -4002,7 +4086,7 @@ impl BundleEditor {
                     }
                 }
                 let segment_selected = self.selected_video_segment == Some(id);
-                let media = video_track_name.clone();
+                let duration_label = duration_label(draft_duration);
                 if uses_ghost_resize
                     && segment_drag.is_some()
                     && draft_duration != segment_duration
@@ -4086,7 +4170,6 @@ impl BundleEditor {
                     );
                 }
                 if let Some((start, width)) = visible_range {
-                    let label_start = (-start).max(0.0) / width;
                     let hover_group = format!("video-segment-hover-{index}-{id}");
                     let segment_element = div()
                         .id(format!("video-segment-{index}-{id}"))
@@ -4137,13 +4220,12 @@ impl BundleEditor {
                                 .child(
                                     div()
                                         .absolute()
-                                        .left(relative(label_start))
-                                        .top_0()
-                                        .bottom_0()
+                                        .inset_0()
                                         .px_3()
                                         .flex()
                                         .items_center()
-                                        .child(media),
+                                        .justify_center()
+                                        .child(duration_label),
                                 ),
                         )
                         .on_mouse_down(
@@ -4164,7 +4246,7 @@ impl BundleEditor {
                                 .top_0()
                                 .bottom_0()
                                 .w(px(12.0))
-                                .cursor_e_resize()
+                                .cursor_ew_resize()
                                 .child(
                                     div()
                                         .absolute()
@@ -4200,7 +4282,7 @@ impl BundleEditor {
                                 .top_0()
                                 .bottom_0()
                                 .w(px(12.0))
-                                .cursor_w_resize()
+                                .cursor_ew_resize()
                                 .child(
                                     div()
                                         .absolute()
@@ -4327,7 +4409,7 @@ impl BundleEditor {
                         }
                         cx.stop_propagation();
                     }))
-                    .child(cut_gap_label(gap_secs));
+                    .child(duration_label(gap_secs));
                 let bubble = match alignment {
                     VideoCropIndicatorAlignment::Start => bubble.left_0().rounded_r_full(),
                     VideoCropIndicatorAlignment::Center => bubble.left(px(-16.0)).rounded_full(),
@@ -4370,28 +4452,7 @@ impl BundleEditor {
                     cut_bubbles = cut_bubbles.child(cut_bubble);
                 }
             }
-            tracks = tracks.child(
-                div()
-                    .h(px(48.0))
-                    .flex()
-                    .items_center()
-                    .gap_3()
-                    .child(
-                        div()
-                            .id(("track-label", index))
-                            .w(px(80.0))
-                            .flex()
-                            .items_center()
-                            .justify_between()
-                            .text_xs()
-                            .text_color(rgb(theme::TEXT_MUTED))
-                            .on_click(cx.listener(move |editor, _, _, cx| {
-                                editor.select_input(index, cx);
-                            }))
-                            .child(video_track_name),
-                    )
-                    .child(video_track),
-            );
+            tracks = tracks.child(div().h(px(48.0)).flex().child(video_track));
         }
         let zoom_track_bounds = Rc::clone(&bounds_cell);
         let mut zoom_segments = div().h(px(48.0)).flex_1().relative().overflow_hidden();
@@ -4411,7 +4472,7 @@ impl BundleEditor {
             );
             let selected = self.selected_zoom == Some(id);
             if let Some((start, width)) = visible_range {
-                let label_start = (-start).max(0.0) / width;
+                let duration_label = duration_label(segment_end_secs - segment_start_secs);
                 let hover_group = format!("zoom-segment-hover-{id}");
                 let segment_element = div()
                     .id(("zoom-segment", id))
@@ -4442,13 +4503,14 @@ impl BundleEditor {
                             .child(
                                 div()
                                     .absolute()
-                                    .left(relative(label_start))
-                                    .top_0()
-                                    .bottom_0()
+                                    .inset_0()
                                     .px_2()
                                     .flex()
+                                    .flex_col()
                                     .items_center()
+                                    .justify_center()
                                     .text_xs()
+                                    .child(duration_label)
                                     .child(format!("{}x", segment.amount as u32)),
                             ),
                     )
@@ -4475,7 +4537,7 @@ impl BundleEditor {
                             .top_0()
                             .bottom_0()
                             .w(px(12.0))
-                            .cursor_e_resize()
+                            .cursor_ew_resize()
                             .child(
                                 div()
                                     .absolute()
@@ -4509,7 +4571,7 @@ impl BundleEditor {
                             .top_0()
                             .bottom_0()
                             .w(px(12.0))
-                            .cursor_w_resize()
+                            .cursor_ew_resize()
                             .child(
                                 div()
                                     .absolute()
@@ -4591,7 +4653,7 @@ impl BundleEditor {
                 view_duration_secs,
             )
         {
-            let label_start = (-start).max(0.0) / width;
+            let duration_label = duration_label(end_secs - start_secs);
             zoom_segments = zoom_segments.child(
                 div()
                     .absolute()
@@ -4615,13 +4677,14 @@ impl BundleEditor {
                             .child(
                                 div()
                                     .absolute()
-                                    .left(relative(label_start))
-                                    .top_0()
-                                    .bottom_0()
+                                    .inset_0()
                                     .px_2()
                                     .flex()
+                                    .flex_col()
                                     .items_center()
+                                    .justify_center()
                                     .text_xs()
+                                    .child(duration_label)
                                     .child("2x"),
                             ),
                     ),
@@ -4658,29 +4721,12 @@ impl BundleEditor {
                 cx.stop_propagation();
             }),
         );
-        tracks = tracks.child(
-            div()
-                .h(px(48.0))
-                .flex()
-                .items_center()
-                .gap_3()
-                .child(
-                    div()
-                        .w(px(80.0))
-                        .flex()
-                        .items_center()
-                        .justify_between()
-                        .text_xs()
-                        .text_color(rgb(theme::TEXT_MUTED))
-                        .child("Zoom"),
-                )
-                .child(zoom_segments),
-        );
+        tracks = tracks.child(div().h(px(48.0)).flex().child(zoom_segments));
         tracks = tracks.when_some(preview_fraction, |tracks, fraction| {
             tracks.child(
                 div()
                     .absolute()
-                    .left(px(92.0))
+                    .left_0()
                     .right_0()
                     .top(px(-4.0))
                     .bottom(px(-8.0))
@@ -4736,7 +4782,7 @@ impl BundleEditor {
             tracks.child(
                 div()
                     .absolute()
-                    .left(px(92.0))
+                    .left_0()
                     .right_0()
                     .top(px(-4.0))
                     .bottom(px(-8.0))
@@ -4750,7 +4796,7 @@ impl BundleEditor {
         let total_time_label = timeline_timecode(self.duration_secs, self.timeline_fps);
 
         div()
-            .p_4()
+            .pt_4()
             .pb(px(8.0))
             .flex()
             .flex_col()
@@ -4767,13 +4813,15 @@ impl BundleEditor {
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|editor, event: &MouseDownEvent, _, cx| {
+                    editor.selected_zoom = None;
+                    editor.selected_video_segment = None;
+                    cx.notify();
                     let bounds = editor.timeline_bounds.get();
                     if event.position.x >= bounds.origin.x - px(6.0) {
                         let Some(time_secs) = editor.timeline_time_at(event.position.x) else {
                             return;
                         };
                         editor.set_playback_time(time_secs);
-                        cx.notify();
                     }
                 }),
             )
@@ -4791,13 +4839,6 @@ impl BundleEditor {
                     .items_center()
                     .gap_3()
                     .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                    .child(
-                        div()
-                            .w(px(80.0))
-                            .text_xs()
-                            .text_color(rgb(theme::TEXT_DIM))
-                            .child("TIMELINE"),
-                    )
                     .child(
                         div()
                             .flex_1()
@@ -4921,7 +4962,7 @@ impl BundleEditor {
                     ),
             )
             .child(timeline_ruler(view_start_secs, view_duration_secs))
-            .child(tracks)
+            .child(div().w_full().pl_4().child(tracks))
     }
 }
 
@@ -4952,6 +4993,11 @@ impl Render for BundleEditor {
             .on_action(cx.listener(|editor, _: &crate::CloseExportDialog, _, cx| {
                 if editor.crop_dialog_open {
                     editor.close_crop_dialog(cx);
+                } else if editor.settings_dialog_open {
+                    editor.settings_dialog_open = false;
+                    cx.notify();
+                } else if editor.aspect_ratio_dropdown_open {
+                    editor.close_aspect_ratio_dropdown(cx);
                 } else if editor.export_dialog_open
                     || editor.selected_zoom.is_some()
                     || editor.selected_video_segment.is_some()
@@ -4976,7 +5022,10 @@ impl Render for BundleEditor {
                     if editor.active_slider.is_some_and(|slider| {
                         matches!(
                             slider,
-                            SliderKind::ZoomAmount
+                            SliderKind::Padding
+                                | SliderKind::Radius
+                                | SliderKind::Shadow
+                                | SliderKind::ZoomAmount
                                 | SliderKind::CameraSize
                                 | SliderKind::CameraPadding
                                 | SliderKind::CameraZoomReduction
@@ -5001,7 +5050,10 @@ impl Render for BundleEditor {
                     if editor.active_slider.is_some_and(|slider| {
                         matches!(
                             slider,
-                            SliderKind::ZoomAmount
+                            SliderKind::Padding
+                                | SliderKind::Radius
+                                | SliderKind::Shadow
+                                | SliderKind::ZoomAmount
                                 | SliderKind::CameraSize
                                 | SliderKind::CameraPadding
                                 | SliderKind::CameraZoomReduction
@@ -5032,9 +5084,9 @@ impl Render for BundleEditor {
                     .border_color(rgb(theme::BORDER_SUBTLE))
                     .child(
                         div()
-                            .id("open-crop")
+                            .id("open-editor-settings")
                             .h(px(24.0))
-                            .px_3()
+                            .px_2()
                             .flex()
                             .items_center()
                             .rounded_md()
@@ -5045,9 +5097,11 @@ impl Render for BundleEditor {
                             .cursor_pointer()
                             .text_xs()
                             .on_click(cx.listener(|editor, _, _, cx| {
-                                editor.open_crop_dialog(cx);
+                                editor.settings_dialog_open = true;
+                                editor.close_aspect_ratio_dropdown(cx);
+                                cx.notify();
                             }))
-                            .child("Crop"),
+                            .child("Settings"),
                     )
                     .child(
                         div()
@@ -5098,18 +5152,64 @@ impl Render for BundleEditor {
                         div()
                             .flex_1()
                             .min_w_0()
-                            .p_8()
-                            .flex()
-                            .items_center()
-                            .justify_center()
+                            .relative()
                             .bg(rgb(theme::CANVAS_BACKGROUND))
-                            .child(self.preview(selected)),
+                            .child(
+                                div()
+                                    .size_full()
+                                    .p_8()
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .child(self.preview(selected)),
+                            )
+                            .child(
+                                div()
+                                    .absolute()
+                                    .top(px(10.0))
+                                    .left_0()
+                                    .right_0()
+                                    .flex()
+                                    .justify_center()
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .items_start()
+                                            .gap_2()
+                                            .child(self.aspect_ratio_dropdown(cx))
+                                            .child(
+                                                div()
+                                                    .id("open-crop")
+                                                    .h(px(26.0))
+                                                    .px_3()
+                                                    .flex()
+                                                    .items_center()
+                                                    .rounded_md()
+                                                    .bg(rgb(theme::PANEL_BACKGROUND))
+                                                    .border_1()
+                                                    .border_color(rgb(theme::BORDER))
+                                                    .shadow_sm()
+                                                    .hover(|button| {
+                                                        button.bg(rgb(theme::CONTROL_HOVER))
+                                                    })
+                                                    .cursor_pointer()
+                                                    .text_xs()
+                                                    .on_click(cx.listener(|editor, _, _, cx| {
+                                                        editor.open_crop_dialog(cx);
+                                                    }))
+                                                    .child("Crop"),
+                                            ),
+                                    ),
+                            ),
                     )
                     .child(self.sidebar(cx)),
             )
             .child(self.timeline(cx))
             .when(self.crop_dialog_open, |editor| {
                 editor.child(self.crop_dialog(cx))
+            })
+            .when(self.settings_dialog_open, |editor| {
+                editor.child(self.settings_dialog(cx))
             })
             .when(self.export_dialog_open, |editor| {
                 editor.child(self.export_dialog(cx))
@@ -5350,8 +5450,8 @@ fn edit_video_cut(segments: &mut Vec<VideoSegment>, right_id: u64) -> Option<Vid
     }
 }
 
-fn cut_gap_label(gap_secs: f64) -> String {
-    let rounded = (gap_secs.max(0.0) * 10.0).round() / 10.0;
+fn duration_label(duration_secs: f64) -> String {
+    let rounded = (duration_secs.max(0.0) * 10.0).round() / 10.0;
     if rounded == 0.0 {
         "0s".to_owned()
     } else {
@@ -5686,7 +5786,6 @@ fn preview_worker(
             request.padding,
             request.border_radius,
             request.shadow,
-            request.corner_style,
             request.zoom,
             request.camera_layout,
             request.screen_crop,
@@ -5783,7 +5882,6 @@ fn render_output_frame(
     padding: f32,
     border_radius: f32,
     shadow: f32,
-    corner_style: CornerStyle,
     zoom: blip_compositor::OutputTransform,
     camera_layout: CameraLayout,
     screen_crop: Option<ScreenCrop>,
@@ -5835,7 +5933,7 @@ fn render_output_frame(
     });
     let content_transform = blip_compositor::ItemTransform::new([0.5, 0.5], content_size)
         .with_corner_radius(corner_radius)
-        .with_squircle(corner_style == CornerStyle::Squircle)
+        .with_squircle(true)
         .with_box_shadow(box_shadow);
     let output_items = [
         blip_compositor::CompositorItem {
@@ -5861,6 +5959,7 @@ fn render_output_frame(
     let Some(camera_frame) = camera_frame else {
         return Ok(output);
     };
+    let camera_is_wide = camera_frame.get_width() >= camera_frame.get_height();
     let (camera_content_rect, camera_dimensions) = camera_crop_rect(
         (camera_frame.get_width(), camera_frame.get_height()),
         camera_layout.crop,
@@ -5884,6 +5983,7 @@ fn render_output_frame(
             content: blip_compositor::CompositorItemContent::Source(1),
             transform: camera_transform(
                 camera_dimensions,
+                camera_is_wide,
                 (output_width as f64, output_height as f64),
                 camera_layout,
                 zoom.scale,
@@ -5963,7 +6063,6 @@ fn render_export(
             job.padding,
             job.border_radius,
             job.shadow,
-            job.corner_style,
             zoom_transform_at(&job.bundle.zoom_segments, timeline_time_secs),
             job.bundle.camera_layout,
             job.bundle.screen_crop,
@@ -6093,7 +6192,11 @@ fn zoom_transform_at(segments: &[ZoomSegment], time_secs: f64) -> blip_composito
         return blip_compositor::OutputTransform::IDENTITY;
     };
     let transition_secs = segment.transition.duration_secs();
-    let zoom_in = ((time_secs - segment.start_secs) / transition_secs).clamp(0.0, 1.0);
+    let zoom_in = if segment.start_secs <= 0.0 {
+        1.0
+    } else {
+        ((time_secs - segment.start_secs) / transition_secs).clamp(0.0, 1.0)
+    };
     let zoom_out =
         ((segment.end_secs + transition_secs - time_secs) / transition_secs).clamp(0.0, 1.0);
     let attack = cubic_bezier_ease(zoom_in, 0.2, 0.8, 0.2, 1.0);
@@ -6179,7 +6282,11 @@ fn bundled_backgrounds() -> Vec<BackgroundImage> {
             if cache_background(&image, image_bytes)
                 && cache_background(&thumbnail, thumbnail_bytes)
             {
-                Some(BackgroundImage { image, thumbnail })
+                Some(BackgroundImage {
+                    name: (*name).to_owned(),
+                    image,
+                    thumbnail,
+                })
             } else {
                 None
             }
@@ -6385,13 +6492,25 @@ fn zoomed_timeline_view(
         .min(timeline_duration_secs);
     let duration_secs = (view_duration_secs * (-f64::from(delta)).exp())
         .clamp(minimum_duration_secs, timeline_duration_secs);
-    let start_secs = (focal_time_secs - focal_fraction * duration_secs)
-        .clamp(0.0, timeline_duration_secs - duration_secs);
+    let start_secs = clamp_timeline_view_start(
+        focal_time_secs - focal_fraction * duration_secs,
+        duration_secs,
+        timeline_duration_secs,
+    );
     (start_secs, duration_secs)
 }
 
 fn timeline_extent_secs(duration_secs: f64) -> f64 {
-    duration_secs.max(0.0) + TIMELINE_EXPANSION_SPACE_SECS
+    duration_secs.max(0.0) + TIMELINE_TRAILING_SPACE_SECS
+}
+
+fn clamp_timeline_view_start(
+    view_start_secs: f64,
+    view_duration_secs: f64,
+    timeline_extent_secs: f64,
+) -> f64 {
+    let maximum_start_secs = (timeline_extent_secs - view_duration_secs).max(0.0);
+    view_start_secs.clamp(0.0, maximum_start_secs)
 }
 
 fn panned_timeline_view(
@@ -6400,92 +6519,88 @@ fn panned_timeline_view(
     timeline_duration_secs: f64,
     delta_fraction: f64,
 ) -> f64 {
-    (view_start_secs - delta_fraction * view_duration_secs)
-        .clamp(0.0, (timeline_duration_secs - view_duration_secs).max(0.0))
+    clamp_timeline_view_start(
+        view_start_secs - delta_fraction * view_duration_secs,
+        view_duration_secs,
+        timeline_duration_secs,
+    )
 }
 
 fn timeline_ruler(view_start_secs: f64, view_duration_secs: f64) -> Div {
-    div()
-        .h(px(24.0))
-        .flex()
-        .items_end()
-        .gap_3()
-        .child(div().w(px(80.0)))
-        .child(
-            canvas(
-                move |bounds, window, _| {
-                    let width = f64::from(bounds.size.width);
-                    if view_duration_secs <= 0.0 || width <= 0.0 {
-                        return Vec::new();
-                    }
+    div().h(px(24.0)).pl_4().flex().items_end().child(
+        canvas(
+            move |bounds, window, _| {
+                let width = f64::from(bounds.size.width);
+                if view_duration_secs <= 0.0 || width <= 0.0 {
+                    return Vec::new();
+                }
 
-                    let interval = timeline_ruler_interval(view_duration_secs / width);
-                    let subdivisions = if interval <= 0.1 { 1 } else { 2 };
-                    let minor_interval = interval / subdivisions as f64;
-                    let first_index = (view_start_secs / minor_interval).ceil() as usize;
-                    let last_index =
-                        ((view_start_secs + view_duration_secs) / minor_interval).floor() as usize;
-                    if first_index > last_index {
-                        return Vec::new();
-                    }
-                    let mut ticks = Vec::with_capacity(last_index - first_index + 1);
-                    for index in first_index..=last_index {
-                        let time_secs = index as f64 * minor_interval;
-                        let x = bounds.left()
-                            + bounds.size.width
-                                * ((time_secs - view_start_secs) / view_duration_secs) as f32;
-                        let major = index % subdivisions == 0;
-                        let label = major.then(|| {
-                            let text: SharedString =
-                                timeline_ruler_label(time_secs, interval).into();
-                            let run = TextRun {
-                                len: text.len(),
-                                font: window.text_style().font(),
-                                color: rgb(theme::TEXT_DIM).into(),
-                                background_color: None,
-                                underline: None,
-                                strikethrough: None,
-                            };
-                            window
-                                .text_system()
-                                .shape_line(text, px(10.0), &[run], None)
-                        });
-                        ticks.push((x, major, label));
-                    }
-                    ticks
-                },
-                move |bounds, ticks, window, cx| {
+                let interval = timeline_ruler_interval(view_duration_secs / width);
+                let subdivisions = if interval <= 0.1 { 1 } else { 2 };
+                let minor_interval = interval / subdivisions as f64;
+                let first_index = (view_start_secs / minor_interval).ceil() as usize;
+                let last_index =
+                    ((view_start_secs + view_duration_secs) / minor_interval).floor() as usize;
+                if first_index > last_index {
+                    return Vec::new();
+                }
+                let mut ticks = Vec::with_capacity(last_index - first_index + 1);
+                for index in first_index..=last_index {
+                    let time_secs = index as f64 * minor_interval;
+                    let x = bounds.left()
+                        + bounds.size.width
+                            * ((time_secs - view_start_secs) / view_duration_secs) as f32;
+                    let major = index % subdivisions == 0;
+                    let label = major.then(|| {
+                        let text: SharedString = timeline_ruler_label(time_secs, interval).into();
+                        let run = TextRun {
+                            len: text.len(),
+                            font: window.text_style().font(),
+                            color: rgb(theme::TEXT_DIM).into(),
+                            background_color: None,
+                            underline: None,
+                            strikethrough: None,
+                        };
+                        window
+                            .text_system()
+                            .shape_line(text, px(10.0), &[run], None)
+                    });
+                    ticks.push((x, major, label));
+                }
+                ticks
+            },
+            move |bounds, ticks, window, cx| {
+                window.paint_quad(fill(
+                    Bounds::new(
+                        point(bounds.left(), bounds.bottom() - px(1.0)),
+                        size(bounds.size.width, px(1.0)),
+                    ),
+                    rgb(theme::BORDER_SUBTLE),
+                ));
+                for (x, major, label) in ticks {
+                    let height = if major { px(8.0) } else { px(4.0) };
                     window.paint_quad(fill(
-                        Bounds::new(
-                            point(bounds.left(), bounds.bottom() - px(1.0)),
-                            size(bounds.size.width, px(1.0)),
-                        ),
-                        rgb(theme::BORDER_SUBTLE),
+                        Bounds::new(point(x, bounds.bottom() - height), size(px(1.0), height)),
+                        rgb(theme::TEXT_DIM),
                     ));
-                    for (x, major, label) in ticks {
-                        let height = if major { px(8.0) } else { px(4.0) };
-                        window.paint_quad(fill(
-                            Bounds::new(point(x, bounds.bottom() - height), size(px(1.0), height)),
-                            rgb(theme::TEXT_DIM),
-                        ));
-                        if let Some(label) = label {
-                            let max_x = (bounds.right() - label.width()).max(bounds.left());
-                            let label_x = (x - label.width() / 2.0).clamp(bounds.left(), max_x);
-                            let _ = label.paint(
-                                point(label_x, bounds.top()),
-                                px(12.0),
-                                TextAlign::Left,
-                                None,
-                                window,
-                                cx,
-                            );
-                        }
+                    if let Some(label) = label {
+                        let max_x = (bounds.right() - label.width()).max(bounds.left());
+                        let label_x = (x - label.width() / 2.0).clamp(bounds.left(), max_x);
+                        let _ = label.paint(
+                            point(label_x, bounds.top()),
+                            px(12.0),
+                            TextAlign::Left,
+                            None,
+                            window,
+                            cx,
+                        );
                     }
-                },
-            )
-            .h_full()
-            .flex_1(),
+                }
+            },
         )
+        .h_full()
+        .flex_1(),
+    )
 }
 
 fn timeline_timecode(time_secs: f64, fps: u32) -> String {
@@ -6684,6 +6799,7 @@ fn map_output_transform_to_crop(
 
 fn camera_transform(
     source_dimensions: (f64, f64),
+    camera_is_wide: bool,
     canvas_dimensions: (f64, f64),
     layout: CameraLayout,
     zoom_scale: f32,
@@ -6691,11 +6807,17 @@ fn camera_transform(
     let zoom_progress = (zoom_scale - 1.0).clamp(0.0, 1.0);
     let reduction = layout.zoom_size_reduction.clamp(0.0, 50.0) / 100.0;
     let maximum_size = layout.size.clamp(0.0, 50.0) / 100.0 * (1.0 - reduction * zoom_progress);
-    let size = aspect_fit_size(
-        [maximum_size, maximum_size],
-        source_dimensions,
-        canvas_dimensions,
-    );
+    let source_aspect = source_dimensions.0 / source_dimensions.1.max(f64::EPSILON);
+    let fixed_extent = canvas_dimensions.0.min(canvas_dimensions.1) * f64::from(maximum_size);
+    let pixel_size = if camera_is_wide {
+        [fixed_extent * source_aspect, fixed_extent]
+    } else {
+        [fixed_extent, fixed_extent / source_aspect.max(f64::EPSILON)]
+    };
+    let size = [
+        (pixel_size[0] / canvas_dimensions.0) as f32,
+        (pixel_size[1] / canvas_dimensions.1) as f32,
+    ];
     let edge_padding = layout.edge_padding.clamp(0.0, 50.0) / 100.0
         * canvas_dimensions.0.min(canvas_dimensions.1) as f32;
     let edge_padding_x = edge_padding / canvas_dimensions.0 as f32;
@@ -6706,8 +6828,13 @@ fn camera_transform(
     let bottom = 1.0 - edge_padding_y - size[1] * 0.5;
     let center = match layout.position {
         CameraPosition::TopLeft => [left, top],
+        CameraPosition::TopCenter => [0.5, top],
         CameraPosition::TopRight => [right, top],
+        CameraPosition::MiddleLeft => [left, 0.5],
+        CameraPosition::Center => [0.5, 0.5],
+        CameraPosition::MiddleRight => [right, 0.5],
         CameraPosition::BottomLeft => [left, bottom],
+        CameraPosition::BottomCenter => [0.5, bottom],
         CameraPosition::BottomRight => [right, bottom],
     };
     let corner_radius = (f64::from(size[0]) * canvas_dimensions.0)
@@ -6740,10 +6867,7 @@ fn camera_crop_rect(
             let side = source_width.min(source_height);
             (side, side)
         }
-        CameraCrop::Squirectangle if source_width * 9 >= source_height * 16 => {
-            (source_height * 16 / 9, source_height)
-        }
-        CameraCrop::Squirectangle => (source_width, source_width * 9 / 16),
+        CameraCrop::Squirectangle => (source_width, source_height),
     };
     let crop_width = crop_width as f64;
     let crop_height = crop_height as f64;
@@ -6768,7 +6892,7 @@ mod tests {
     use super::{
         CropResizeHandle, VideoSegmentEdge, ZoomSegmentEdge, aligned_input_time, camera_crop_rect,
         camera_transform, can_split_video_segment, clamp_video_timeline_to_source_range,
-        crop_contains, cubic_bezier_ease, cut_gap_label, edit_video_cut, fit_dimensions,
+        crop_contains, cubic_bezier_ease, duration_label, edit_video_cut, fit_dimensions,
         include_timeline_fps, map_output_transform_to_crop, map_output_transform_to_item,
         normalize_screen_crop, output_dimensions, panned_timeline_view, playback_position,
         resize_video_segment_range, resize_zoom_segment_range, resized_screen_crop,
@@ -6924,8 +7048,8 @@ mod tests {
             shadow: 20.0,
             crop: CameraCrop::Squirectangle,
         };
-        let unzoomed = camera_transform((1920.0, 1080.0), (1920.0, 1080.0), layout, 1.0);
-        let zoomed = camera_transform((1920.0, 1080.0), (1920.0, 1080.0), layout, 2.0);
+        let unzoomed = camera_transform((1920.0, 1080.0), true, (1920.0, 1080.0), layout, 1.0);
+        let zoomed = camera_transform((1920.0, 1080.0), true, (1920.0, 1080.0), layout, 2.0);
 
         assert!((unzoomed.size[0] - 0.28).abs() < 0.0001);
         assert!((zoomed.size[0] - 0.14).abs() < 0.0001);
@@ -6942,13 +7066,27 @@ mod tests {
     #[test]
     fn camera_crop_matches_recording_shapes() {
         let (square, square_dimensions) = camera_crop_rect((1920, 1080), CameraCrop::Circle);
-        let (wide, wide_dimensions) = camera_crop_rect((1920, 1200), CameraCrop::Squirectangle);
+        let (full, full_dimensions) = camera_crop_rect((1920, 1200), CameraCrop::Squirectangle);
 
         assert_eq!(square_dimensions, (1080.0, 1080.0));
         assert_eq!(square.x, 420.0);
         assert_eq!(square.y, 0.0);
-        assert_eq!(wide_dimensions, (1920.0, 1080.0));
-        assert_eq!(wide.y, 60.0);
+        assert_eq!(full_dimensions, (1920.0, 1200.0));
+        assert_eq!(full.x, 0.0);
+        assert_eq!(full.y, 0.0);
+    }
+
+    #[test]
+    fn camera_shape_changes_preserve_the_orientation_extent() {
+        let layout = CameraLayout::default();
+        let canvas = (1920.0, 1080.0);
+        let wide_square = camera_transform((1.0, 1.0), true, canvas, layout, 1.0);
+        let wide_full = camera_transform((16.0, 9.0), true, canvas, layout, 1.0);
+        let tall_square = camera_transform((1.0, 1.0), false, canvas, layout, 1.0);
+        let tall_full = camera_transform((9.0, 16.0), false, canvas, layout, 1.0);
+
+        assert!((wide_square.size[1] - wide_full.size[1]).abs() < 0.0001);
+        assert!((tall_square.size[0] - tall_full.size[0]).abs() < 0.0001);
     }
 
     #[test]
@@ -7040,8 +7178,17 @@ mod tests {
     }
 
     #[test]
-    fn timeline_extent_includes_space_for_expansion() {
-        assert_eq!(timeline_extent_secs(10.0), 15.0);
+    fn zoomed_timeline_preserves_trailing_space() {
+        let view_duration_secs = 4.0;
+        let view_start_secs =
+            panned_timeline_view(0.0, view_duration_secs, timeline_extent_secs(10.0), -10.0);
+
+        assert_eq!(view_start_secs + view_duration_secs, 13.0);
+    }
+
+    #[test]
+    fn timeline_extent_includes_three_seconds_of_trailing_space() {
+        assert_eq!(timeline_extent_secs(10.0), 13.0);
     }
 
     #[test]
@@ -7225,10 +7372,10 @@ mod tests {
     }
 
     #[test]
-    fn cut_gap_labels_are_rounded_to_tenths() {
-        assert_eq!(cut_gap_label(0.0), "0s");
-        assert_eq!(cut_gap_label(1.24), "1.2s");
-        assert_eq!(cut_gap_label(1.25), "1.3s");
+    fn duration_labels_are_rounded_to_tenths() {
+        assert_eq!(duration_label(0.0), "0s");
+        assert_eq!(duration_label(1.24), "1.2s");
+        assert_eq!(duration_label(1.25), "1.3s");
     }
 
     #[test]
@@ -7377,6 +7524,26 @@ mod tests {
         assert_eq!(zoom_transform_at(&[segment.clone()], 5.0).scale, 3.0);
         assert!(zoom_transform_at(&[segment.clone()], 5.125).scale > 2.5);
         assert_eq!(zoom_transform_at(&[segment], 5.5).scale, 1.0);
+    }
+
+    #[test]
+    fn zoom_starting_at_zero_is_applied_immediately() {
+        let segment = ZoomSegment {
+            id: 1,
+            start_secs: 0.0,
+            end_secs: 3.0,
+            target: [0.25, 0.75],
+            amount: 3.0,
+            transition: ZoomTransitionSpeed::Medium,
+        };
+
+        assert_eq!(
+            zoom_transform_at(&[segment], 0.0),
+            blip_compositor::OutputTransform {
+                center: [0.25, 0.75],
+                scale: 3.0,
+            }
+        );
     }
 
     #[test]

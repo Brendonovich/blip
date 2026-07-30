@@ -11,6 +11,8 @@ pub(crate) const CORNER_CIRCLE: &str = "icons/corner-circle.svg";
 pub(crate) const CORNER_SQUIRCLE: &str = "icons/corner-squircle.svg";
 pub(crate) const SHAPE_FRAME: &str = "icons/shape-frame.svg";
 pub(crate) const CLOSE: &str = "icons/close.svg";
+pub(crate) const CHECK: &str = "icons/check.svg";
+pub(crate) const CHEVRON_DOWN: &str = "icons/chevron-down.svg";
 
 pub(crate) struct CaptureAssets;
 
@@ -25,6 +27,8 @@ impl AssetSource for CaptureAssets {
             CORNER_SQUIRCLE => Some(include_bytes!("../assets/icons/corner-squircle.svg")),
             SHAPE_FRAME => Some(include_bytes!("../assets/icons/shape-frame.svg")),
             CLOSE => Some(include_bytes!("../assets/icons/close.svg")),
+            CHECK => Some(include_bytes!("../assets/icons/check.svg")),
+            CHEVRON_DOWN => Some(include_bytes!("../assets/icons/chevron-down.svg")),
             _ => None,
         };
         Ok(bytes.map(Cow::Borrowed))
@@ -40,6 +44,8 @@ impl AssetSource for CaptureAssets {
             CORNER_SQUIRCLE,
             SHAPE_FRAME,
             CLOSE,
+            CHECK,
+            CHEVRON_DOWN,
         ]
         .into_iter()
         .filter(|asset| asset.starts_with(path))

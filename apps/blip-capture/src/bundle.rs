@@ -25,6 +25,10 @@ pub(crate) struct BlipBundle {
     pub(crate) output_aspect_ratio: OutputAspectRatio,
     #[serde(default, skip_serializing)]
     pub(crate) screen_crop: Option<ScreenCrop>,
+    #[serde(default, skip_serializing)]
+    pub(crate) appearance: ProjectAppearance,
+    #[serde(default, skip_serializing)]
+    pub(crate) export_settings: ExportSettings,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -41,6 +45,104 @@ struct ProjectConfig {
     output_aspect_ratio: OutputAspectRatio,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     screen_crop: Option<ScreenCrop>,
+    #[serde(default)]
+    appearance: ProjectAppearance,
+    #[serde(default)]
+    export_settings: ExportSettings,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum BackgroundType {
+    Color,
+    Image,
+    #[default]
+    Gradient,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub(crate) struct ProjectAppearance {
+    #[serde(default)]
+    pub(crate) background_type: BackgroundType,
+    #[serde(default = "default_background_image")]
+    pub(crate) background_image: String,
+    #[serde(default = "default_background_padding")]
+    pub(crate) padding: f32,
+    #[serde(default = "default_border_radius")]
+    pub(crate) border_radius: f32,
+    #[serde(default = "default_shadow")]
+    pub(crate) shadow: f32,
+}
+
+fn default_background_image() -> String {
+    "tahoe-dusk.jpg".into()
+}
+
+const fn default_background_padding() -> f32 {
+    8.0
+}
+
+const fn default_border_radius() -> f32 {
+    8.0
+}
+
+const fn default_shadow() -> f32 {
+    20.0
+}
+
+impl Default for ProjectAppearance {
+    fn default() -> Self {
+        Self {
+            background_type: BackgroundType::default(),
+            background_image: default_background_image(),
+            padding: default_background_padding(),
+            border_radius: default_border_radius(),
+            shadow: default_shadow(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ExportFormat {
+    #[default]
+    Mp4,
+    Mov,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ExportResolution {
+    #[default]
+    P1080,
+    P720,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct ExportSettings {
+    #[serde(default)]
+    pub(crate) format: ExportFormat,
+    #[serde(default)]
+    pub(crate) resolution: ExportResolution,
+    #[serde(default = "default_export_fps")]
+    pub(crate) fps: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) destination: Option<PathBuf>,
+}
+
+const fn default_export_fps() -> u32 {
+    30
+}
+
+impl Default for ExportSettings {
+    fn default() -> Self {
+        Self {
+            format: ExportFormat::default(),
+            resolution: ExportResolution::default(),
+            fps: default_export_fps(),
+            destination: None,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
@@ -96,8 +198,13 @@ pub(crate) enum VideoSegmentResizeMode {
 #[serde(rename_all = "snake_case")]
 pub(crate) enum CameraPosition {
     TopLeft,
+    TopCenter,
     TopRight,
+    MiddleLeft,
+    Center,
+    MiddleRight,
     BottomLeft,
+    BottomCenter,
     #[default]
     BottomRight,
 }
@@ -224,6 +331,8 @@ impl BlipBundle {
             camera_layout: CameraLayout::default(),
             output_aspect_ratio: OutputAspectRatio::default(),
             screen_crop: None,
+            appearance: ProjectAppearance::default(),
+            export_settings: ExportSettings::default(),
         };
         if let Err(error) = bundle.save_manifest(path) {
             fs::remove_dir_all(path).ok();
@@ -247,6 +356,8 @@ impl BlipBundle {
                 bundle.camera_layout = config.camera_layout;
                 bundle.output_aspect_ratio = config.output_aspect_ratio;
                 bundle.screen_crop = config.screen_crop;
+                bundle.appearance = config.appearance;
+                bundle.export_settings = config.export_settings;
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(format!("failed to read project config: {error}")),
@@ -298,6 +409,8 @@ impl BlipBundle {
             camera_layout: self.camera_layout,
             output_aspect_ratio: self.output_aspect_ratio,
             screen_crop: self.screen_crop,
+            appearance: self.appearance.clone(),
+            export_settings: self.export_settings.clone(),
         };
         let contents = serde_json::to_string_pretty(&config)
             .map_err(|error| format!("failed to encode project config: {error}"))?;
@@ -311,8 +424,9 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{
-        BlipBundle, CameraCrop, CameraLayout, CameraPosition, OutputAspectRatio, ScreenCrop,
-        VideoSegment, VideoSegmentResizeMode,
+        BackgroundType, BlipBundle, CameraCrop, CameraLayout, CameraPosition, ExportFormat,
+        ExportResolution, ExportSettings, OutputAspectRatio, PROJECT_CONFIG_FILE,
+        ProjectAppearance, ScreenCrop, VideoSegment, VideoSegmentResizeMode,
     };
 
     #[test]
@@ -348,6 +462,8 @@ mod tests {
         assert_eq!(bundle.camera_layout, CameraLayout::default());
         assert_eq!(bundle.output_aspect_ratio, OutputAspectRatio::Wide);
         assert_eq!(bundle.screen_crop, None);
+        assert_eq!(bundle.appearance, ProjectAppearance::default());
+        assert_eq!(bundle.export_settings, ExportSettings::default());
 
         std::fs::remove_dir_all(path).ok();
     }
@@ -389,6 +505,8 @@ mod tests {
         assert_eq!(bundle.camera_layout, CameraLayout::default());
         assert_eq!(bundle.output_aspect_ratio, OutputAspectRatio::Wide);
         assert_eq!(bundle.screen_crop, None);
+        assert_eq!(bundle.appearance, ProjectAppearance::default());
+        assert_eq!(bundle.export_settings, ExportSettings::default());
     }
 
     #[test]
@@ -407,6 +525,23 @@ mod tests {
                 .map(|segments| segments.len()),
             Some(0)
         );
+    }
+
+    #[test]
+    fn loads_project_configs_without_editor_settings() {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |duration| duration.as_nanos());
+        let path = std::env::temp_dir().join(format!("blip-legacy-config-test-{suffix}.blip"));
+        BlipBundle::create(&path, false).expect("create bundle");
+        std::fs::write(path.join(PROJECT_CONFIG_FILE), "{}").expect("write legacy config");
+
+        let loaded = BlipBundle::load(&path).expect("load legacy project config");
+
+        assert_eq!(loaded.appearance, ProjectAppearance::default());
+        assert_eq!(loaded.export_settings, ExportSettings::default());
+
+        std::fs::remove_dir_all(path).ok();
     }
 
     #[test]
@@ -436,6 +571,19 @@ mod tests {
             position: [0.1, 0.2],
             size: [0.7, 0.6],
         });
+        bundle.appearance = ProjectAppearance {
+            background_type: BackgroundType::Image,
+            background_image: "sonoma-river.jpg".into(),
+            padding: 12.0,
+            border_radius: 16.0,
+            shadow: 24.0,
+        };
+        bundle.export_settings = ExportSettings {
+            format: ExportFormat::Mov,
+            resolution: ExportResolution::P720,
+            fps: 60,
+            destination: Some(path.join("export.mov")),
+        };
 
         bundle
             .save_project_config(&path)
@@ -461,6 +609,8 @@ mod tests {
         assert_eq!(loaded.camera_layout, bundle.camera_layout);
         assert_eq!(loaded.output_aspect_ratio, OutputAspectRatio::Auto);
         assert_eq!(loaded.screen_crop, bundle.screen_crop);
+        assert_eq!(loaded.appearance, bundle.appearance);
+        assert_eq!(loaded.export_settings, bundle.export_settings);
 
         std::fs::remove_dir_all(path).ok();
     }

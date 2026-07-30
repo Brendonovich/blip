@@ -2,6 +2,7 @@
 
 use std::fmt;
 
+mod audio;
 mod capture;
 mod config;
 mod content;

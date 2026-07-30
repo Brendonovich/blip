@@ -1,0 +1,10 @@
+[package]
+name = "blip-ui"
+version = "0.1.0"
+edition.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+gpui.workspace = true

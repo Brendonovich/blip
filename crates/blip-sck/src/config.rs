@@ -7,7 +7,10 @@ use objc2_screen_capture_kit::SCStreamConfiguration;
 
 use crate::{CaptureError, CaptureFilter};
 
-pub struct StreamConfig(Retained<SCStreamConfiguration>);
+pub struct StreamConfig {
+    raw: Retained<SCStreamConfiguration>,
+    captures_audio: bool,
+}
 
 #[derive(Debug, Clone, Copy, Default)]
 pub enum PixelFormat {
@@ -40,7 +43,12 @@ impl StreamConfig {
 
     #[must_use]
     pub(crate) fn as_raw(&self) -> &SCStreamConfiguration {
-        &self.0
+        &self.raw
+    }
+
+    #[must_use]
+    pub(crate) const fn captures_audio(&self) -> bool {
+        self.captures_audio
     }
 }
 
@@ -52,6 +60,7 @@ pub struct StreamConfigBuilder {
     pixel_format: PixelFormat,
     color_space: Option<CaptureColorSpace>,
     source_rect: Option<(f64, f64, f64, f64)>,
+    captures_audio: bool,
 }
 
 impl StreamConfigBuilder {
@@ -114,6 +123,13 @@ impl StreamConfigBuilder {
         self
     }
 
+    /// Requests system audio alongside screen frames on macOS 13 and later.
+    #[must_use]
+    pub fn with_system_audio(mut self, captures_audio: bool) -> Self {
+        self.captures_audio = captures_audio;
+        self
+    }
+
     fn build(self, width: usize, height: usize) -> Result<StreamConfig, CaptureError> {
         let timescale = self
             .fps
@@ -173,12 +189,20 @@ impl StreamConfigBuilder {
                 config.setColorSpaceName(name);
             }
             config.setShowsCursor(self.shows_cursor);
+            if self.captures_audio && objc2::available!(macos = 13.0) {
+                config.setCapturesAudio(true);
+                config.setSampleRate(48_000);
+                config.setChannelCount(2);
+            }
             if let Some((x, y, width, height)) = self.source_rect {
                 config.setSourceRect(CGRect::new(CGPoint::new(x, y), CGSize::new(width, height)));
             }
         }
 
-        Ok(StreamConfig(config))
+        Ok(StreamConfig {
+            raw: config,
+            captures_audio: self.captures_audio && objc2::available!(macos = 13.0),
+        })
     }
 }
 

@@ -3,6 +3,7 @@ use std::sync::Mutex;
 use std::sync::mpsc;
 use std::time::Duration;
 
+use blip_audio::AudioPacket;
 use blip_media_time::FrameTimestamp;
 use block2::RcBlock;
 use dispatch2::{DispatchQueue, DispatchRetained};
@@ -17,11 +18,13 @@ use crate::platform::initialize_core_graphics;
 use crate::{CaptureError, CaptureFilter, StreamConfig, StreamConfigBuilder, VideoFrame};
 
 type VideoCallback = Box<dyn FnMut(VideoFrame) + Send>;
+type AudioCallback = Box<dyn FnMut(AudioPacket) + Send>;
 type StopCallback = Box<dyn FnMut(&NSError) + Send>;
 
 #[derive(Default)]
 struct Callbacks {
     video: Option<VideoCallback>,
+    audio: Option<AudioCallback>,
     stopped: Option<StopCallback>,
 }
 
@@ -44,19 +47,25 @@ define_class!(
             sample_buffer: &CMSampleBuffer,
             output_type: SCStreamOutputType,
         ) {
-            if output_type != SCStreamOutputType::Screen {
-                return;
-            }
-
-            let timestamp = normalized_frame_timestamp(stream, sample_buffer);
-            let Some(frame) = VideoFrame::new(sample_buffer, timestamp) else {
-                return;
-            };
             let _ = catch_unwind(AssertUnwindSafe(|| {
-                if let Ok(mut callbacks) = self.ivars().callbacks.lock()
-                    && let Some(callback) = &mut callbacks.video
-                {
-                    callback(frame);
+                if let Ok(mut callbacks) = self.ivars().callbacks.lock() {
+                    if output_type == SCStreamOutputType::Screen {
+                        let timestamp = normalized_frame_timestamp(stream, sample_buffer);
+                        if let (Some(frame), Some(callback)) = (
+                            VideoFrame::new(sample_buffer, timestamp),
+                            &mut callbacks.video,
+                        ) {
+                            callback(frame);
+                        }
+                    } else if output_type == SCStreamOutputType::Audio
+                        && let Some(callback) = &mut callbacks.audio
+                        && let Ok(packet) = crate::audio::audio_packet(
+                            sample_buffer,
+                            normalized_frame_timestamp(stream, sample_buffer),
+                        )
+                    {
+                        callback(packet);
+                    }
                 }
             }));
         }
@@ -206,6 +215,15 @@ impl CapturerBuilder {
     }
 
     #[must_use]
+    pub fn with_audio_frame_callback(
+        mut self,
+        callback: impl FnMut(AudioPacket) + Send + 'static,
+    ) -> Self {
+        self.callbacks.audio = Some(Box::new(callback));
+        self
+    }
+
+    #[must_use]
     pub fn with_stop_callback(mut self, callback: impl FnMut(&NSError) + Send + 'static) -> Self {
         self.callbacks.stopped = Some(Box::new(callback));
         self
@@ -224,6 +242,7 @@ impl CapturerBuilder {
     /// Returns an error if `ScreenCaptureKit` rejects the stream output.
     pub fn build(self) -> Result<Capturer, CaptureError> {
         initialize_core_graphics();
+        let has_audio_callback = self.callbacks.audio.is_some();
         let output = StreamOutput::new(self.callbacks);
         let delegate = ProtocolObject::<dyn SCStreamDelegate>::from_ref(&*output);
         // SAFETY: The filter, configuration, and delegate remain retained for the stream lifetime.
@@ -239,6 +258,17 @@ impl CapturerBuilder {
         let stream_output = ProtocolObject::<dyn SCStreamOutput>::from_ref(&*output);
         // SAFETY: Capturer retains the serial queue and output for the stream lifetime.
         unsafe {
+            if self.config.captures_audio() && has_audio_callback {
+                stream
+                    .addStreamOutput_type_sampleHandlerQueue_error(
+                        stream_output,
+                        SCStreamOutputType::Audio,
+                        Some(&queue),
+                    )
+                    .map_err(|error| {
+                        CaptureError::Framework(error.localizedDescription().to_string())
+                    })?;
+            }
             stream
                 .addStreamOutput_type_sampleHandlerQueue_error(
                     stream_output,

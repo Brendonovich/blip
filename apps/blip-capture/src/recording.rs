@@ -8,6 +8,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use async_channel::Sender;
+use blip_audio::AudioPacket;
 use blip_avfoundation::{HlsWriter, Mp4Writer, WriterError};
 use blip_media_time::FrameTimestamp;
 use blip_sck::{
@@ -49,6 +50,7 @@ pub(crate) enum RecordingEvent {
 
 enum WriterMessage {
     Frame(VideoFrame, FrameTiming),
+    Audio(AudioPacket, FrameTiming),
     Finish,
 }
 
@@ -254,7 +256,8 @@ fn record(
         .with_cursor(true)
         .with_queue_depth(8)
         .with_pixel_format(PixelFormat::Bgra)
-        .with_color_space(CaptureColorSpace::Srgb);
+        .with_color_space(CaptureColorSpace::Srgb)
+        .with_system_audio(format != RecordingFormat::BlipBundle);
     if let Some((x, y, width, height)) = source_rect {
         config = config.with_source_rect(x, y, width, height);
     }
@@ -282,6 +285,7 @@ fn record(
         .map_err(|error| error.to_string())?;
     let frame_sender = writer_sender.clone();
     let capture_events = events.clone();
+    let audio_sender = writer_sender.clone();
     let capturer = Capturer::builder(filter, config)
         .map_err(|error| error.to_string())?
         .with_timeout(CAPTURE_TIMEOUT)
@@ -291,6 +295,13 @@ fn record(
                 fallback: recording_start.elapsed(),
             };
             let _ = frame_sender.try_send(WriterMessage::Frame(frame, timing));
+        })
+        .with_audio_frame_callback(move |frame| {
+            let timing = FrameTiming {
+                normalized: frame.timestamp(),
+                fallback: recording_start.elapsed(),
+            };
+            let _ = audio_sender.try_send(WriterMessage::Audio(frame, timing));
         })
         .with_stop_callback(move |error| {
             let _ = capture_events.try_send(RecordingEvent::Failed(
@@ -419,7 +430,7 @@ fn write_frames(
                     Some(writer) => writer,
                     None => writer.insert(if format == RecordingFormat::Hls {
                         Writer::Hls(if let Some(upload_assets) = upload_assets.clone() {
-                            HlsWriter::new_with_asset_callback(
+                            HlsWriter::new_with_asset_callback_and_system_audio(
                                 output,
                                 frame.width(),
                                 frame.height(),
@@ -430,7 +441,7 @@ fn write_frames(
                                 },
                             )?
                         } else {
-                            HlsWriter::new(
+                            HlsWriter::new_with_system_audio(
                                 output,
                                 frame.width(),
                                 frame.height(),
@@ -440,7 +451,7 @@ fn write_frames(
                         })
                     } else {
                         let writer = if format == RecordingFormat::Mp4 {
-                            Mp4Writer::new_with_bitrate_preserving_color(
+                            Mp4Writer::new_with_bitrate_preserving_color_and_system_audio(
                                 output,
                                 frame.width(),
                                 frame.height(),
@@ -488,6 +499,19 @@ fn write_frames(
                         elapsed_ms = timing.fallback.as_millis(),
                         "Recorded frame"
                     );
+                }
+            }
+            WriterMessage::Audio(frame, timing) => {
+                let Some(writer) = &mut writer else {
+                    continue;
+                };
+                match writer {
+                    Writer::Mp4(writer) => {
+                        writer.append_audio(&frame, timing.writer_timestamp())?;
+                    }
+                    Writer::Hls(writer) => {
+                        writer.append_audio(&frame, timing.writer_timestamp())?;
+                    }
                 }
             }
             WriterMessage::Finish => {

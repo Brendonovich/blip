@@ -1,14 +1,153 @@
 use std::ops::Range;
+use std::time::Duration;
 
 use gpui::{
-    App, Bounds, Context, CursorStyle, Element, ElementId, ElementInputHandler, Entity,
-    EntityInputHandler, EventEmitter, FocusHandle, Focusable, GlobalElementId, InspectorElementId,
-    IntoElement, KeyBinding, LayoutId, MouseButton, MouseDownEvent, PaintQuad, Pixels, Point,
-    ShapedLine, SharedString, Style, Subscription, TextAlign, TextRun, UTF16Selection, Window,
-    actions, div, fill, point, prelude::*, px, relative, rgb, size,
+    Animation, AnimationExt as _, AnyElement, App, Bounds, Context, CursorStyle, Div, Element,
+    ElementId, ElementInputHandler, Entity, EntityInputHandler, EventEmitter, FocusHandle,
+    Focusable, GlobalElementId, InspectorElementId, IntoElement, KeyBinding, LayoutId, MouseButton,
+    MouseDownEvent, PaintQuad, Pixels, Point, ShapedLine, SharedString, Stateful, Style,
+    Subscription, TextAlign, TextRun, Transformation, UTF16Selection, Window, actions, div,
+    ease_out_quint, fill, percentage, point, prelude::*, px, relative, rgb, size, svg,
 };
 
-use crate::theme;
+pub const DROPDOWN_ANIMATION_DURATION: Duration = Duration::from_millis(150);
+
+#[derive(Clone, Copy)]
+pub struct DropdownStyle {
+    pub control_background: u32,
+    pub control_hover: u32,
+    pub control_active: u32,
+    pub border_subtle: u32,
+    pub border: u32,
+    pub text_muted: u32,
+    pub trigger_full_width: bool,
+    pub trigger_height: Pixels,
+    pub menu_top: Pixels,
+    pub menu_max_height: Pixels,
+    pub option_height: Pixels,
+    pub menu_shadow: bool,
+}
+
+impl Default for DropdownStyle {
+    fn default() -> Self {
+        Self {
+            control_background: 0x001c_1c1c,
+            control_hover: 0x0023_2323,
+            control_active: 0x0029_2929,
+            border_subtle: 0x0024_2424,
+            border: 0x0030_3030,
+            text_muted: 0x0099_9999,
+            trigger_full_width: true,
+            trigger_height: px(30.0),
+            menu_top: px(34.0),
+            menu_max_height: px(280.0),
+            option_height: px(28.0),
+            menu_shadow: false,
+        }
+    }
+}
+
+pub fn dropdown_trigger(id: impl Into<ElementId>, style: DropdownStyle) -> Stateful<Div> {
+    div()
+        .id(id)
+        .when(style.trigger_full_width, gpui::Styled::w_full)
+        .h(style.trigger_height)
+        .px_2()
+        .flex()
+        .items_center()
+        .gap_2()
+        .rounded_sm()
+        .bg(rgb(style.control_background))
+        .border_1()
+        .border_color(rgb(style.border_subtle))
+        .hover(move |button| button.bg(rgb(style.control_hover)))
+        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+        .cursor_pointer()
+}
+
+pub fn dropdown_chevron(
+    path: impl Into<SharedString>,
+    open: bool,
+    transition: u64,
+    style: DropdownStyle,
+) -> AnyElement {
+    let chevron = svg()
+        .size(px(14.0))
+        .path(path)
+        .text_color(rgb(style.text_muted))
+        .flex_none();
+    if transition == 0 {
+        chevron.into_any_element()
+    } else {
+        chevron
+            .with_animation(
+                format!("dropdown-chevron-transition-{transition}"),
+                Animation::new(DROPDOWN_ANIMATION_DURATION).with_easing(ease_out_quint()),
+                move |chevron, delta| {
+                    let progress = if open { delta } else { 1.0 - delta };
+                    chevron.with_transformation(Transformation::rotate(percentage(progress * 0.5)))
+                },
+            )
+            .into_any_element()
+    }
+}
+
+pub fn dropdown_menu(
+    id: impl Into<ElementId>,
+    open: bool,
+    transition: u64,
+    style: DropdownStyle,
+    children: impl IntoIterator<Item = AnyElement>,
+) -> AnyElement {
+    div()
+        .id(id)
+        .absolute()
+        .left_0()
+        .right_0()
+        .max_h(style.menu_max_height)
+        .p_1()
+        .flex()
+        .flex_col()
+        .gap_1()
+        .overflow_y_scroll()
+        .rounded_sm()
+        .bg(rgb(style.control_background))
+        .border_1()
+        .border_color(rgb(style.border))
+        .when(style.menu_shadow, gpui::Styled::shadow_lg)
+        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+        .children(children)
+        .with_animation(
+            format!("dropdown-menu-transition-{transition}"),
+            Animation::new(DROPDOWN_ANIMATION_DURATION).with_easing(ease_out_quint()),
+            #[allow(clippy::arithmetic_side_effects)]
+            move |menu, delta| {
+                let visibility = if open { delta } else { 1.0 - delta };
+                menu.top(style.menu_top - px(6.0) * (1.0 - visibility))
+                    .opacity(visibility)
+            },
+        )
+        .into_any_element()
+}
+
+pub fn dropdown_option(
+    id: impl Into<ElementId>,
+    selected: bool,
+    style: DropdownStyle,
+) -> Stateful<Div> {
+    div()
+        .id(id)
+        .w_full()
+        .min_h(style.option_height)
+        .px_2()
+        .flex()
+        .items_center()
+        .rounded_sm()
+        .text_xs()
+        .when(selected, |option| option.bg(rgb(style.control_active)))
+        .hover(move |option| option.bg(rgb(style.control_hover)))
+        .cursor_pointer()
+}
 
 actions!(
     numeric_input,
@@ -17,12 +156,36 @@ actions!(
     ]
 );
 
-pub(crate) enum NumericInputEvent {
+pub enum NumericInputEvent {
     Changed(f32),
     FocusChanged(bool),
 }
 
-pub(crate) struct NumericInput {
+pub struct NumericInputStyle {
+    pub control_background: u32,
+    pub border_subtle: u32,
+    pub text: u32,
+    pub text_muted: u32,
+    pub text_dim: u32,
+    pub focus: u32,
+    pub selection_fill: u32,
+}
+
+impl Default for NumericInputStyle {
+    fn default() -> Self {
+        Self {
+            control_background: 0x001c_1c1c,
+            border_subtle: 0x0024_2424,
+            text: 0x00e8_e8e8,
+            text_muted: 0x0099_9999,
+            text_dim: 0x0068_6868,
+            focus: 0x007e_8ea6,
+            selection_fill: 0x0039_4352,
+        }
+    }
+}
+
+pub struct NumericInput {
     label: Option<&'static str>,
     placeholder: SharedString,
     numeric: bool,
@@ -32,10 +195,11 @@ pub(crate) struct NumericInput {
     last_layout: Option<ShapedLine>,
     last_bounds: Option<Bounds<Pixels>>,
     focus_subscriptions: Vec<Subscription>,
+    style: NumericInputStyle,
 }
 
 impl NumericInput {
-    pub(crate) fn new(label: &'static str, cx: &mut Context<Self>) -> Self {
+    pub fn new(label: &'static str, cx: &mut Context<Self>) -> Self {
         Self {
             label: Some(label),
             placeholder: "".into(),
@@ -46,10 +210,11 @@ impl NumericInput {
             last_layout: None,
             last_bounds: None,
             focus_subscriptions: Vec::new(),
+            style: NumericInputStyle::default(),
         }
     }
 
-    pub(crate) fn new_text(placeholder: impl Into<SharedString>, cx: &mut Context<Self>) -> Self {
+    pub fn new_text(placeholder: impl Into<SharedString>, cx: &mut Context<Self>) -> Self {
         Self {
             label: None,
             placeholder: placeholder.into(),
@@ -60,14 +225,22 @@ impl NumericInput {
             last_layout: None,
             last_bounds: None,
             focus_subscriptions: Vec::new(),
+            style: NumericInputStyle::default(),
         }
     }
 
-    pub(crate) fn value(&self) -> &str {
+    #[must_use]
+    pub fn with_style(mut self, style: NumericInputStyle) -> Self {
+        self.style = style;
+        self
+    }
+
+    #[must_use]
+    pub fn value(&self) -> &str {
         &self.content
     }
 
-    pub(crate) fn bind_keys(cx: &mut App) {
+    pub fn bind_keys(cx: &mut App) {
         cx.bind_keys([
             KeyBinding::new("backspace", Backspace, Some("NumericInput")),
             KeyBinding::new("delete", Delete, Some("NumericInput")),
@@ -80,7 +253,7 @@ impl NumericInput {
         ]);
     }
 
-    pub(crate) fn set_value(&mut self, value: f32, focused: bool, cx: &mut Context<Self>) {
+    pub fn set_value(&mut self, value: f32, focused: bool, cx: &mut Context<Self>) {
         if focused {
             return;
         }
@@ -92,13 +265,14 @@ impl NumericInput {
         }
     }
 
-    pub(crate) fn set_text(&mut self, value: impl Into<SharedString>, cx: &mut Context<Self>) {
+    pub fn set_text(&mut self, value: impl Into<SharedString>, cx: &mut Context<Self>) {
         self.content = value.into();
         self.selected_range = self.content.len()..self.content.len();
         cx.notify();
     }
 
-    pub(crate) fn focus_handle(&self) -> &FocusHandle {
+    #[must_use]
+    pub fn focus_handle(&self) -> &FocusHandle {
         &self.focus_handle
     }
 
@@ -180,6 +354,7 @@ impl NumericInput {
         cx.notify();
     }
 
+    #[allow(clippy::arithmetic_side_effects)]
     fn index_for_mouse_position(&self, position: Point<Pixels>) -> usize {
         if self.content.is_empty() {
             return 0;
@@ -367,7 +542,7 @@ impl Element for NumericTextElement {
             len: display_text.len(),
             font: window.text_style().font(),
             color: if content.is_empty() {
-                rgb(theme::TEXT_DIM).into()
+                rgb(input.style.text_dim).into()
             } else {
                 window.text_style().color
             },
@@ -390,7 +565,7 @@ impl Element for NumericTextElement {
                         point(bounds.left() + cursor_x, bounds.top()),
                         size(px(1.0), bounds.size.height),
                     ),
-                    rgb(theme::FOCUS),
+                    rgb(input.style.focus),
                 )),
             )
         } else {
@@ -406,7 +581,7 @@ impl Element for NumericTextElement {
                             bounds.bottom(),
                         ),
                     ),
-                    rgb(theme::SELECTION_FILL),
+                    rgb(input.style.selection_fill),
                 )),
                 None,
             )
@@ -496,14 +671,14 @@ impl Render for NumericInput {
             .flex()
             .items_center()
             .rounded_sm()
-            .bg(rgb(theme::CONTROL_BACKGROUND))
+            .bg(rgb(self.style.control_background))
             .border_1()
             .border_color(if self.focus_handle.is_focused(window) {
-                rgb(theme::FOCUS)
+                rgb(self.style.focus)
             } else {
-                rgb(theme::BORDER_SUBTLE)
+                rgb(self.style.border_subtle)
             })
-            .text_color(rgb(theme::TEXT))
+            .text_color(rgb(self.style.text))
             .text_sm();
         let input = if let Some(label) = self.label {
             input.child(
@@ -511,7 +686,7 @@ impl Render for NumericInput {
                     .w(px(18.0))
                     .flex_none()
                     .text_xs()
-                    .text_color(rgb(theme::TEXT_MUTED))
+                    .text_color(rgb(self.style.text_muted))
                     .child(label),
             )
         } else {

@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 
 use blip_avfoundation::{CameraDevice, list_video_devices, request_camera_access};
 use blip_sck::{CaptureError, Display, ShareableContent, Window as CaptureWindow};
+use blip_ui::{NumericInput, NumericInputEvent};
 use chrono::Local;
 use clap::Parser;
 use core_foundation::{base::TCFType, number::CFNumber, string::CFString};
@@ -44,9 +45,6 @@ mod bundle;
 mod camera_preview;
 mod editor;
 mod headless;
-#[path = "../../blip-studio/src/numeric_input.rs"]
-#[allow(dead_code)]
-mod numeric_input;
 mod profiles;
 mod recording;
 mod theme;
@@ -55,7 +53,6 @@ mod upload;
 use bundle::{BlipBundle, CameraCrop};
 use camera_preview::CameraPreview;
 use editor::BundleEditor;
-use numeric_input::{NumericInput, NumericInputEvent};
 use profiles::{
     CompletionAction, RecordingFormat, RecordingProfile, RecordingProfiles, RecordingTarget,
     join_server_url, split_server_url,
@@ -1378,10 +1375,16 @@ impl ProfileSettings {
         cx: &mut Context<Self>,
     ) -> Self {
         let selected = profiles.selected_index();
-        let name_input = cx.new(|cx| NumericInput::new_text("Profile name", cx));
-        let destination_input =
-            cx.new(|cx| NumericInput::new_text("Folder or Blip server URL", cx));
-        let token_input = cx.new(|cx| NumericInput::new_text("blip_...", cx));
+        let name_input = cx.new(|cx| {
+            NumericInput::new_text("Profile name", cx).with_style(theme::NUMERIC_INPUT_STYLE)
+        });
+        let destination_input = cx.new(|cx| {
+            NumericInput::new_text("Folder or Blip server URL", cx)
+                .with_style(theme::NUMERIC_INPUT_STYLE)
+        });
+        let token_input = cx.new(|cx| {
+            NumericInput::new_text("blip_...", cx).with_style(theme::NUMERIC_INPUT_STYLE)
+        });
         let mut settings = Self {
             controller,
             profiles,
@@ -2459,7 +2462,7 @@ fn region_input(
     field: RegionField,
     cx: &mut Context<SelectionOverlay>,
 ) -> Entity<NumericInput> {
-    let input = cx.new(|cx| NumericInput::new(label, cx));
+    let input = cx.new(|cx| NumericInput::new(label, cx).with_style(theme::NUMERIC_INPUT_STYLE));
     cx.subscribe(&input, move |overlay, _, event: &NumericInputEvent, cx| {
         if let NumericInputEvent::Changed(value) = event {
             overlay.set_region_field(field, *value, cx);

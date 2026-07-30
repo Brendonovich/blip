@@ -13,6 +13,7 @@ blip-avfoundation.workspace = true
 blip-compositor.workspace = true
 blip-sck.workspace = true
 blip-updater.workspace = true
+blip-ui.workspace = true
 clap.workspace = true
 core-foundation.workspace = true
 core-video.workspace = true

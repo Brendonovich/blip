@@ -9,11 +9,13 @@ workspace = true
 [dependencies]
 anyhow.workspace = true
 async-channel.workspace = true
+blip-audio.workspace = true
 blip-avfoundation.workspace = true
 blip-compositor.workspace = true
 blip-media-time.workspace = true
 blip-sck.workspace = true
 blip-updater.workspace = true
+blip-ui.workspace = true
 chrono.workspace = true
 clap.workspace = true
 core-foundation.workspace = true

@@ -16,4 +16,3 @@ pub(crate) const DANGER_TEXT: u32 = 0x00dc_a0a0;
 pub(crate) const ERROR_TEXT: u32 = 0x00d8_8f8f;
 pub(crate) const FOCUS: u32 = 0x007e_8ea6;
 pub(crate) const SELECTION: u32 = 0x0082_94ad;
-pub(crate) const SELECTION_FILL: u32 = 0x0039_4352;
